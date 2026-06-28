@@ -1,0 +1,5 @@
+{
+    "java.project.sourcePaths": [
+        "LangChain-RAG-FastAPI-Service-master/front/node_modules"
+    ]
+}
