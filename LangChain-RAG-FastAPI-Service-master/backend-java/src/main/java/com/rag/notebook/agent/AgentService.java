@@ -1,20 +1,21 @@
 package com.rag.notebook.agent;
 
-import com.rag.notebook.chat.entity.ChatMessage;
-import com.rag.notebook.chat.entity.ChatSession;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.config.ApplicationProperties;
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
+import dev.langchain4j.agent.tool.ToolSpecification;
+import dev.langchain4j.agent.tool.ToolSpecifications;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
 
@@ -24,8 +25,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 @Slf4j
 @Service
@@ -36,6 +35,7 @@ public class AgentService {
     private final ChatService chatService;
     private final ApplicationProperties props;
     private final Executor taskExecutor;
+    private final List<ToolSpecification> toolSpecifications;
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
                         ChatService chatService, ApplicationProperties props,
@@ -45,43 +45,42 @@ public class AgentService {
         this.chatService = chatService;
         this.props = props;
         this.taskExecutor = taskExecutor;
+        // 从 @Tool 注解自动提取工具定义
+        this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
 
     public SseEmitter streamAgentResponse(String query, String sessionId, String userId) {
         SseEmitter emitter = new SseEmitter(120000L);
 
-        // Capture SecurityContext from request thread for async propagation
         SecurityContext securityContext = SecurityContextHolder.getContext();
 
         CompletableFuture.runAsync(() -> {
-            // Set SecurityContext on the async thread
             SecurityContextHolder.setContext(securityContext);
             try {
-                // Load session history
-                List<ChatMessage> history = chatService.getSessionMessages(sessionId);
+                // 加载会话历史
+                List<com.rag.notebook.chat.entity.ChatMessage> history = chatService.getSessionMessages(sessionId);
 
-                // Build chat messages
+                // 构建消息列表
                 List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
                 messages.add(SystemMessage.from(loadSystemPrompt()));
-
-                for (ChatMessage msg : history) {
+                for (com.rag.notebook.chat.entity.ChatMessage msg : history) {
                     if ("human".equals(msg.getRole())) {
                         messages.add(UserMessage.from(msg.getContent()));
                     } else if ("ai".equals(msg.getRole())) {
                         messages.add(AiMessage.from(msg.getContent()));
                     }
                 }
+                messages.add(UserMessage.from(query));
 
-                // Process tools and get response
-                String response = processWithTools(query, userId, messages);
+                // 使用 function calling 处理
+                String response = processWithFunctionCalling(messages, userId, emitter, sessionId);
 
-                // Send thinking event
+                // 发送最终回复（流式分块）
                 sendSseEvent(emitter, "thinking", Map.of(
                         "stage", "complete",
                         "content", "已处理完成"
                 ));
 
-                // Stream response in chunks for better performance
                 int chunkSize = 50;
                 for (int i = 0; i < response.length(); i += chunkSize) {
                     int end = Math.min(i + chunkSize, response.length());
@@ -92,11 +91,10 @@ public class AgentService {
                     Thread.sleep(50);
                 }
 
-                // Save to history
+                // 保存到历史
                 chatService.addMessage(sessionId, userId, "human", query);
                 chatService.addMessage(sessionId, userId, "ai", response);
 
-                // Send done event
                 sendSseEvent(emitter, "done", Map.of("session_id", sessionId));
                 emitter.complete();
 
@@ -119,74 +117,109 @@ public class AgentService {
         return emitter;
     }
 
-    private String processWithTools(String query, String userId,
-                                    List<dev.langchain4j.data.message.ChatMessage> messages) {
+    /**
+     * LangChain4j function calling 循环
+     */
+    private String processWithFunctionCalling(
+            List<dev.langchain4j.data.message.ChatMessage> messages,
+            String userId, SseEmitter emitter, String sessionId) throws IOException {
+
         ChatLanguageModel chatModel = modelFactory.createChatModel();
 
-        // Add user query
-        messages.add(UserMessage.from(query));
-
-        // Agent loop: max 3 iterations to prevent infinite loops
+        // Agent 循环：最多 3 轮工具调用
         for (int i = 0; i < 3; i++) {
-            dev.langchain4j.model.output.Response<AiMessage> response = chatModel.generate(messages);
-            String responseText = response.content().text();
+            // 发送消息 + 工具定义给 LLM
+            Response<AiMessage> chatResponse = chatModel.generate(messages, toolSpecifications);
+            AiMessage aiMessage = chatResponse.content();
 
-            // Check if LLM is trying to call a tool
-            String toolName = extractToolName(responseText);
-            if (toolName == null) {
-                // No tool call, return the response directly
-                return responseText;
+            // LLM 要求调用工具
+            if (aiMessage.hasToolExecutionRequests()) {
+                String toolNames = aiMessage.toolExecutionRequests().stream()
+                        .map(ToolExecutionRequest::name)
+                        .reduce((a, b) -> a + ", " + b).orElse("");
+
+                sendSseEvent(emitter, "thinking", Map.of(
+                        "stage", "tool_call",
+                        "content", "正在调用工具: " + toolNames
+                ));
+
+                // 把 AI 的工具调用消息加入历史
+                messages.add(aiMessage);
+
+                // 执行每个工具调用
+                for (ToolExecutionRequest toolRequest : aiMessage.toolExecutionRequests()) {
+                    String toolName = toolRequest.name();
+                    String toolArgs = toolRequest.arguments();
+                    log.info("Executing tool: {} with args: {}", toolName, toolArgs);
+
+                    // 注入 userId 执行工具
+                    String toolResult = executeToolWithUserId(toolName, toolArgs, userId);
+
+                    // 工具结果加入消息列表
+                    messages.add(ToolExecutionResultMessage.from(toolRequest, toolResult));
+
+                    log.info("Tool '{}' result: {}", toolName,
+                            toolResult.length() > 100 ? toolResult.substring(0, 100) + "..." : toolResult);
+                }
+                // 继续循环，让 LLM 基于工具结果生成回复
+            } else {
+                // LLM 不需要调工具，直接返回文本
+                return aiMessage.text();
             }
-
-            // Execute the tool
-            String toolResult = executeTool(toolName, query, userId);
-            log.info("Tool '{}' executed, result length: {}", toolName, toolResult.length());
-
-            // Add AI response and tool result to conversation, then let LLM generate final answer
-            messages.add(AiMessage.from(responseText));
-            messages.add(UserMessage.from("工具执行结果：\n" + toolResult + "\n\n请基于以上结果，用自然语言回答用户的问题：" + query));
         }
 
-        // If max iterations reached, just call LLM one final time
-        dev.langchain4j.model.output.Response<AiMessage> finalResponse = chatModel.generate(messages);
+        // 达到最大轮次，最终调用一次（不带工具定义）
+        Response<AiMessage> finalResponse = chatModel.generate(messages);
         return finalResponse.content().text();
     }
 
     /**
-     * Detect if LLM response contains a tool call
+     * 解析工具参数并注入 userId 执行
      */
-    private String extractToolName(String response) {
-        if (response == null) return null;
-        // Match known tool names in the response
-        String[] toolNames = {"rag_summary_tools", "search_notes_tool", "get_note_stats_tool",
-                "get_today_reviews_tool", "mark_reviewed_tool", "create_note_tool", "get_related_notes_tool"};
-        for (String tool : toolNames) {
-            if (response.contains(tool)) {
-                return tool;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Execute a tool by name
-     */
-    private String executeTool(String toolName, String query, String userId) {
+    private String executeToolWithUserId(String toolName, String arguments, String userId) {
         try {
+            Map<String, String> args = parseToolArguments(arguments);
             return switch (toolName) {
-                case "rag_summary_tools" -> agentTools.ragSummary(query, userId);
-                case "search_notes_tool" -> agentTools.searchNotes(query, 5, userId);
-                case "get_note_stats_tool" -> agentTools.getNoteStats(userId);
-                case "get_today_reviews_tool" -> agentTools.getTodayReviews(userId);
-                case "mark_reviewed_tool" -> agentTools.markReviewed(query, userId);
-                case "create_note_tool" -> "笔记创建功能暂不支持自动调用";
-                case "get_related_notes_tool" -> "相关笔记推荐功能暂不支持自动调用";
+                case "ragSummary" -> agentTools.ragSummary(args.getOrDefault("query", ""), userId);
+                case "searchNotes" -> agentTools.searchNotes(args.getOrDefault("query", ""), userId);
+                case "getNoteStats" -> agentTools.getNoteStats(userId);
+                case "getTodayReviews" -> agentTools.getTodayReviews(userId);
+                case "markReviewed" -> agentTools.markReviewed(args.getOrDefault("noteId", ""), userId);
+                case "createNote" -> agentTools.createNote(
+                        args.getOrDefault("title", ""), args.getOrDefault("content", ""), userId);
+                case "getRelatedNotes" -> agentTools.getRelatedNotes(args.getOrDefault("noteId", ""), userId);
+                case "whatTimeIsNow" -> agentTools.whatTimeIsNow();
                 default -> "未知工具: " + toolName;
             };
         } catch (Exception e) {
             log.error("Tool '{}' execution failed: {}", toolName, e.getMessage());
             return "工具执行失败: " + e.getMessage();
         }
+    }
+
+    /**
+     * 解析工具调用的 JSON 参数
+     */
+    private Map<String, String> parseToolArguments(String json) {
+        Map<String, String> result = new HashMap<>();
+        if (json == null || json.isBlank()) return result;
+        try {
+            json = json.trim();
+            if (json.startsWith("{") && json.endsWith("}")) {
+                json = json.substring(1, json.length() - 1);
+                for (String pair : json.split(",")) {
+                    String[] kv = pair.split(":", 2);
+                    if (kv.length == 2) {
+                        String key = kv[0].trim().replace("\"", "");
+                        String value = kv[1].trim().replace("\"", "");
+                        result.put(key, value);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to parse tool arguments: {}", json);
+        }
+        return result;
     }
 
     private void sendSseEvent(SseEmitter emitter, String type, Map<String, Object> data) throws IOException {
