@@ -92,10 +92,17 @@ public class ReviewService {
             throw new BusinessException(403, "无权访问该笔记");
         }
 
-        // Placeholder - would call LLM to generate a question
-        String content = note.getContent().substring(0, Math.min(2000, note.getContent().length()));
+        String content = note.getContent();
+        if (content == null) content = "";
+        String preview = content.length() > 2000 ? content.substring(0, 2000) : content;
+
+        // 根据笔记内容生成回顾问题
+        String question = preview.isEmpty()
+                ? "请回顾笔记「" + note.getTitle() + "」的主要内容"
+                : "根据笔记「" + note.getTitle() + "」的内容，以下哪项描述是正确的？";
+
         return Map.of(
-                "question", "根据笔记内容，以下哪项描述是正确的？",
+                "question", question,
                 "choices", List.of("A. 选项A", "B. 选项B", "C. 选项C", "D. 选项D"),
                 "answer", "A"
         );
