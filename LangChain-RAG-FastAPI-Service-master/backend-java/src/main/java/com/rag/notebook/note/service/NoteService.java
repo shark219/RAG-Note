@@ -60,7 +60,7 @@ public class NoteService {
         if (request.getCategory() != null && !request.getCategory().isEmpty()) {
             note.setCategory(request.getCategory());
         }
-        note = noteRepository.save(note);
+        note = noteRepository.save(note); // 保存到MySQL
 
         try {
             vectorStoreService.addNoteVector(note);
@@ -81,7 +81,7 @@ public class NoteService {
         return toResponse(note);
     }
 
-    @Async("taskExecutor")
+    @Async("taskExecutor") // 使用异步线程
     public void asyncAutoTagAndReview(String noteId, String userId, String userCategory) {
         try {
             Note note = noteRepository.findById(noteId).orElse(null);

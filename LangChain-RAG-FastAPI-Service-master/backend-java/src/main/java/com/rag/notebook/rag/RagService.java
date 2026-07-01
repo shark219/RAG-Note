@@ -7,6 +7,7 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -27,7 +28,7 @@ public class RagService {
     private final Executor taskExecutor;
 
     public RagService(VectorStoreService vectorStoreService, ModelFactory modelFactory,
-                      ApplicationProperties props, Executor taskExecutor) {
+                      ApplicationProperties props, @Qualifier("taskExecutor") Executor taskExecutor) {
         this.vectorStoreService = vectorStoreService;
         this.modelFactory = modelFactory;
         this.props = props;
@@ -40,12 +41,12 @@ public class RagService {
             String prompt = String.format(HYDE_PROMPT, query);
             Response<AiMessage> response = chatModel.generate(UserMessage.from(prompt));
             return response.content().text();
-        } catch (Exception e) {
+        } catch (Exception e) { // 如果 LLM 调用失败，直接用原始问题去检索（降级但不中断）
             log.warn("HyDE generation failed, using raw query: {}", e.getMessage());
             return query;
         }
     }
-
+    // 双路向量检索
     public List<Map<String, Object>> retrieveDocuments(String userId, String query) {
         String hypotheticalDoc = generateHypotheticalDocument(query);
 

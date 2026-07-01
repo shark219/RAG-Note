@@ -1,5 +1,6 @@
 package com.rag.notebook.agent;
 
+import com.rag.notebook.chat.entity.ChatMessage;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.config.ApplicationProperties;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
@@ -12,6 +13,7 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -39,7 +41,7 @@ public class AgentService {
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
                         ChatService chatService, ApplicationProperties props,
-                        Executor taskExecutor) {
+                        @Qualifier("taskExecutor") Executor taskExecutor) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
         this.chatService = chatService;
@@ -58,12 +60,12 @@ public class AgentService {
             SecurityContextHolder.setContext(securityContext);
             try {
                 // 加载会话历史
-                List<com.rag.notebook.chat.entity.ChatMessage> history = chatService.getSessionMessages(sessionId);
+                List<ChatMessage> history = chatService.getSessionMessages(sessionId);
 
                 // 构建消息列表
                 List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
                 messages.add(SystemMessage.from(loadSystemPrompt()));
-                for (com.rag.notebook.chat.entity.ChatMessage msg : history) {
+                for (ChatMessage msg : history) {
                     if ("human".equals(msg.getRole())) {
                         messages.add(UserMessage.from(msg.getContent()));
                     } else if ("ai".equals(msg.getRole())) {

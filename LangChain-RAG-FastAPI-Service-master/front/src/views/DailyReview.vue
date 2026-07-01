@@ -13,17 +13,17 @@
 
         <ReviewCard
           v-for="item in reviews"
-          :key="item.note_id"
+          :key="item.noteId"
           :title="item.title"
-          :question="getQuestion(item.note_id)"
+          :question="getQuestion(item.noteId)"
           :tags="item.tags"
           :category="item.category"
-          :review-count="item.review_count"
-          :done="doneMap[item.note_id]"
+          :review-count="item.reviewCount"
+          :done="doneMap[item.noteId]"
           @click="handleCardClick(item)"
           @review-now="handleCardClick(item)"
-          @done="handleDone(item.note_id)"
-          @skip="handleSkip(item.note_id)"
+          @done="handleDone(item.noteId)"
+          @skip="handleSkip(item.noteId)"
         />
       </div>
     </div>
@@ -101,8 +101,8 @@ import TabBar from '../components/TabBar.vue'
 const userStore = useUserStore()
 const loading = ref(false)
 const reviews = ref([])
-const questions = reactive({})   /** note_id → 回顾问题（string） */
-const doneMap = reactive({})     /** note_id → 是否已完成 */
+const questions = reactive({})   /** noteId → 回顾问题（string） */
+const doneMap = reactive({})     /** noteId → 是否已完成 */
 const doneCount = ref(0)
 
 /** 弹窗状态 */
@@ -128,8 +128,8 @@ function getQuestion(noteId) {
 
 /** 点击卡片 —— 弹窗展示选择题 */
 async function handleCardClick(item) {
-  if (doneMap[item.note_id]) return
-  currentNoteId.value = item.note_id
+  if (doneMap[item.noteId]) return
+  currentNoteId.value = item.noteId
   popupVisible.value = true
   quizLoading.value = true
   quizData.value = null
@@ -137,7 +137,7 @@ async function handleCardClick(item) {
   answered.value = false
 
   try {
-    const res = await fetch(apiConfig.endpoints.reviewQuestion(item.note_id), {
+    const res = await fetch(apiConfig.endpoints.reviewQuestion(item.noteId), {
       headers: getHeaders(),
     })
     const json = await res.json()
@@ -152,7 +152,7 @@ async function handleCardClick(item) {
       }
       quizData.value = data
       // 缓存问题文本供卡片展示
-      questions[item.note_id] = data.question
+      questions[item.noteId] = data.question
     } else {
       showToast('获取回顾问题失败')
       popupVisible.value = false

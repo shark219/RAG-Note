@@ -6,6 +6,7 @@ import com.rag.notebook.rag.DocumentProcessor;
 import com.rag.notebook.rag.Md5Store;
 import com.rag.notebook.rag.VectorStoreService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -19,6 +20,7 @@ import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.function.BiConsumer;
 
 @Slf4j
 @Service
@@ -31,7 +33,7 @@ public class KnowledgeService {
 
     public KnowledgeService(VectorStoreService vectorStoreService,
                             DocumentProcessor documentProcessor, Md5Store md5Store,
-                            Executor taskExecutor) {
+                            @Qualifier("taskExecutor") Executor taskExecutor) {
         this.vectorStoreService = vectorStoreService;
         this.documentProcessor = documentProcessor;
         this.md5Store = md5Store;
@@ -74,7 +76,7 @@ public class KnowledgeService {
     }
 
     private void processUploadedFile(String userId, MultipartFile file,
-                                     java.util.function.BiConsumer<String, Object> progressCallback) {
+                                     BiConsumer<String, Object> progressCallback) {
         try {
             String originalFilename = file.getOriginalFilename();
             if (originalFilename == null) {
