@@ -56,9 +56,17 @@ public class ApplicationProperties {
 
     @Data
     public static class Embed {
-        private String type = "OLLAMA";
+        private String type = "ZHIPU";
+        private EmbedZhipu zhipu = new EmbedZhipu();
         private Llm.Ollama ollama = new Llm.Ollama();
         private EmbedAliyun aliyun = new EmbedAliyun();
+
+        @Data
+        public static class EmbedZhipu {
+            private String apiKey = "";
+            private String baseUrl = "https://open.bigmodel.cn/api/paas/v4";
+            private String model = "embedding-3";
+        }
 
         @Data
         public static class EmbedAliyun {

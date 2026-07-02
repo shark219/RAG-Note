@@ -12,7 +12,7 @@
         </svg>
       </template>
     </van-tabbar-item>
-    <van-tabbar-item to="/chat">
+    <van-tabbar-item :to="lastChatSession ? `/chat/${lastChatSession}` : '/chat'">
       <span>AI助手</span>
       <template #icon="props">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
@@ -48,11 +48,14 @@
  * TabBar 底部导航栏 —— 4 个 Tab：笔记、AI助手、回顾、我的。
  * 配合 Vue Router 的 route 属性实现页面切换。
  */
-import { ref, watch } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 const route = useRoute()
 const active = ref(0)
+
+// 从 localStorage 获取最近一次的会话 ID，用于点击"AI助手"时恢复会话
+const lastChatSession = computed(() => localStorage.getItem('current_session_id') || '')
 
 function setActiveTab() {
   const path = route.path

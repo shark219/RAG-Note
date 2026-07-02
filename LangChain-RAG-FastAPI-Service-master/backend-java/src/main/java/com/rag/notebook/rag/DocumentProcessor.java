@@ -33,9 +33,16 @@ public class DocumentProcessor {
             progressCallback.accept("loading", originalFilename);
 
             String md5 = computeMd5(file);
-            if (md5Store.exists(md5, userId)) {
+            // 只有 MD5 记录存在 且 向量数据也存在时才跳过
+            // 防止重启后向量数据丢失但 MD5 记录还在导致无法重新上传
+            if (md5Store.exists(md5, userId) && vectorStoreService.hasKnowledgeDocument(userId, md5)) {
                 progressCallback.accept("skipping", originalFilename);
                 return;
+            }
+            // MD5 记录存在但向量数据丢失，清理旧的 MD5 记录
+            if (md5Store.exists(md5, userId)) {
+                md5Store.deleteByMd5(md5, userId);
+                log.info("MD5 记录存在但向量数据丢失，清理后重新处理: {}", originalFilename);
             }
 
             progressCallback.accept("splitting", originalFilename);

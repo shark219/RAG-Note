@@ -396,6 +396,7 @@ const parseEvent = (event) => {
   }
 
   try {
+    if (!data || data.trim() === '') return;
     const eventData = JSON.parse(data);
     const { event_type, filename, message, progress, success_count, failed_count } = eventData;
 
