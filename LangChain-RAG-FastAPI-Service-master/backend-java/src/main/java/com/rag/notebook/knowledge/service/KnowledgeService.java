@@ -51,23 +51,64 @@ public class KnowledgeService {
     }
 
     public SseEmitter uploadMultipleStream(String userId, MultipartFile[] files) {
-        SseEmitter emitter = new SseEmitter(300000L);
+        SseEmitter emitter = new SseEmitter(600000L);  // 10 分钟超时
+        com.fasterxml.jackson.databind.ObjectMapper objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
 
         CompletableFuture.runAsync(() -> {
+            int successCount = 0;
+            int failedCount = 0;
+
             try {
                 for (MultipartFile file : files) {
                     processUploadedFile(userId, file, (stage, data) -> {
                         try {
-                            emitter.send(SseEmitter.event()
-                                    .data(Map.of("stage", stage, "file", file.getOriginalFilename(), "data", data.toString())));
-                        } catch (IOException e) {
+                            // 构建前端期望的事件格式
+                            Map<String, Object> eventData = new java.util.LinkedHashMap<>();
+                            eventData.put("event_type", stage);
+                            eventData.put("filename", file.getOriginalFilename());
+                            eventData.put("message", data.toString());
+
+                            // 解析进度信息
+                            String dataStr = data.toString();
+                            if (dataStr.contains("向量化进度:")) {
+                                // 提取百分比
+                                int percentStart = dataStr.lastIndexOf("(");
+                                int percentEnd = dataStr.lastIndexOf("%");
+                                if (percentStart > 0 && percentEnd > percentStart) {
+                                    String percent = dataStr.substring(percentStart + 1, percentEnd);
+                                    try {
+                                        eventData.put("progress", Integer.parseInt(percent));
+                                    } catch (NumberFormatException ignored) {}
+                                }
+                                eventData.put("event_type", "processing");
+                            }
+
+                            String json = objectMapper.writeValueAsString(eventData);
+                            emitter.send(SseEmitter.event().data(json));
+                        } catch (Exception e) {
                             log.warn("Failed to send SSE event: {}", e.getMessage());
                         }
                     });
+
+                    successCount++;
                 }
-                emitter.send(SseEmitter.event().data(Map.of("stage", "all_completed")));
+
+                // 发送完成事件
+                Map<String, Object> finishEvent = new java.util.LinkedHashMap<>();
+                finishEvent.put("event_type", "finish");
+                finishEvent.put("success_count", successCount);
+                finishEvent.put("failed_count", failedCount);
+                emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(finishEvent)));
                 emitter.complete();
             } catch (Exception e) {
+                failedCount++;
+                try {
+                    Map<String, Object> finishEvent = new java.util.LinkedHashMap<>();
+                    finishEvent.put("event_type", "finish");
+                    finishEvent.put("success_count", successCount);
+                    finishEvent.put("failed_count", failedCount);
+                    emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(finishEvent)));
+                } catch (Exception ignored) {}
                 emitter.completeWithError(e);
             }
         }, taskExecutor);
@@ -99,6 +140,7 @@ public class KnowledgeService {
 
     public void cleanUserDocuments(String userId) {
         vectorStoreService.deleteUserKnowledge(userId);
+        md5Store.deleteByUser(userId);  // 同时删除MD5记录
     }
 
     public void clearMd5Records(String userId, boolean deleteDocuments) {
@@ -142,15 +184,20 @@ public class KnowledgeService {
     public KnowledgeListResponse listDocuments(String userId) {
         List<Map<String, Object>> docs = vectorStoreService.getUserDocuments(userId);
         List<KnowledgeDocument> documents = docs.stream()
-                .map(d -> new KnowledgeDocument(
-                        (String) d.get("md5"),
-                        (String) d.get("filename"),
-                        (String) d.get("original_filename"),
-                        (String) d.get("user_id"),
-                        (int) d.get("chunk_count"),
-                        (String) d.get("preview"),
-                        null
-                ))
+                .map(d -> {
+                    Object createdAt = d.get("createdAt");
+                    String createdAtStr = createdAt != null ? createdAt.toString() : null;
+                    return new KnowledgeDocument(
+                            (String) d.get("id"),
+                            (String) d.get("filename"),
+                            (String) d.get("originalFilename"),
+                            (String) d.get("userId"),
+                            (int) d.get("chunkCount"),
+                            (String) d.get("preview"),
+                            (String) d.get("status"),
+                            createdAtStr
+                    );
+                })
                 .toList();
         return new KnowledgeListResponse(documents, documents.size());
     }
@@ -165,5 +212,12 @@ public class KnowledgeService {
 
     public Map<String, Object> getDocumentChunks(String userId, String filename) {
         return vectorStoreService.getDocumentChunks(userId, filename);
+    }
+
+    public void retryVectorization(String userId, String docId) {
+        boolean success = vectorStoreService.retryVectorization(docId);
+        if (!success) {
+            throw new BusinessException("重试失败：文档不存在或状态不是vector_failed");
+        }
     }
 }

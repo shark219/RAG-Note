@@ -103,17 +103,35 @@
             </template>
             <template #label>
               <div class="doc-meta">
-                <span class="chunk-count">{{ doc.chunk_count }} {{ $t('knowledgebase.chunks') }}</span>
+                <span class="chunk-count">{{ doc.chunkCount }} {{ $t('knowledgebase.chunks') }}</span>
+                <van-tag v-if="doc.status === 'vector_failed'" type="danger" size="small">
+                  {{ $t('knowledgebase.vectorFailed') }}
+                </van-tag>
+                <van-tag v-else-if="doc.status === 'processing'" type="warning" size="small">
+                  {{ $t('knowledgebase.processing') }}
+                </van-tag>
               </div>
             </template>
             <template #right-icon>
-              <van-icon 
-                name="delete" 
-                color="#ee0a24" 
-                size="18" 
-                class="delete-icon"
-                @click.stop="handleDeleteDocument(doc)"
-              />
+              <div class="doc-actions">
+                <van-button
+                  v-if="doc.status === 'vector_failed'"
+                  size="small"
+                  type="primary"
+                  plain
+                  class="retry-btn"
+                  @click.stop="handleRetryVectorization(doc)"
+                >
+                  {{ $t('knowledgebase.retry') }}
+                </van-button>
+                <van-icon
+                  name="delete"
+                  color="#ee0a24"
+                  size="18"
+                  class="delete-icon"
+                  @click.stop="handleDeleteDocument(doc)"
+                />
+              </div>
             </template>
           </van-cell>
         </van-cell-group>
@@ -154,7 +172,7 @@
         <van-loading v-if="loadingDetail" />
         <template v-else>
           <div class="detail-meta">
-            <span>{{ currentDocument?.chunk_count }} {{ $t('knowledgebase.chunks') }}</span>
+            <span>{{ currentDocument?.chunkCount }} {{ $t('knowledgebase.chunks') }}</span>
           </div>
           <div class="detail-content-full">
             <!-- 文档完整文本内容 -->
@@ -616,6 +634,92 @@ const handleCleanAll = () => {
   });
 };
 
+const handleRetryVectorization = async (doc) => {
+  const token = userStore.token;
+  if (!token) {
+    showToast(t('common.login'));
+    router.push('/login');
+    return;
+  }
+
+  try {
+    // 先更新本地状态为 processing
+    const index = documents.value.findIndex(d => d.id === doc.id);
+    if (index !== -1) {
+      documents.value[index].status = 'processing';
+    }
+    showToast(t('knowledgebase.retrySuccess'));
+
+    const response = await fetch(`/knowledge/retry-vectorization/${doc.id}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json'
+      }
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      if (result.code === 200) {
+        // 轮询等待状态更新
+        await pollDocumentStatus(doc.id);
+      } else {
+        showToast(result.message || t('knowledgebase.retryFailed'));
+        await fetchDocuments();
+      }
+    } else {
+      showToast(t('knowledgebase.retryFailed'));
+      await fetchDocuments();
+    }
+  } catch (error) {
+    console.error('Retry vectorization error:', error);
+    showToast(t('knowledgebase.retryFailed'));
+    await fetchDocuments();
+  }
+};
+
+const pollDocumentStatus = async (docId) => {
+  const maxAttempts = 60; // 最多轮询60次
+  const interval = 2000; // 每2秒轮询一次
+
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(resolve => setTimeout(resolve, interval));
+
+    try {
+      const token = userStore.token;
+      const response = await fetch('/knowledge/list', {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json'
+        }
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        if (result.code === 200 && result.data) {
+          documents.value = result.data.documents || [];
+
+          // 检查文档状态
+          const doc = documents.value.find(d => d.id === docId);
+          if (doc && doc.status !== 'processing') {
+            // 状态已更新（completed 或 vector_failed）
+            if (doc.status === 'completed') {
+              showToast(t('knowledgebase.completed'));
+            }
+            return;
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Poll status error:', error);
+    }
+  }
+
+  // 超时后刷新一次
+  await fetchDocuments();
+};
+
 // 批量加载切片图片：一次请求 /images/all/{md5} 拿到所有图片的 base64 缓存，
 // 然后给每个切片的 chunk.images 转换为可直接显示的 _imageUrls
 // 这样做的目的是减少请求次数（不需要每张图片都发一次 HTTP 请求）
@@ -797,6 +901,18 @@ onMounted(() => {
 .delete-icon {
   cursor: pointer;
   padding: 8px;
+}
+
+.doc-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.retry-btn {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 .chunk-count {

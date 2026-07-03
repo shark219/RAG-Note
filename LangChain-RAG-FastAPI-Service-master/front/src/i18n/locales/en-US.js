@@ -106,6 +106,10 @@ export default {
     cleanFailed: 'Failed to clear',
     deleteConfirm: 'Are you sure you want to delete document "{filename}"? This action cannot be undone.',
     deleteSuccess: 'Deleted successfully',
-    deleteFailed: 'Failed to delete'
+    deleteFailed: 'Failed to delete',
+    vectorFailed: 'Vectorization Failed',
+    retry: 'Retry',
+    retrySuccess: 'Retry task submitted',
+    retryFailed: 'Retry failed'
   }
 };

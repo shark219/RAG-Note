@@ -71,6 +71,8 @@ migrations/
 
 # ==================== ChromaDB ====================
 chromadb/
+bm25_index/
+md5_hex_store/
 
 # ==================== Temporary ====================
 *.tmp

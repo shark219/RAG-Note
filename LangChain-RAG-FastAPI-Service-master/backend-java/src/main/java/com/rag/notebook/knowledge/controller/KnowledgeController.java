@@ -113,4 +113,10 @@ public class KnowledgeController {
     public ApiResponse<Map<String, Object>> getBatchImages(@UserId String userId, @PathVariable String md5) {
         return ApiResponse.success(Map.of("images", java.util.List.of()));
     }
+
+    @PostMapping("/retry-vectorization/{docId}")
+    public ApiResponse<Void> retryVectorization(@UserId String userId, @PathVariable String docId) {
+        knowledgeService.retryVectorization(userId, docId);
+        return ApiResponse.success("重试任务已提交");
+    }
 }

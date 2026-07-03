@@ -106,6 +106,10 @@ export default {
     cleanFailed: '清空失败',
     deleteConfirm: '确定要删除文档「{filename}」吗？此操作不可恢复。',
     deleteSuccess: '删除成功',
-    deleteFailed: '删除失败'
+    deleteFailed: '删除失败',
+    vectorFailed: '向量化失败',
+    retry: '重试',
+    retrySuccess: '重试任务已提交',
+    retryFailed: '重试失败'
   }
 };
