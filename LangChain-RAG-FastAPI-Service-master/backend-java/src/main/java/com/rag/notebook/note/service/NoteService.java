@@ -60,7 +60,7 @@ public class NoteService {
         if (request.getCategory() != null && !request.getCategory().isEmpty()) {
             note.setCategory(request.getCategory());
         }
-        note = noteRepository.save(note);
+        note = noteRepository.save(note); // 保存到MySQL
 
         try {
             vectorStoreService.addNoteVector(note);
@@ -81,7 +81,7 @@ public class NoteService {
         return toResponse(note);
     }
 
-    @Async("taskExecutor")
+    @Async("taskExecutor") // 使用异步线程
     public void asyncAutoTagAndReview(String noteId, String userId, String userCategory) {
         try {
             Note note = noteRepository.findById(noteId).orElse(null);
@@ -255,11 +255,17 @@ public class NoteService {
             throw new BusinessException(403, "无权删除该笔记");
         }
 
+        // 删除笔记
         noteRepository.delete(note);
+
+        // 删除关联的复习记录
+        reviewRecordRepository.deleteByNoteId(noteId);
+
+        // 删除向量索引
         try {
             vectorStoreService.deleteNoteVector(noteId);
         } catch (Exception e) {
-            log.warn("Failed to delete note vector from ChromaDB: {}", e.getMessage());
+            log.warn("Failed to delete note vector: {}", e.getMessage());
         }
     }
 

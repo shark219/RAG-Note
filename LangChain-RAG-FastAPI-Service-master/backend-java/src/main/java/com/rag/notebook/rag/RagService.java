@@ -7,6 +7,7 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -22,13 +23,16 @@ public class RagService {
     private static final String HYDE_PROMPT = "基于以下问题，生成一个详细的假设性回答，我会根据你的这个假设性回答在向量数据库里检索文档：\n\n问题：%s\n\n假设性回答：";
 
     private final VectorStoreService vectorStoreService;
+    private final HybridRetriever hybridRetriever;
     private final ModelFactory modelFactory;
     private final ApplicationProperties props;
     private final Executor taskExecutor;
 
-    public RagService(VectorStoreService vectorStoreService, ModelFactory modelFactory,
-                      ApplicationProperties props, Executor taskExecutor) {
+    public RagService(VectorStoreService vectorStoreService, HybridRetriever hybridRetriever,
+                      ModelFactory modelFactory, ApplicationProperties props,
+                      @Qualifier("taskExecutor") Executor taskExecutor) {
         this.vectorStoreService = vectorStoreService;
+        this.hybridRetriever = hybridRetriever;
         this.modelFactory = modelFactory;
         this.props = props;
         this.taskExecutor = taskExecutor;
@@ -40,29 +44,29 @@ public class RagService {
             String prompt = String.format(HYDE_PROMPT, query);
             Response<AiMessage> response = chatModel.generate(UserMessage.from(prompt));
             return response.content().text();
-        } catch (Exception e) {
+        } catch (Exception e) { // 如果 LLM 调用失败，直接用原始问题去检索（降级但不中断）
             log.warn("HyDE generation failed, using raw query: {}", e.getMessage());
             return query;
         }
     }
-
+    /**
+     * 混合检索：HyDE + 多Query扩展 + 向量检索 + BM25 + RRF融合
+     */
     public List<Map<String, Object>> retrieveDocuments(String userId, String query) {
+        // HyDE: 用 LLM 生成假设性文档，提升语义匹配精度
         String hypotheticalDoc = generateHypotheticalDocument(query);
 
-        // Search knowledge base
-        List<Map<String, Object>> knowledgeResults = vectorStoreService.searchKnowledge(
-                userId, hypotheticalDoc, props.getChroma().getK());
-
-        // Tag source type
-        //把键 "source_type"（来源类型）的值设置为 "knowledge_base"（知识库）
+        // 混合检索知识库：原始查询用于 Query 扩展，HyDE 文档用于向量检索
+        List<Map<String, Object>> knowledgeResults = hybridRetriever.searchKnowledge(
+                userId, query, hypotheticalDoc, props.getChroma().getK());
         knowledgeResults.forEach(r -> r.put("source_type", "knowledge_base"));
 
-        // Search notes
-        List<Map<String, Object>> noteResults = vectorStoreService.searchNotes(
-                userId, hypotheticalDoc, 3);
+        // 混合检索笔记
+        List<Map<String, Object>> noteResults = hybridRetriever.searchNotes(
+                userId, query, hypotheticalDoc, 3);
         noteResults.forEach(r -> r.put("source_type", "note"));
 
-        // Merge: notes first, then knowledge base
+        // 合并：笔记优先，知识库在后
         List<Map<String, Object>> merged = new ArrayList<>();
         merged.addAll(noteResults);
         merged.addAll(knowledgeResults);

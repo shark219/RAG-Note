@@ -1,5 +1,6 @@
 package com.rag.notebook.agent;
 
+import com.rag.notebook.chat.entity.ChatMessage;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.config.ApplicationProperties;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
@@ -12,6 +13,7 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -35,16 +37,19 @@ public class AgentService {
     private final ChatService chatService;
     private final ApplicationProperties props;
     private final Executor taskExecutor;
+    private final ContextManager contextManager;
     private final List<ToolSpecification> toolSpecifications;
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
                         ChatService chatService, ApplicationProperties props,
-                        Executor taskExecutor) {
+                        @Qualifier("taskExecutor") Executor taskExecutor,
+                        ContextManager contextManager) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
         this.chatService = chatService;
         this.props = props;
         this.taskExecutor = taskExecutor;
+        this.contextManager = contextManager;
         // 从 @Tool 注解自动提取工具定义
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
@@ -57,19 +62,16 @@ public class AgentService {
         CompletableFuture.runAsync(() -> {
             SecurityContextHolder.setContext(securityContext);
             try {
-                // 加载会话历史
-                List<com.rag.notebook.chat.entity.ChatMessage> history = chatService.getSessionMessages(sessionId);
+                // 加载会话历史，滑动窗口 + 摘要压缩
+                List<ChatMessage> history = chatService.getSessionMessages(sessionId);
+                ChatLanguageModel chatModel = modelFactory.createChatModel();
+                List<dev.langchain4j.data.message.ChatMessage> historyMessages =
+                        contextManager.buildMessages(history, chatModel);
 
-                // 构建消息列表
+                // 构建消息列表：系统提示 + 压缩后的历史 + 用户新消息
                 List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
                 messages.add(SystemMessage.from(loadSystemPrompt()));
-                for (com.rag.notebook.chat.entity.ChatMessage msg : history) {
-                    if ("human".equals(msg.getRole())) {
-                        messages.add(UserMessage.from(msg.getContent()));
-                    } else if ("ai".equals(msg.getRole())) {
-                        messages.add(AiMessage.from(msg.getContent()));
-                    }
-                }
+                messages.addAll(historyMessages);
                 messages.add(UserMessage.from(query));
 
                 // 使用 function calling 处理

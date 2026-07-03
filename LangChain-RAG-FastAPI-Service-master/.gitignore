@@ -1,5 +1,5 @@
 # ==================== Java / Maven ====================
-backend-java/target/
+LangChain-RAG-FastAPI-Service-master/backend-java/target/
 *.class
 *.jar
 *.war
@@ -56,6 +56,7 @@ logs/
 # ==================== Data ====================
 data/
 media/
+node_modules
 *.db
 *.sqlite3
 

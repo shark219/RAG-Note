@@ -1,13 +1,17 @@
 package com.rag.notebook.review.controller;
 
 import com.rag.notebook.common.auth.UserId;
+import com.rag.notebook.common.exception.BusinessException;
 import com.rag.notebook.common.result.ApiResponse;
 import com.rag.notebook.review.dto.ReviewDoneResponse;
 import com.rag.notebook.review.service.ReviewService;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
+@Slf4j
 @RestController
 @RequestMapping("/review")
 public class ReviewController {
@@ -31,8 +35,14 @@ public class ReviewController {
     }
 
     @GetMapping("/question/{noteId}")
-    public ApiResponse<Map<String, Object>> generateQuestion(@UserId String userId, @PathVariable String noteId) {
-        Map<String, Object> result = reviewService.generateQuestion(userId, noteId);
-        return ApiResponse.success(result);
+    public CompletableFuture<ApiResponse<Map<String, Object>>> generateQuestion(
+            @UserId String userId, @PathVariable String noteId) {
+        return reviewService.generateQuestion(userId, noteId)
+                .thenApply(ApiResponse::success)
+                .exceptionally(ex -> {
+                    Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    log.warn("生成复习题目失败: {}", cause.getMessage());
+                    throw new BusinessException("题目生成失败，请重试");
+                });
     }
 }

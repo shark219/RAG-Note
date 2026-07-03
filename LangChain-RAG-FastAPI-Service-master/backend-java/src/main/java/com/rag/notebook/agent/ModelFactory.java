@@ -7,6 +7,7 @@ import dev.langchain4j.model.dashscope.QwenEmbeddingModel;
 import dev.langchain4j.model.ollama.OllamaChatModel;
 import dev.langchain4j.model.ollama.OllamaEmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -47,7 +48,13 @@ public class ModelFactory {
 
     public EmbeddingModel createEmbeddingModel() {
         String type = props.getEmbed().getType();
-        if ("ALIYUN".equalsIgnoreCase(type)) {
+        if ("ZHIPU".equalsIgnoreCase(type)) {
+            return OpenAiEmbeddingModel.builder()
+                    .apiKey(props.getEmbed().getZhipu().getApiKey())
+                    .baseUrl(props.getEmbed().getZhipu().getBaseUrl())
+                    .modelName(props.getEmbed().getZhipu().getModel())
+                    .build();
+        } else if ("ALIYUN".equalsIgnoreCase(type)) {
             return QwenEmbeddingModel.builder()
                     .apiKey(props.getEmbed().getAliyun().getApiKey())
                     .modelName(props.getEmbed().getAliyun().getModel())
