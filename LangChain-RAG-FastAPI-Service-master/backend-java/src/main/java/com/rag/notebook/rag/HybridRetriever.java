@@ -63,10 +63,16 @@ public class HybridRetriever {
             allRankings.add(bm25Results);
         }
 
-        // 额外：用 HyDE 假设文档做一次向量检索（语义更丰富）
+        // 额外：用 HyDE 假设文档做向量检索 + BM25 检索
         if (hydeQuery != null && !hydeQuery.equals(query)) {
             List<Map<String, Object>> hydeVectorResults = vectorStoreService.searchKnowledge(userId, hydeQuery, topK * 2);
             allRankings.add(hydeVectorResults);
+
+            List<Map<String, Object>> hydeBm25Results = bm25Service.search(userId, hydeQuery, topK * 2);
+            hydeBm25Results = hydeBm25Results.stream()
+                    .filter(r -> "knowledge_base".equals(r.get("source")))
+                    .collect(Collectors.toList());
+            allRankings.add(hydeBm25Results);
         }
 
         // 3. RRF 融合
@@ -99,10 +105,16 @@ public class HybridRetriever {
             allRankings.add(bm25Results);
         }
 
-        // 额外：用 HyDE 假设文档做一次向量检索
+        // 额外：用 HyDE 假设文档做向量检索 + BM25 检索
         if (hydeQuery != null && !hydeQuery.equals(query)) {
             List<Map<String, Object>> hydeVectorResults = vectorStoreService.searchNotes(userId, hydeQuery, topK * 2);
             allRankings.add(hydeVectorResults);
+
+            List<Map<String, Object>> hydeBm25Results = bm25Service.search(userId, hydeQuery, topK * 2);
+            hydeBm25Results = hydeBm25Results.stream()
+                    .filter(r -> "note".equals(r.get("source")))
+                    .collect(Collectors.toList());
+            allRankings.add(hydeBm25Results);
         }
 
         List<Map<String, Object>> fused = rrfFusion(allRankings, topK);
