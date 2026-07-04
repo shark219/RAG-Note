@@ -1,6 +1,87 @@
-chroma.log
-chroma_data/
-chroma/
-data/
+# ==================== Java / Maven ====================
+LangChain-RAG-FastAPI-Service-master/backend-java/target/
+*.class
+*.jar
+*.war
+*.ear
+hs_err_pid*
+replay_pid*
+
+# Maven
+.mvn/wrapper/maven-wrapper.jar
+
+# ==================== Node / Vue ====================
+front/node_modules/
+front/dist/
+front/package-lock.json
+front/pnpm-lock.yaml
+
+# ==================== IDE ====================
 .idea/
-*.bak
+.vscode/
+*.swp
+*.swo
+*.iml
+.project
+.classpath
+.settings/
+*.code-workspace
+.trae
+.opencode/
+.omo/
+.codegraph/
+
+# ==================== Environment ====================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+# 保留 .env.example
+!.env.example
+
+# ==================== OS ====================
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ==================== Logs ====================
+logs/
+*.log
+
+# ==================== Data ====================
+data/
+media/
+node_modules
+*.db
+*.sqlite3
+
+# ==================== Python (Django 用户服务) ====================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+migrations/
+
+# ==================== ChromaDB ====================
+chromadb/
+bm25_index/
+md5_hex_store/
+
+# ==================== Temporary ====================
+*.tmp
+*.temp
+*.pem
+
+# ==================== Jupyter ====================
+.ipynb_checkpoints/
+
+#隐私
+
+application.yml

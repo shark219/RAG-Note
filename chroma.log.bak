@@ -1,0 +1,116 @@
+[33mWARNING[0m:  [02-07-2026 18:33:14] chroma_server_nofile is not supported on Windows. chroma_server_nofile will not be set.
+[32mINFO[0m:     [02-07-2026 18:33:14] Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+[36mDEBUG[0m:    [02-07-2026 18:33:14] Starting component System
+[36mDEBUG[0m:    [02-07-2026 18:33:14] Starting component OpenTelemetryClient
+[36mDEBUG[0m:    [02-07-2026 18:33:14] Starting component SqliteDB
+[36mDEBUG[0m:    [02-07-2026 18:33:15] Starting component SimpleQuotaEnforcer
+[36mDEBUG[0m:    [02-07-2026 18:33:15] Starting component Posthog
+[36mDEBUG[0m:    [02-07-2026 18:33:15] Starting component SimpleRateLimitEnforcer
+[36mDEBUG[0m:    [02-07-2026 18:33:15] Starting component LocalSegmentManager
+[36mDEBUG[0m:    [02-07-2026 18:33:15] Starting component LocalExecutor
+[36mDEBUG[0m:    [02-07-2026 18:33:15] Starting component SegmentAPI
+[31mERROR[0m:    [02-07-2026 18:33:15] Failed to send telemetry event ServerStartEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 18:33:15] Started server process [[36m106388[0m]
+[32mINFO[0m:     [02-07-2026 18:33:15] Waiting for application startup.
+[32mINFO[0m:     [02-07-2026 18:33:15] Application startup complete.
+[32mINFO[0m:     [02-07-2026 18:33:15] Uvicorn running on [1mhttp://localhost:8001[0m (Press CTRL+C to quit)
+[32mINFO[0m:     [02-07-2026 18:33:35] Shutting down
+[32mINFO[0m:     [02-07-2026 18:33:35] Waiting for application shutdown.
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component System
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component SegmentAPI
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component LocalExecutor
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component LocalSegmentManager
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component SimpleRateLimitEnforcer
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component Posthog
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component SimpleQuotaEnforcer
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component SqliteDB
+[36mDEBUG[0m:    [02-07-2026 18:33:35] Stopping component OpenTelemetryClient
+[32mINFO[0m:     [02-07-2026 18:33:35] Application shutdown complete.
+[32mINFO[0m:     [02-07-2026 18:33:35] Finished server process [[36m106388[0m]
+[33mWARNING[0m:  [02-07-2026 18:45:55] chroma_server_nofile is not supported on Windows. chroma_server_nofile will not be set.
+[32mINFO[0m:     [02-07-2026 18:45:55] Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component System
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component OpenTelemetryClient
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component SqliteDB
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component SimpleQuotaEnforcer
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component Posthog
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component SimpleRateLimitEnforcer
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component LocalSegmentManager
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component LocalExecutor
+[36mDEBUG[0m:    [02-07-2026 18:45:55] Starting component SegmentAPI
+[31mERROR[0m:    [02-07-2026 18:45:55] Failed to send telemetry event ServerStartEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 18:45:55] Started server process [[36m116088[0m]
+[32mINFO[0m:     [02-07-2026 18:45:55] Waiting for application startup.
+[32mINFO[0m:     [02-07-2026 18:45:55] Application startup complete.
+[32mINFO[0m:     [02-07-2026 18:45:55] Uvicorn running on [1mhttp://localhost:8001[0m (Press CTRL+C to quit)
+[32mINFO[0m:     [02-07-2026 18:46:17] 127.0.0.1:52243 - "GET /api/v1/collections/notes_collection HTTP/1.1" 400
+[31mERROR[0m:    [02-07-2026 18:46:17] Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 18:46:17] 127.0.0.1:52243 - "POST /api/v1/collections HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:46:17] 127.0.0.1:52245 - "GET /api/v1/collections/rag_collection HTTP/1.1" 400
+[31mERROR[0m:    [02-07-2026 18:46:17] Failed to send telemetry event ClientCreateCollectionEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 18:46:17] 127.0.0.1:52245 - "POST /api/v1/collections HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:54:13] 127.0.0.1:54284 - "GET /api/v1/collections/notes_collection HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:54:13] 127.0.0.1:54286 - "GET /api/v1/collections/rag_collection HTTP/1.1" 200
+[36mDEBUG[0m:    [02-07-2026 18:54:45] Starting component PersistentLocalHnswSegment
+[31mERROR[0m:    [02-07-2026 18:54:45] Failed to send telemetry event CollectionAddEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 18:54:45] 127.0.0.1:54414 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/add HTTP/1.1" 201
+[31mERROR[0m:    [02-07-2026 18:57:33] Failed to send telemetry event CollectionQueryEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 18:57:33] 127.0.0.1:55140 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:57:33] 127.0.0.1:55140 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:57:34] 127.0.0.1:55140 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:57:34] 127.0.0.1:55140 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:57:35] 127.0.0.1:55140 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[31mERROR[0m:    [02-07-2026 18:57:36] Failed to send telemetry event CollectionQueryEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 18:57:36] 127.0.0.1:55156 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:57:37] 127.0.0.1:55156 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:57:37] 127.0.0.1:55156 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:57:37] 127.0.0.1:55156 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 18:57:37] 127.0.0.1:55156 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[36mDEBUG[0m:    [02-07-2026 19:08:39] Starting component PersistentLocalHnswSegment
+[31mERROR[0m:    [02-07-2026 19:08:39] Failed to send telemetry event CollectionAddEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 19:08:39] 127.0.0.1:57945 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/add HTTP/1.1" 201
+[32mINFO[0m:     [02-07-2026 19:09:00] 127.0.0.1:57945 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/add HTTP/1.1" 201
+[32mINFO[0m:     [02-07-2026 19:09:54] 127.0.0.1:58267 - "GET /api/v1/collections/notes_collection HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 19:09:54] 127.0.0.1:58268 - "GET /api/v1/collections/rag_collection HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 19:10:12] 127.0.0.1:58267 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/add HTTP/1.1" 201
+[33mWARNING[0m:  [02-07-2026 19:10:19] Number of requested results 4 is greater than number of elements in index 3, updating n_results = 3
+[32mINFO[0m:     [02-07-2026 19:10:19] 127.0.0.1:58267 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[33mWARNING[0m:  [02-07-2026 19:10:27] Delete of nonexisting embedding ID: 3022b4e2147344a39cc128d9b3200a4b
+[33mWARNING[0m:  [02-07-2026 19:10:27] Delete of nonexisting embedding ID: 3022b4e2147344a39cc128d9b3200a4b
+[31mERROR[0m:    [02-07-2026 19:10:27] Failed to send telemetry event CollectionDeleteEvent: capture() takes 1 positional argument but 3 were given
+[32mINFO[0m:     [02-07-2026 19:10:27] 127.0.0.1:58267 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/delete HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 19:10:27] 127.0.0.1:58267 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/add HTTP/1.1" 201
+[32mINFO[0m:     [02-07-2026 19:10:28] 127.0.0.1:58267 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 19:11:42] 127.0.0.1:58747 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/add HTTP/1.1" 201
+[32mINFO[0m:     [02-07-2026 19:12:37] 127.0.0.1:58980 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 19:12:38] 127.0.0.1:58980 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 19:12:38] 127.0.0.1:58980 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 19:12:38] 127.0.0.1:58980 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 19:12:38] 127.0.0.1:58980 - "POST /api/v1/collections/7b3bcbd5-ef1b-45fa-9c47-a70b2cbdfc4e/query HTTP/1.1" 200
+[33mWARNING[0m:  [02-07-2026 19:12:40] Number of requested results 6 is greater than number of elements in index 5, updating n_results = 5
+[32mINFO[0m:     [02-07-2026 19:12:40] 127.0.0.1:58995 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[33mWARNING[0m:  [02-07-2026 19:12:40] Number of requested results 6 is greater than number of elements in index 5, updating n_results = 5
+[32mINFO[0m:     [02-07-2026 19:12:40] 127.0.0.1:58995 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[33mWARNING[0m:  [02-07-2026 19:12:40] Number of requested results 6 is greater than number of elements in index 5, updating n_results = 5
+[32mINFO[0m:     [02-07-2026 19:12:40] 127.0.0.1:58995 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[33mWARNING[0m:  [02-07-2026 19:12:41] Number of requested results 6 is greater than number of elements in index 5, updating n_results = 5
+[32mINFO[0m:     [02-07-2026 19:12:41] 127.0.0.1:58995 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[33mWARNING[0m:  [02-07-2026 19:12:41] Number of requested results 6 is greater than number of elements in index 5, updating n_results = 5
+[32mINFO[0m:     [02-07-2026 19:12:41] 127.0.0.1:58995 - "POST /api/v1/collections/a7c3251f-85da-4dd5-a44a-35fd7735c171/query HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 21:52:05] 127.0.0.1:62116 - "GET /api/v1/collections/notes_collection HTTP/1.1" 200
+[32mINFO[0m:     [02-07-2026 21:52:05] 127.0.0.1:62117 - "GET /api/v1/collections/rag_collection HTTP/1.1" 200
+[32mINFO[0m:     [03-07-2026 10:44:27] Shutting down
+[32mINFO[0m:     [03-07-2026 10:44:27] Waiting for application shutdown.
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component System
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component SegmentAPI
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component LocalExecutor
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component PersistentLocalHnswSegment
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component PersistentLocalHnswSegment
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component LocalSegmentManager
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component SimpleRateLimitEnforcer
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component Posthog
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component SimpleQuotaEnforcer
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component SqliteDB
+[36mDEBUG[0m:    [03-07-2026 10:44:27] Stopping component OpenTelemetryClient
+[32mINFO[0m:     [03-07-2026 10:44:27] Application shutdown complete.
+[32mINFO[0m:     [03-07-2026 10:44:27] Finished server process [[36m116088[0m]
