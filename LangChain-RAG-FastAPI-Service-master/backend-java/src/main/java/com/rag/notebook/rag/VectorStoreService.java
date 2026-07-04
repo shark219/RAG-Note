@@ -9,6 +9,8 @@ import com.rag.notebook.knowledge.repository.ChromaCleanupTaskRepository;
 import com.rag.notebook.knowledge.repository.KnowledgeDocumentChunkRepository;
 import com.rag.notebook.knowledge.repository.KnowledgeDocumentRepository;
 import com.rag.notebook.note.entity.Note;
+import com.rag.notebook.note.entity.NoteChunk;
+import com.rag.notebook.note.repository.NoteChunkRepository;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
@@ -50,6 +52,7 @@ public class VectorStoreService {
     private final ChromaCleanupTaskRepository cleanupTaskRepository;
     private final StringRedisTemplate redisTemplate;
     private final Md5Store md5Store;
+    private final NoteChunkRepository noteChunkRepository;
 
     // ChromaDB 向量存储（连接成功时使用）
     private EmbeddingStore<TextSegment> noteStore;
@@ -61,7 +64,8 @@ public class VectorStoreService {
                               KnowledgeDocumentChunkRepository chunkRepository,
                               ChromaCleanupTaskRepository cleanupTaskRepository,
                               StringRedisTemplate redisTemplate,
-                              Md5Store md5Store) {
+                              Md5Store md5Store,
+                              NoteChunkRepository noteChunkRepository) {
         this.props = props;
         this.embeddingModel = modelFactory.createEmbeddingModel();
         this.bm25Service = bm25Service;
@@ -70,6 +74,7 @@ public class VectorStoreService {
         this.cleanupTaskRepository = cleanupTaskRepository;
         this.redisTemplate = redisTemplate;
         this.md5Store = md5Store;
+        this.noteChunkRepository = noteChunkRepository;
 
         // 尝试连接 ChromaDB
         try {
@@ -94,8 +99,9 @@ public class VectorStoreService {
     // ========== 笔记向量操作 ==========
 
     /**
-     * 添加笔记向量（与知识库流程一致：向量→ChromaDB，BM25→Bm25Service）
+     * 添加笔记向量（与知识库流程一致：切片→MySQL+ChromaDB+BM25）
      */
+    @Transactional
     public void addNoteVector(Note note) {
         if (!chromaAvailable) {
             log.warn("ChromaDB不可用，无法添加笔记向量: noteId={}", note.getId());
@@ -103,45 +109,140 @@ public class VectorStoreService {
         }
 
         String text = buildNoteText(note);
-        Embedding embedding = embed(text);
+        String title = note.getTitle() != null ? note.getTitle() : "";
 
-        Map<String, Object> meta = new HashMap<>();
-        meta.put("note_id", note.getId());
-        meta.put("user_id", note.getUserId());
-        meta.put("doc_type", "note");
-        meta.put("title", note.getTitle() != null ? note.getTitle() : "");
-        meta.put("content", note.getContent() != null ? note.getContent() : "");
+        // 1. 文本切片
+        List<String> chunks = splitText(text, props.getChroma().getChunkSize(), props.getChroma().getChunkOverlap());
+        log.info("笔记切片完成: noteId={}, chunks={}", note.getId(), chunks.size());
 
-        // 写入 ChromaDB
-        TextSegment segment = TextSegment.from(text, dev.langchain4j.data.document.Metadata.from(meta));
-        noteStore.add(embedding, segment);
+        // 2. 写入 MySQL（NoteChunk 表）
+        List<NoteChunk> chunkEntities = new ArrayList<>();
+        for (int i = 0; i < chunks.size(); i++) {
+            NoteChunk chunk = new NoteChunk();
+            chunk.setId(UUID.randomUUID().toString());
+            chunk.setNoteId(note.getId());
+            chunk.setChunkIndex(i);
+            chunk.setContent(chunks.get(i));
+            chunkEntities.add(chunk);
+        }
+        noteChunkRepository.saveAll(chunkEntities);
 
-        // 写入 BM25 索引
-        bm25Service.addDocument(note.getUserId(), note.getId(), text,
-                Map.of("source", "note", "note_id", note.getId(),
-                        "title", note.getTitle(), "user_id", note.getUserId()));
+        // 3. 异步写入 ChromaDB
+        writeNoteToChromaAsync(note.getId(), note.getUserId(), title, chunks);
 
-        log.info("笔记向量添加成功: noteId={}", note.getId());
+        // 4. 写入 BM25 索引
+        for (int i = 0; i < chunks.size(); i++) {
+            String chunkKey = note.getId() + "_" + i;
+            bm25Service.addDocument(note.getUserId(), chunkKey, chunks.get(i),
+                    Map.of("source", "note", "chunk_id", chunkKey,
+                            "note_id", note.getId(), "title", title, "user_id", note.getUserId()));
+        }
+
+        log.info("笔记向量添加成功: noteId={}, chunks={}", note.getId(), chunks.size());
     }
 
     /**
-     * 删除笔记向量（需要传入 userId 用于 BM25 删除）
+     * 异步写入笔记向量到 ChromaDB
      */
+    @Async
+    public void writeNoteToChromaAsync(String noteId, String userId, String title, List<String> chunks) {
+        try {
+            // 1. 清理旧数据
+            deleteNoteChunksFromChroma(noteId);
+
+            // 2. 批量写入新数据
+            List<TextSegment> segments = new ArrayList<>();
+            for (int i = 0; i < chunks.size(); i++) {
+                String chunkKey = noteId + "_" + i;
+                String content = chunks.get(i);
+
+                Map<String, Object> meta = new HashMap<>();
+                meta.put("chunk_id", chunkKey);
+                meta.put("note_id", noteId);
+                meta.put("user_id", userId);
+                meta.put("title", title);
+                meta.put("content", content);
+                meta.put("index", i);
+                meta.put("source", "note");
+
+                segments.add(TextSegment.from(content, dev.langchain4j.data.document.Metadata.from(meta)));
+            }
+
+            // 分批写入
+            int batchSize = 10;
+            for (int i = 0; i < segments.size(); i += batchSize) {
+                int end = Math.min(i + batchSize, segments.size());
+                List<TextSegment> batch = segments.subList(i, end);
+                List<String> batchContents = chunks.subList(i, end);
+                List<Embedding> embeddings = batchEmbed(batchContents);
+                noteStore.addAll(embeddings, batch);
+            }
+
+            log.info("笔记向量写入ChromaDB成功: noteId={}, chunks={}", noteId, chunks.size());
+        } catch (Exception e) {
+            log.error("笔记向量写入ChromaDB失败: noteId={}, error={}", noteId, e.getMessage());
+        }
+    }
+
+    /**
+     * 从 ChromaDB 删除笔记的所有切片
+     */
+    private void deleteNoteChunksFromChroma(String noteId) {
+        // 查询并删除所有属于该笔记的向量
+        // 由于 ChromaDB 不支持按 metadata 批量删除，这里使用 REST API
+        try {
+            String chromaUrl = props.getChroma().getUrl();
+            String collectionName = props.getChroma().getNotesCollection();
+            String collectionId = getCollectionId(collectionName);
+
+            if (collectionId == null) {
+                log.error("无法获取笔记Collection ID");
+                return;
+            }
+
+            String deleteUrl = chromaUrl + "/api/v1/collections/" + collectionId + "/delete";
+            String requestBody = String.format("{\"where\": {\"note_id\": \"%s\"}}", noteId);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<String> entity = new HttpEntity<>(requestBody, headers);
+
+            RestTemplate restTemplate = new RestTemplate();
+            ResponseEntity<String> response = restTemplate.exchange(deleteUrl, HttpMethod.POST, entity, String.class);
+
+            if (response.getStatusCode() == HttpStatus.OK) {
+                log.info("笔记旧向量删除成功: noteId={}", noteId);
+            }
+        } catch (Exception e) {
+            log.warn("笔记旧向量删除失败: noteId={}, error={}", noteId, e.getMessage());
+        }
+    }
+
+    /**
+     * 删除笔记向量（删除所有 chunk）
+     */
+    @Transactional
     public void deleteNoteVector(String noteId, String userId) {
-        // 1. 尝试从 ChromaDB 删除，失败则记录待清理任务
+        // 1. 从 MySQL 删除 NoteChunk
+        noteChunkRepository.deleteByNoteId(noteId);
+        log.info("笔记切片已从MySQL删除: noteId={}", noteId);
+
+        // 2. 从 ChromaDB 删除（按 note_id 批量删除）
         if (chromaAvailable) {
             try {
-                noteStore.remove(noteId);
-                log.info("笔记向量删除成功: noteId={}", noteId);
+                deleteNoteChunksFromChroma(noteId);
+                log.info("笔记向量已从ChromaDB删除: noteId={}", noteId);
             } catch (Exception e) {
                 log.error("笔记向量删除失败，记录待清理任务: noteId={}, error={}", noteId, e.getMessage());
                 saveNoteCleanupTask(noteId, userId, props.getChroma().getNotesCollection());
             }
         }
 
-        // 2. 从 BM25 索引删除
-        if (userId != null) {
-            bm25Service.deleteDocument(userId, noteId);
+        // 3. 从 BM25 索引删除（删除所有 chunk）
+        List<NoteChunk> chunks = noteChunkRepository.findByNoteIdOrderByChunkIndexAsc(noteId);
+        for (NoteChunk chunk : chunks) {
+            String chunkKey = noteId + "_" + chunk.getChunkIndex();
+            bm25Service.deleteDocument(userId, chunkKey);
         }
     }
 
@@ -808,10 +909,57 @@ public class VectorStoreService {
         StringBuilder sb = new StringBuilder();
         if (note.getTitle() != null && !note.getTitle().isEmpty()) sb.append(note.getTitle()).append("\n");
         if (note.getContent() != null) {
-            String content = note.getContent().length() > 1000 ? note.getContent().substring(0, 1000) : note.getContent();
-            sb.append(content);
+            sb.append(note.getContent());
         }
         return sb.toString();
+    }
+
+    /**
+     * 文本切片（与 DocumentProcessor 逻辑一致）
+     */
+    private List<String> splitText(String text, int chunkSize, int chunkOverlap) {
+        List<String> chunks = new ArrayList<>();
+        if (text == null || text.isEmpty()) return chunks;
+
+        String[] separators = {"\n\n", "\n", "。", "！", "？", ".", "!", "?", "；", ";", "，", ","};
+        List<String> sentences = splitBySeparators(text, separators);
+
+        StringBuilder currentChunk = new StringBuilder();
+        for (String sentence : sentences) {
+            if (currentChunk.length() + sentence.length() > chunkSize && currentChunk.length() > 0) {
+                chunks.add(currentChunk.toString().trim());
+                String overlap = currentChunk.toString();
+                int overlapStart = Math.max(0, overlap.length() - chunkOverlap);
+                currentChunk = new StringBuilder(overlap.substring(overlapStart));
+            }
+            currentChunk.append(sentence);
+        }
+        if (currentChunk.length() > 0) {
+            chunks.add(currentChunk.toString().trim());
+        }
+
+        return chunks;
+    }
+
+    private List<String> splitBySeparators(String text, String[] separators) {
+        List<String> result = new ArrayList<>();
+        result.add(text);
+
+        for (String sep : separators) {
+            List<String> newResult = new ArrayList<>();
+            for (String segment : result) {
+                String[] parts = segment.split("(?=" + java.util.regex.Pattern.quote(sep) + ")");
+                for (String part : parts) {
+                    if (!part.isEmpty()) {
+                        newResult.add(part);
+                    }
+                }
+            }
+            result = newResult;
+            if (result.size() > 1) break;
+        }
+
+        return result;
     }
 
     private float cosineSimilarity(float[] a, float[] b) {

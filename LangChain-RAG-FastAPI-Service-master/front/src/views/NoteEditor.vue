@@ -5,9 +5,10 @@
       <!-- 顶部操作栏 -->
       <div class="editor-toolbar">
         <span class="toolbar-back" @click="goBack">← 返回</span>
-        <span class="toolbar-title-label">{{ isNew ? '新建笔记' : '编辑笔记' }}</span>
+        <span class="toolbar-title-label">{{ isNew ? '新建笔记' : (isPreview ? '预览笔记' : '编辑笔记') }}</span>
         <div class="toolbar-actions">
-          <span class="toolbar-btn" @click="handleSave">{{ saving ? '保存中...' : '保存' }}</span>
+          <span v-if="!isNew" class="toolbar-btn" @click="togglePreview">{{ isPreview ? '编辑' : '预览' }}</span>
+          <span v-if="!isPreview" class="toolbar-btn" @click="handleSave">{{ saving ? '保存中...' : '保存' }}</span>
           <span v-if="!isNew" class="toolbar-btn toolbar-btn--delete" @click="handleDelete">删除</span>
         </div>
       </div>
@@ -26,17 +27,22 @@
         </div>
       </div>
 
-      <!-- 快捷 Markdown 工具栏 -->
-      <QuickToolbar :editor-ref="markdownEditorRef" />
+      <!-- 快捷 Markdown 工具栏（仅编辑模式显示） -->
+      <QuickToolbar v-if="!isPreview" :editor-ref="markdownEditorRef" />
 
-      <!-- Markdown 编辑器 -->
+      <!-- Markdown 编辑器 / 预览 -->
       <div class="editor-body">
-        <MarkdownEditor ref="markdownEditorRef" v-model="content" />
-        <InlineCompletion
-          :context="completionContext"
-          :position="cursorPosition"
-          @accept="handleAccept"
-        />
+        <!-- 预览模式 -->
+        <div v-if="isPreview" class="preview-content markdown-body" v-html="renderedContent"></div>
+        <!-- 编辑模式 -->
+        <template v-else>
+          <MarkdownEditor ref="markdownEditorRef" v-model="content" />
+          <InlineCompletion
+            :context="completionContext"
+            :position="cursorPosition"
+            @accept="handleAccept"
+          />
+        </template>
       </div>
     </div>
 
@@ -154,6 +160,13 @@ const tags = ref([])
 const category = ref('')
 const saving = ref(false)
 const noteId = ref('')
+const isPreview = ref(false)  // 是否为预览模式
+
+/** 预览模式下渲染的 HTML 内容 */
+const renderedContent = computed(() => {
+  const html = marked.parse(content.value || '')
+  return DOMPurify.sanitize(html)
+})
 
 /** ---- 侧边栏状态 ---- */
 const sidebarVisible = ref(false)
@@ -192,6 +205,11 @@ function toggleSidebar() {
   if (sidebarVisible.value && relatedItems.value.length === 0) {
     fetchRelated()
   }
+}
+
+/** 切换预览/编辑模式 */
+function togglePreview() {
+  isPreview.value = !isPreview.value
 }
 
 /** 在侧边栏内展开查看关联笔记的完整内容 */
@@ -320,7 +338,8 @@ async function handleSave() {
       if (json.code === 200) {
         clearDraft()
         showToast('保存成功')
-        router.replace(`/notes/${json.data.id}`)
+        // 跳转到新笔记并设置为预览模式
+        router.replace({ path: `/notes/${json.data.id}`, query: { preview: 'true' } })
       } else {
         showToast('保存失败')
       }
@@ -334,6 +353,8 @@ async function handleSave() {
       if (json.code === 200) {
         clearDraft()
         showToast('保存成功')
+        // 保存成功后切换到预览模式
+        isPreview.value = true
       } else {
         showToast('保存失败')
       }
@@ -392,8 +413,11 @@ onMounted(() => {
   noteId.value = route.params.id
   if (isNew.value) {
     clearDraft()
+    isPreview.value = false  // 新建笔记默认编辑模式
   } else {
     loadNote()
+    // 旧笔记默认预览模式，或 URL 中指定 preview=true
+    isPreview.value = route.query.preview === 'true' || !route.query.preview
   }
   setupCursorTracking()
 })
@@ -553,6 +577,104 @@ onUnmounted(() => {
   position: relative;
   min-height: 0;
   z-index: 1;
+}
+
+/* 预览内容样式 */
+.preview-content {
+  padding: 24px;
+  max-width: 800px;
+  margin: 0 auto;
+  font-size: 15px;
+  line-height: 1.8;
+  color: #333;
+}
+.preview-content :deep(h1) {
+  font-size: 24px;
+  font-weight: 700;
+  margin: 24px 0 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #eee;
+}
+.preview-content :deep(h2) {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 20px 0 12px;
+}
+.preview-content :deep(h3) {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 16px 0 8px;
+}
+.preview-content :deep(p) {
+  margin: 0 0 12px;
+}
+.preview-content :deep(pre) {
+  background: #f5f5f5;
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-size: 13px;
+  margin: 12px 0;
+}
+.preview-content :deep(code) {
+  background: #f0f0f0;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 13px;
+  font-family: 'Consolas', 'Monaco', monospace;
+}
+.preview-content :deep(pre code) {
+  background: transparent;
+  padding: 0;
+}
+.preview-content :deep(blockquote) {
+  margin: 12px 0;
+  padding: 8px 16px;
+  border-left: 4px solid #ddd;
+  color: #666;
+  background: #fafafa;
+  border-radius: 0 4px 4px 0;
+}
+.preview-content :deep(ul),
+.preview-content :deep(ol) {
+  margin: 8px 0;
+  padding-left: 24px;
+}
+.preview-content :deep(li) {
+  margin: 4px 0;
+}
+.preview-content :deep(table) {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 12px 0;
+}
+.preview-content :deep(th),
+.preview-content :deep(td) {
+  border: 1px solid #e0e0e0;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+.preview-content :deep(th) {
+  background: #f5f5f5;
+  font-weight: 600;
+}
+.preview-content :deep(img) {
+  max-width: 100%;
+  border-radius: 4px;
+  margin: 8px 0;
+}
+.preview-content :deep(a) {
+  color: #1967D2;
+  text-decoration: none;
+}
+.preview-content :deep(a:hover) {
+  text-decoration: underline;
+}
+.preview-content :deep(hr) {
+  border: none;
+  border-top: 1px solid #eee;
+  margin: 20px 0;
 }
 
 /* ============ 侧边栏区域 ============ */

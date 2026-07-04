@@ -113,7 +113,13 @@ public class ApplicationProperties {
 
     @Data
     public static class Reranker {
-        private String modelPath = "";
+        private boolean enabled = false;
+        private String type = "ZHIPU";
+        private String apiKey = "";
+        private String baseUrl = "https://open.bigmodel.cn/api/paas/v4";
+        private String model = "rerank";
+        private double scoreThreshold = 0.5;
+        private int topN = 5;
     }
 
     @Data

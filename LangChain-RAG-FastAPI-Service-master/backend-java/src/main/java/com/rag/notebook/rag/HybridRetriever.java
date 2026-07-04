@@ -7,12 +7,14 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * 混合检索服务：向量检索 + BM25 + 多 Query 扩展 + RRF 融合
+ * 混合检索服务：向量检索 + BM25 + 多 Query 扩展 + RRF 融合 + Cross-Encoder 精排
  *
  * 检索流程：
  * 1. 多 Query 扩展：将用户查询改写为 N 个语义等价版本
  * 2. 每个查询版本分别执行：向量检索 + BM25 检索
  * 3. RRF 融合：将所有路的检索结果用 Reciprocal Rank Fusion 合并排序
+ * 4. Cross-Encoder 精排：使用智谱 AI rerank API 重新打分
+ * 5. 阈值过滤：过滤掉低相关性的结果
  */
 @Slf4j
 @Service
@@ -24,13 +26,16 @@ public class HybridRetriever {
     private final VectorStoreService vectorStoreService;
     private final Bm25Service bm25Service;
     private final QueryExpander queryExpander;
+    private final RerankerService rerankerService;
 
     public HybridRetriever(VectorStoreService vectorStoreService,
                            Bm25Service bm25Service,
-                           QueryExpander queryExpander) {
+                           QueryExpander queryExpander,
+                           RerankerService rerankerService) {
         this.vectorStoreService = vectorStoreService;
         this.bm25Service = bm25Service;
         this.queryExpander = queryExpander;
+        this.rerankerService = rerankerService;
     }
 
     /**
@@ -76,8 +81,12 @@ public class HybridRetriever {
         }
 
         // 3. RRF 融合
-        List<Map<String, Object>> fused = rrfFusion(allRankings, topK);
-        log.info("知识库混合检索完成: {} 个查询版本 × {}路, 融合后返回 {} 条",
+        List<Map<String, Object>> fused = rrfFusion(allRankings, topK * 2);
+
+        // 4. Cross-Encoder 精排
+        fused = rerankerService.rerank(query, fused);
+
+        log.info("知识库混合检索完成: {} 个查询版本 × {}路, 精排后返回 {} 条",
                 queries.size(), allRankings.size(), fused.size());
 
         return fused;
@@ -117,8 +126,13 @@ public class HybridRetriever {
             allRankings.add(hydeBm25Results);
         }
 
-        List<Map<String, Object>> fused = rrfFusion(allRankings, topK);
-        log.info("笔记混合检索完成: 返回 {} 条", fused.size());
+        // RRF 融合
+        List<Map<String, Object>> fused = rrfFusion(allRankings, topK * 2);
+
+        // Cross-Encoder 精排
+        fused = rerankerService.rerank(query, fused);
+
+        log.info("笔记混合检索完成: 精排后返回 {} 条", fused.size());
 
         return fused;
     }

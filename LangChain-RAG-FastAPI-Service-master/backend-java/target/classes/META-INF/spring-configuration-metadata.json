@@ -243,7 +243,42 @@
       "sourceType": "com.rag.notebook.config.ApplicationProperties$RateLimit"
     },
     {
+      "name": "app.reranker.api-key",
+      "type": "java.lang.String",
+      "sourceType": "com.rag.notebook.config.ApplicationProperties$Reranker"
+    },
+    {
+      "name": "app.reranker.base-url",
+      "type": "java.lang.String",
+      "sourceType": "com.rag.notebook.config.ApplicationProperties$Reranker"
+    },
+    {
+      "name": "app.reranker.enabled",
+      "type": "java.lang.Boolean",
+      "sourceType": "com.rag.notebook.config.ApplicationProperties$Reranker"
+    },
+    {
+      "name": "app.reranker.model",
+      "type": "java.lang.String",
+      "sourceType": "com.rag.notebook.config.ApplicationProperties$Reranker"
+    },
+    {
       "name": "app.reranker.model-path",
+      "type": "java.lang.String",
+      "sourceType": "com.rag.notebook.config.ApplicationProperties$Reranker"
+    },
+    {
+      "name": "app.reranker.score-threshold",
+      "type": "java.lang.Double",
+      "sourceType": "com.rag.notebook.config.ApplicationProperties$Reranker"
+    },
+    {
+      "name": "app.reranker.top-n",
+      "type": "java.lang.Integer",
+      "sourceType": "com.rag.notebook.config.ApplicationProperties$Reranker"
+    },
+    {
+      "name": "app.reranker.type",
       "type": "java.lang.String",
       "sourceType": "com.rag.notebook.config.ApplicationProperties$Reranker"
     },
