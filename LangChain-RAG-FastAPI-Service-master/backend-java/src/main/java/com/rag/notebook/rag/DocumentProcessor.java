@@ -58,7 +58,7 @@ public class DocumentProcessor {
                     "source", "knowledge_base",
                     "created_at", System.currentTimeMillis()
             );
-            vectorStoreService.addKnowledgeDocument(userId, originalFilename, md5, chunks, metadata);
+            vectorStoreService.addKnowledgeDocument(userId, originalFilename, md5, chunks, metadata, progressCallback);
 
             md5Store.save(md5, originalFilename, originalFilename, userId);
 

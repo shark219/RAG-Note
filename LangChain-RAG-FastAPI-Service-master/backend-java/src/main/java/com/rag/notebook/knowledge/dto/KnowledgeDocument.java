@@ -10,5 +10,6 @@ public record KnowledgeDocument(
         String userId,
         int chunkCount,
         String preview,
+        String status,
         String createdAt
 ) {}

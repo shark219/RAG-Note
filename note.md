@@ -1,6 +1,15 @@
 # RAG-Note 项目架构与开发思路梳理
 
 > AI 驱动的智能知识管理笔记系统，基于 RAG（检索增强生成）+ 间隔复习 + Agent 智能体
+> 
+写在前面：
+
+    chroma启动：
+        conda activate chroma-server
+        chroma run --host 0.0.0.0 --port 8001 --path D:/code/javacode/RAG-Note/data/chromadb
+    前端启动：
+        cd LangChain-RAG-FastAPI-Service-master/front
+        npm run dev
 
 ---
 

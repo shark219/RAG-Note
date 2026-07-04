@@ -237,7 +237,7 @@ public class NoteService {
 
         if (contentChanged) {
             try {
-                vectorStoreService.deleteNoteVector(noteId);
+                vectorStoreService.deleteNoteVector(noteId, note.getUserId());
                 vectorStoreService.addNoteVector(note);
             } catch (Exception e) {
                 log.warn("Failed to update note vector in ChromaDB: {}", e.getMessage());
@@ -263,7 +263,7 @@ public class NoteService {
 
         // 删除向量索引
         try {
-            vectorStoreService.deleteNoteVector(noteId);
+            vectorStoreService.deleteNoteVector(noteId, userId);
         } catch (Exception e) {
             log.warn("Failed to delete note vector: {}", e.getMessage());
         }

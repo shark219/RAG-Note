@@ -1,5 +1,6 @@
 package com.rag.notebook.rag;
 
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
@@ -12,21 +13,27 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.search.*;
-import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 基于 Lucene 的 BM25 检索服务
- * 为每个用户维护独立的内存索引，支持中英文 BM25 评分检索
+ * 为每个用户维护独立的磁盘索引，支持中英文 BM25 评分检索
+ * 索引持久化到磁盘，应用重启后自动加载，无需重建
  */
 @Slf4j
 @Service
 public class Bm25Service {
+
+    private static final String INDEX_BASE_DIR = "data/bm25_index";
 
     // 每个用户独立的索引：key=userId
     private final Map<String, Directory> userIndexes = new ConcurrentHashMap<>();
@@ -34,6 +41,18 @@ public class Bm25Service {
     private final Map<String, Map<String, Map<String, Object>>> userDocMetadata = new ConcurrentHashMap<>();
 
     private final Analyzer analyzer = new StandardAnalyzer();
+
+    @PostConstruct
+    public void init() {
+        // 确保索引基础目录存在
+        try {
+            Path basePath = Paths.get(INDEX_BASE_DIR);
+            Files.createDirectories(basePath);
+            log.info("BM25索引目录已初始化: {}", basePath.toAbsolutePath());
+        } catch (IOException e) {
+            log.error("创建BM25索引目录失败: {}", e.getMessage());
+        }
+    }
 
     /**
      * 添加文档到用户的 BM25 索引
@@ -133,12 +152,53 @@ public class Bm25Service {
      * 清空用户的 BM25 索引
      */
     public void clearUserIndex(String userId) {
-        userIndexes.remove(userId);
+        Directory indexDir = userIndexes.get(userId);
+        if (indexDir != null) {
+            try {
+                IndexWriterConfig config = new IndexWriterConfig(analyzer);
+                config.setOpenMode(IndexWriterConfig.OpenMode.CREATE);
+                try (IndexWriter writer = new IndexWriter(indexDir, config)) {
+                    writer.deleteAll();
+                    writer.commit();
+                }
+            } catch (IOException e) {
+                log.warn("清空BM25索引失败: {}", e.getMessage());
+            }
+        }
         userDocMetadata.remove(userId);
         log.debug("BM25 cleared index for user {}", userId);
     }
 
+    /**
+     * 获取或创建用户的索引目录（磁盘持久化）
+     */
     private Directory getOrCreateIndex(String userId) {
-        return userIndexes.computeIfAbsent(userId, k -> new ByteBuffersDirectory());
+        return userIndexes.computeIfAbsent(userId, k -> {
+            try {
+                Path indexPath = Paths.get(INDEX_BASE_DIR, userId);
+                Files.createDirectories(indexPath);
+                FSDirectory fsDir = FSDirectory.open(indexPath);
+                log.info("BM25索引目录已创建/加载: userId={}, path={}", userId, indexPath.toAbsolutePath());
+                return fsDir;
+            } catch (IOException e) {
+                log.error("创建BM25索引目录失败: userId={}, error={}", userId, e.getMessage());
+                throw new RuntimeException("创建BM25索引目录失败", e);
+            }
+        });
+    }
+
+    /**
+     * 获取已加载的用户索引列表（用于诊断）
+     */
+    public Set<String> getLoadedUserIndexes() {
+        return Collections.unmodifiableSet(userIndexes.keySet());
+    }
+
+    /**
+     * 检查用户索引是否存在
+     */
+    public boolean hasUserIndex(String userId) {
+        Path indexPath = Paths.get(INDEX_BASE_DIR, userId);
+        return Files.exists(indexPath) && Files.isDirectory(indexPath);
     }
 }
