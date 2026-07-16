@@ -2,68 +2,62 @@ package com.rag.notebook.rag;
 
 import com.rag.notebook.agent.ModelFactory;
 import com.rag.notebook.config.ApplicationProperties;
+import com.rag.notebook.evaluation.entity.RagTrace;
+import com.rag.notebook.evaluation.repository.RagTraceRepository;
 import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 public class RagService {
 
-    private static final String HYDE_PROMPT = "基于以下问题，生成一个详细的假设性回答，我会根据你的这个假设性回答在向量数据库里检索文档：\n\n问题：%s\n\n假设性回答：";
+    private static final String SYSTEM_PROMPT =
+            "你是一个智能笔记助手，请根据以下参考资料回答用户的问题。\n\n" +
+            "规则：\n" +
+            "1. 只基于参考资料中的内容回答，不要编造信息\n" +
+            "2. 如果参考资料中没有相关信息，请回答「根据现有资料无法回答」\n" +
+            "3. 如果合适，可以在回答中引用来源（如「根据你的笔记《xxx》...」）\n" +
+            "4. 回答要简洁、准确、有条理";
+
+    // 存储当前线程最新的 traceId，供 AgentService 读取
+    private static final ThreadLocal<String> latestTraceId = new ThreadLocal<>();
 
     private final VectorStoreService vectorStoreService;
     private final HybridRetriever hybridRetriever;
     private final ModelFactory modelFactory;
     private final ApplicationProperties props;
-    private final Executor taskExecutor;
+    private final RagTraceRepository traceRepository;
 
     public RagService(VectorStoreService vectorStoreService, HybridRetriever hybridRetriever,
                       ModelFactory modelFactory, ApplicationProperties props,
-                      @Qualifier("taskExecutor") Executor taskExecutor) {
+                      RagTraceRepository traceRepository) {
         this.vectorStoreService = vectorStoreService;
         this.hybridRetriever = hybridRetriever;
         this.modelFactory = modelFactory;
         this.props = props;
-        this.taskExecutor = taskExecutor;
+        this.traceRepository = traceRepository;
     }
 
-    public String generateHypotheticalDocument(String query) {
-        try {
-            ChatLanguageModel chatModel = modelFactory.createChatModel();
-            String prompt = String.format(HYDE_PROMPT, query);
-            Response<AiMessage> response = chatModel.generate(UserMessage.from(prompt));
-            return response.content().text();
-        } catch (Exception e) { // 如果 LLM 调用失败，直接用原始问题去检索（降级但不中断）
-            log.warn("HyDE generation failed, using raw query: {}", e.getMessage());
-            return query;
-        }
-    }
     /**
-     * 混合检索：HyDE + 多Query扩展 + 向量检索 + BM25 + RRF融合
+     * 混合检索：多Query扩展 + 向量检索 + BM25 + RRF融合
      */
     public List<Map<String, Object>> retrieveDocuments(String userId, String query) {
-        // HyDE: 用 LLM 生成假设性文档，提升语义匹配精度
-        String hypotheticalDoc = generateHypotheticalDocument(query);
-
-        // 混合检索知识库：原始查询用于 Query 扩展，HyDE 文档用于向量检索
+        // 混合检索知识库
         List<Map<String, Object>> knowledgeResults = hybridRetriever.searchKnowledge(
-                userId, query, hypotheticalDoc, props.getChroma().getK());
+                userId, query, props.getChroma().getK());
         knowledgeResults.forEach(r -> r.put("source_type", "knowledge_base"));
 
         // 混合检索笔记
         List<Map<String, Object>> noteResults = hybridRetriever.searchNotes(
-                userId, query, hypotheticalDoc, 3);
+                userId, query, 3);
         noteResults.forEach(r -> r.put("source_type", "note"));
 
         // 合并：笔记优先，知识库在后
@@ -74,96 +68,117 @@ public class RagService {
         return merged;
     }
 
-// 核心方法：传入用户ID和查询词，返回相关的文档列表和最终的AI总结
-public Map<String, Object> getDocumentsAndSummary(String userId, String query) {
-    // 1. 检索阶段：从底层（可能是向量库或Elasticsearch）获取相关文档
-    List<Map<String, Object>> documents = retrieveDocuments(userId, query);
+    // 核心方法：传入用户ID和查询词，返回相关的文档列表和最终的AI总结
+    public Map<String, Object> getDocumentsAndSummary(String userId, String query) {
+        // Trace 记录开始
+        RagTrace trace = new RagTrace();
+        trace.setTraceId(UUID.randomUUID().toString().replace("-", ""));
+        trace.setUserId(userId);
+        trace.setQuery(query);
+        long startTime = System.currentTimeMillis();
 
-    // 2. 边界处理：如果没搜到任何东西，直接提前返回，避免浪费后续计算资源
-    if (documents.isEmpty()) {
-        return Map.of("documents", List.of(), "summary", "未找到相关文档。");
-    }
+        // 1. 检索阶段
+        long retrievalStart = System.currentTimeMillis();
+        List<Map<String, Object>> documents = retrieveDocuments(userId, query);
+        trace.setRetrievalLatencyMs(System.currentTimeMillis() - retrievalStart);
+        trace.setRetrievedDocCount(documents.size());
 
-    // 3. 数据清洗与组装：给每个文档加上[来源]标签，方便AI理解上下文
-    List<String> documentContents = documents.stream()
-            .map(doc -> {
-                // 安全地获取来源类型，默认是 unknown
-                String sourceType = (String) doc.getOrDefault("source_type", "unknown");
-                // 获取标题，如果没有就用文件名，再没有就填"未知"
-                String title = (String) doc.getOrDefault("title", doc.getOrDefault("filename", "未知"));
-                // 获取文档正文
-                String content = (String) doc.getOrDefault("content", "");
-                // 根据不同来源拼接不同的前缀标签
-                String tag = "note".equals(sourceType)
-                        ? "[来源：笔记《" + title + "》]"
-                        : "[来源：知识库《" + title + "》]";
-                // 将标签和正文拼在一起返回
-                return tag + "\n" + content;
-            })
-            .collect(Collectors.toList());
+        double avgSim = documents.stream()
+                .mapToDouble(d -> (double) d.getOrDefault("similarity", 0.0))
+                .average().orElse(0.0);
+        trace.setAvgSimilarity(avgSim);
 
-    // 4. 截断处理：为了防止文档太长撑爆大模型的Token限制，这里强行只取前3篇文档
-    int maxDocs = Math.min(3, documentContents.size());
-    List<String> topDocs = documentContents.subList(0, maxDocs);
+        List<String> docPreviews = documents.stream()
+                .map(d -> (String) d.getOrDefault("content", ""))
+                .map(c -> c.length() > 200 ? c.substring(0, 200) : c)
+                .collect(Collectors.toList());
+        trace.setRetrievedDocs(docPreviews);
 
-    // 5. 准备大模型客户端：创建一个聊天模型实例
-    ChatLanguageModel chatModel = modelFactory.createChatModel();
-    
-    // 6. 【关键操作】并发生成单篇摘要（Map阶段）
-    List<CompletableFuture<String>> summaryFutures = topDocs.stream()
-            // 为每篇文档开启一个异步线程
-            .map(doc -> CompletableFuture.supplyAsync(() -> {
-                try {
-                    // 构造让大模型总结单篇文档的Prompt
-                    String prompt = "基于以下问题和文档内容，生成简洁的摘要：\n\n问题：" + query + "\n\n文档：\n" + doc + "\n\n摘要：";
-                    // 调用大模型API
-                    Response<AiMessage> response = chatModel.generate(UserMessage.from(prompt));
-                    return response.content().text();
-                } catch (Exception e) {
-                    // 兜底策略：如果大模型调用失败（如超时、限流），记录日志，并退化为直接截取原文前200个字
-                    log.warn("Document summarization failed: {}", e.getMessage());
-                    return doc.substring(0, Math.min(200, doc.length()));
-                }
-            }, taskExecutor).orTimeout(30, TimeUnit.SECONDS)) // 极为关键：设置30秒硬超时，防止线程永久卡死
-            .collect(Collectors.toList());
-
-    // 7. 阻塞等待所有并发任务完成，收集结果
-    List<String> summaries = summaryFutures.stream()
-            .map(f -> {
-                try {
-                    return f.join(); // 等待当前线程结果
-                } catch (Exception e) {
-                    return "摘要生成失败"; // 如果超时或异常，返回默认话术
-                }
-            })
-            .collect(Collectors.toList());
-
-    // 8. 【关键操作】最终的融合总结（Reduce阶段）
-    String finalSummary;
-    if (summaries.size() > 1) { // 如果有两篇以上摘要，需要大模型做二次融合
-        try {
-            // 用分隔符把多篇摘要拼接在一起
-            String combinedContext = String.join("\n\n---\n\n", summaries);
-            // 构造二次总结的Prompt
-            String mergePrompt = "基于以下多个文档的摘要，生成一个综合性的回答：\n\n问题：" + query + "\n\n文档摘要：\n" + combinedContext + "\n\n综合回答：";
-            // 再次调用大模型
-            Response<AiMessage> response = chatModel.generate(UserMessage.from(mergePrompt));
-            finalSummary = response.content().text();
-        } catch (Exception e) {
-            // 兜底策略：如果融合失败，直接把所有单篇摘要硬拼在一起返回
-            finalSummary = String.join("\n\n", summaries);
+        if (documents.isEmpty()) {
+            trace.setFinalAnswer("未找到相关文档。");
+            trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
+            saveTrace(trace);
+            return Map.of("documents", List.of(), "summary", "未找到相关文档。");
         }
-    } else {
-        // 如果只有一篇摘要，直接作为最终结果
-        finalSummary = summaries.isEmpty() ? "未找到相关文档。" : summaries.get(0);
+
+        // 2. 构建参考资料（带来源标注）
+        long generationStart = System.currentTimeMillis();
+        String context = buildContext(documents);
+
+        // 3. 构建用户提示词
+        String userPrompt = "参考资料：\n" + context + "\n\n用户问题：" + query;
+
+        // 4. 调用 LLM 生成回答
+        String finalSummary = generateAnswer(userPrompt);
+
+        // Trace 记录结束
+        trace.setGenerationLatencyMs(System.currentTimeMillis() - generationStart);
+        trace.setFinalAnswer(finalSummary);
+        trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
+        saveTrace(trace);
+
+        return Map.of("documents", documents, "summary", finalSummary);
     }
 
-    // 9. 将原始文档和最终总结一起返回给前端
-    return Map.of("documents", documents, "summary", finalSummary);
-}
+    /**
+     * 构建参考资料（带来源标注）
+     */
+    private String buildContext(List<Map<String, Object>> documents) {
+        return documents.stream()
+                .map(doc -> {
+                    String sourceType = (String) doc.getOrDefault("source_type", "unknown");
+                    String title = (String) doc.getOrDefault("title", doc.getOrDefault("filename", "未知"));
+                    String content = (String) doc.getOrDefault("content", "");
+                    String tag = "note".equals(sourceType)
+                            ? "[来源：笔记《" + title + "》]"
+                            : "[来源：知识库《" + title + "》]";
+                    return tag + "\n" + content;
+                })
+                .collect(Collectors.joining("\n\n"));
+    }
+
+    /**
+     * 调用 LLM 生成回答
+     */
+    private String generateAnswer(String userPrompt) {
+        try {
+            ChatLanguageModel chatModel = modelFactory.createChatModel();
+            Response<AiMessage> response = chatModel.generate(
+                    SystemMessage.from(SYSTEM_PROMPT),
+                    UserMessage.from(userPrompt)
+            );
+            return response.content().text();
+        } catch (Exception e) {
+            log.error("LLM 生成回答失败: {}", e.getMessage());
+            return "生成回答时发生错误，请稍后重试。";
+        }
+    }
 
     public String ragSummary(String userId, String query) {
         Map<String, Object> result = getDocumentsAndSummary(userId, query);
         return (String) result.get("summary");
+    }
+
+    private void saveTrace(RagTrace trace) {
+        try {
+            traceRepository.save(trace);
+            latestTraceId.set(trace.getTraceId());
+        } catch (Exception e) {
+            log.warn("Failed to save trace: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 获取当前线程最新的 traceId
+     */
+    public String getLatestTraceId() {
+        return latestTraceId.get();
+    }
+
+    /**
+     * 清除当前线程的 traceId
+     */
+    public void clearLatestTraceId() {
+        latestTraceId.remove();
     }
 }

@@ -114,8 +114,8 @@ const loadSessions = async () => {
     router.push('/login');
     return;
   }
-  
-  // 获取用户ID（假设从用户信息中获取）
+
+  // 获取用户ID
   if (!userStore.userInfo) {
     const result = await userStore.getUserInfoDetail();
     if (!result.success) {
@@ -123,18 +123,16 @@ const loadSessions = async () => {
       return;
     }
   }
-  
-  if (userStore.userInfo) {
 
-    
-    // 尝试获取用户ID，支持不同的字段名
+  if (userStore.userInfo) {
     let userId = userStore.userInfo.uuid || userStore.userInfo.id || userStore.userInfo.user_id;
-    
+    console.log('加载会话列表，userId:', userId);
+
     if (userId) {
-      await sessionStore.getUserSessions(userId);
+      const result = await sessionStore.getUserSessions(userId);
+      console.log('会话列表结果:', result, 'sessions:', sessionStore.sessions);
     } else {
-      // 显示详细的错误信息
-      showToast('获取用户ID失败，请检查用户信息结构');
+      showToast('获取用户ID失败');
       console.error('用户信息中没有找到ID字段:', userStore.userInfo);
     }
   } else {

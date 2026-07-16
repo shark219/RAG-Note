@@ -24,6 +24,7 @@ export const apiConfig = {
     // AI对话相关
     agentQuery: '/chat/agent/query/stream',
     agentQueryStream: '/chat/agent/query/stream',
+    clarifyQuery: '/chat/clarify',
 
     // RAG相关
     ragQuery: '/chat/rag/query',
@@ -58,5 +59,12 @@ export const apiConfig = {
     reviewToday: '/review/today',
     reviewDone: (noteId) => `/review/done/${noteId}`,
     reviewQuestion: (noteId) => `/review/question/${noteId}`,
+
+    // 评估体系
+    evaluationStats: '/evaluation/stats',
+    evaluationReports: '/evaluation/reports',
+    evaluationLowScores: '/evaluation/low-scores',
+    evaluationBatch: '/evaluation/batch',
+    evaluationFeedback: '/evaluation/feedback',
   }
 }

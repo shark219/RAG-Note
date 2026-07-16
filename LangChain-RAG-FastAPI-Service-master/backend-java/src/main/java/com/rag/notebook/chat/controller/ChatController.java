@@ -1,6 +1,7 @@
 package com.rag.notebook.chat.controller;
 
 import com.rag.notebook.agent.AgentService;
+import com.rag.notebook.agent.ClarifierService;
 import com.rag.notebook.chat.dto.*;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.common.auth.UserId;
@@ -18,10 +19,18 @@ public class ChatController {
 
     private final ChatService chatService;
     private final AgentService agentService;
+    private final ClarifierService clarifierService;
 
-    public ChatController(ChatService chatService, AgentService agentService) {
+    public ChatController(ChatService chatService, AgentService agentService, ClarifierService clarifierService) {
         this.chatService = chatService;
         this.agentService = agentService;
+        this.clarifierService = clarifierService;
+    }
+
+    @PostMapping("/clarify")
+    public ApiResponse<ClarifyResult> clarify(@Valid @RequestBody QueryRequest request) {
+        ClarifyResult result = clarifierService.clarify(request.getQuery());
+        return ApiResponse.success(result);
     }
 
     @PostMapping("/agent/query/stream")

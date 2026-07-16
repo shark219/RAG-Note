@@ -24,13 +24,14 @@ public class QueryExpander {
     private static final int MAX_EXPANSIONS = 3;
 
     private static final String EXPAND_PROMPT =
-            "请将以下查询改写为3个不同的版本，保持语义相同但使用不同的表述方式。\n" +
+            "请将以下查询改写为3个不同的版本，用于从知识库中检索相关文档。\n" +
             "要求：\n" +
             "1. 每个版本一行，不要编号\n" +
-            "2. 使用不同的关键词和句式\n" +
-            "3. 可以包含同义词、缩写、全称等不同表达\n" +
-            "4. 只返回改写结果，不要有其他文字\n" +
-            "5. 每个版本不超过20个字\n\n" +
+            "2. 如果查询是抽象概念（如'简历'、'项目方案'），请展开为具体内容维度（如教育背景、工作经历、技能清单）\n" +
+            "3. 使用具体的关键词，避免抽象词汇\n" +
+            "4. 可以包含同义词、缩写、全称等不同表达\n" +
+            "5. 只返回改写结果，不要有其他文字\n" +
+            "6. 每个版本不超过20个字\n\n" +
             "原始查询：{query}\n\n" +
             "改写结果：";
 
@@ -54,7 +55,7 @@ public class QueryExpander {
         String shortQuery = query.length() > 100 ? query.substring(0, 100) : query;
 
         try {
-            ChatLanguageModel chatModel = modelFactory.createChatModel();
+            ChatLanguageModel chatModel = modelFactory.createCreativeModel();
             String prompt = EXPAND_PROMPT.replace("{query}", shortQuery);
             Response<AiMessage> response = chatModel.generate(UserMessage.from(prompt));
 

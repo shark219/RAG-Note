@@ -18,32 +18,72 @@ public class ModelFactory {
 
     private final ApplicationProperties props;
 
+    /** 温度预设：精确推理（工具选择、逻辑判断） */
+    public static final double TEMP_PRECISE = 0.1;
+    /** 温度预设：平衡模式（一般对话、RAG 总结） */
+    public static final double TEMP_BALANCED = 0.5;
+    /** 温度预设：创意模式（写作、头脑风暴） */
+    public static final double TEMP_CREATIVE = 0.8;
+
     public ModelFactory(ApplicationProperties props) {
         this.props = props;
     }
 
+    /**
+     * 使用默认温度(0.7)创建聊天模型
+     */
     public ChatLanguageModel createChatModel() {
+        return createChatModel(0.7);
+    }
+
+    /**
+     * 使用指定温度创建聊天模型
+     *
+     * @param temperature 温度值：0.0-1.0，越低越精确，越高越有创意
+     */
+    public ChatLanguageModel createChatModel(double temperature) {
         String type = props.getLlm().getType();
         if ("ZHIPU".equalsIgnoreCase(type)) {
             return OpenAiChatModel.builder()
                     .apiKey(props.getLlm().getZhipu().getApiKey())
                     .baseUrl(props.getLlm().getZhipu().getBaseUrl())
                     .modelName(props.getLlm().getZhipu().getModel())
-                    .temperature(0.7)
+                    .temperature(temperature)
                     .build();
         } else if ("OLLAMA".equalsIgnoreCase(type)) {
             return OllamaChatModel.builder()
                     .baseUrl(props.getLlm().getOllama().getBaseUrl())
                     .modelName(props.getLlm().getOllama().getModel())
-                    .temperature(0.7)
+                    .temperature(temperature)
                     .build();
         } else {
             return QwenChatModel.builder()
                     .apiKey(props.getLlm().getAliyun().getApiKey())
                     .modelName(props.getLlm().getAliyun().getModel())
-                    .temperature(0.7f)
+                    .temperature((float) temperature)
                     .build();
         }
+    }
+
+    /**
+     * 创建精确推理模型（工具选择、质量审查等）
+     */
+    public ChatLanguageModel createPreciseModel() {
+        return createChatModel(TEMP_PRECISE);
+    }
+
+    /**
+     * 创建平衡模型（RAG 总结、一般对话）
+     */
+    public ChatLanguageModel createBalancedModel() {
+        return createChatModel(TEMP_BALANCED);
+    }
+
+    /**
+     * 创建创意模型（写作、笔记生成）
+     */
+    public ChatLanguageModel createCreativeModel() {
+        return createChatModel(TEMP_CREATIVE);
     }
 
     public EmbeddingModel createEmbeddingModel() {

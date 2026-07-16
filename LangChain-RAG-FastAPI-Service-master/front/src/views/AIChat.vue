@@ -36,6 +36,23 @@
           :class="['message', message.role === 'user' ? 'user-message' : 'ai-message']"
         >
           <div class="message-content">
+            <!-- 澄清方向选择 -->
+            <template v-if="message.type === 'clarify'">
+              <div class="clarify-message">{{ message.clarifyMessage }}</div>
+              <div class="clarify-directions">
+                <button
+                  v-for="(dir, dIndex) in message.clarifyDirections"
+                  :key="dIndex"
+                  class="clarify-direction-btn"
+                  :class="{ 'clarify-selected': message.clarifySelected === dIndex, 'clarify-disabled': message.clarifySelected !== null && message.clarifySelected !== dIndex }"
+                  :disabled="message.clarifySelected !== null"
+                  @click="selectDirection(message, dir, dIndex)"
+                >
+                  <span class="clarify-dir-index">{{ dIndex + 1 }}</span>
+                  <span class="clarify-dir-text">{{ dir }}</span>
+                </button>
+              </div>
+            </template>
             <!-- 思考过程区域 -->
             <div v-if="message.thinking && message.thinking.length > 0" class="thinking-section">
               <div class="thinking-header" @click="toggleThinking(message)">
@@ -81,15 +98,25 @@
             <!-- 回复正文 -->
             <div v-if="message.content" v-html="formatMessage(message.content)"></div>
             <!-- 打字指示器（无内容且无思考过程时显示） -->
-            <div v-if="message.role === 'assistant' && !message.content && (!message.thinking || message.thinking.length === 0)" class="typing-indicator">
+            <div v-if="message.role === 'assistant' && message.type !== 'clarify' && !message.content && (!message.thinking || message.thinking.length === 0)" class="typing-indicator">
               <span></span>
               <span></span>
               <span></span>
             </div>
+            <!-- 用户反馈按钮 -->
+            <div v-if="message.role === 'assistant' && message.content && message.traceId && !message.feedback" class="feedback-bar">
+              <span class="feedback-btn" @click="submitFeedback(message, 5)">👍</span>
+              <span class="feedback-btn" @click="submitFeedback(message, 1)">👎</span>
+            </div>
+            <div v-if="message.feedback" class="feedback-thanks">
+              {{ message.feedback >= 4 ? '感谢反馈！' : '感谢反馈，我们会持续优化' }}
+            </div>
           </div>
         </div>
       </div>
-      
+
+      <token-usage :used="tokenUsed" :max="tokenMax" />
+
       <div class="input-container">
         <van-field
           v-model="userInput"
@@ -110,7 +137,7 @@
         </van-button>
       </div>
     </div>
-    
+
     <tab-bar />
   </div>
 </template>
@@ -119,6 +146,7 @@
 import { ref, computed, onMounted, nextTick, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import TabBar from '../components/TabBar.vue';
+import TokenUsage from '../components/TokenUsage.vue';
 import { showToast } from 'vant';
 import { marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
@@ -140,6 +168,10 @@ const messagesContainer = ref(null);
 const isLoading = ref(false);
 const hasJumped = ref(false);
 const autoCollapseTimer = ref(null);
+
+// Token 使用量
+const tokenUsed = ref(0);
+const tokenMax = ref(32000);
 
 const router = useRouter();
 const route = useRoute();
@@ -199,7 +231,13 @@ const stageConfig = {
   retrieval:  { label: '检索',   color: '#B8926E' },
   hyde:       { label: 'HyDE',   color: '#8B7E6F' },
   reorder:    { label: '重排序', color: '#D4914A' },
-  summarize:  { label: '总结',   color: '#7D9B7A' }
+  summarize:  { label: '总结',   color: '#7D9B7A' },
+  planning:   { label: '规划',   color: '#6B8EAE' },
+  researching:{ label: '研究',   color: '#8B7E6F' },
+  writing:    { label: '写作',   color: '#7D9B7A' },
+  tool_call:  { label: '工具',   color: '#D4914A' },
+  review:     { label: '审查',   color: '#C47D5A' },
+  complete:   { label: '完成',   color: '#5A8F6A' }
 };
 
 const getStageLabel = (stage) => {
@@ -247,35 +285,101 @@ const toggleThinking = (message) => {
   }
 };
 
+// 调用澄清接口
+const callClarify = async (query) => {
+  const token = localStorage.getItem('jwt_token') || userStore.token;
+  const response = await fetch(apiConfig.endpoints.clarifyQuery, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({ query })
+  });
+  if (!response.ok) throw new Error('澄清请求失败');
+  const json = await response.json();
+  return json.data || json;
+};
+
 // 发送消息
 const sendMessage = async () => {
   if (!userInput.value.trim() || isLoading.value) return;
-  
+
   // 检查是否登录
   if (!userStore.getLoginStatus) {
     showToast('请先登录');
     return;
   }
-  
+
   // 添加用户消息
   const userMessage = userInput.value.trim();
   messages.value.push({ role: 'user', content: userMessage });
   userInput.value = '';
-  
-  // 添加AI消息占位（含思考过程字段）
-  messages.value.push({ role: 'assistant', content: '', thinking: [], thinkingCollapsed: false, thinkingAutoCollapsed: false });
-  
+
   // 滚动到底部
   await nextTick();
   scrollToBottom();
-  
-  // 发送请求
+
   isLoading.value = true;
   try {
-    await fetchAIResponse(userMessage);
+    // 先调用澄清接口
+    const clarifyResult = await callClarify(userMessage);
+
+    if (clarifyResult.isClear) {
+      // 查询清晰，直接进入 Agent 流程
+      messages.value.push({ role: 'assistant', content: '', thinking: [], thinkingCollapsed: false, thinkingAutoCollapsed: false });
+      await nextTick();
+      scrollToBottom();
+      await fetchAIResponse(clarifyResult.brief || userMessage);
+    } else {
+      // 查询模糊，展示方向选择
+      messages.value.push({
+        role: 'assistant',
+        content: '',
+        type: 'clarify',
+        clarifyMessage: clarifyResult.message || '你的问题比较宽泛，以下是几个具体方向，选一个开始吧：',
+        clarifyDirections: clarifyResult.directions || [],
+        clarifySelected: null
+      });
+      await nextTick();
+      scrollToBottom();
+    }
+  } catch (error) {
+    console.error('Error in sendMessage:', error);
+    // 澄清失败时降级为直接发送
+    messages.value.push({ role: 'assistant', content: '', thinking: [], thinkingCollapsed: false, thinkingAutoCollapsed: false });
+    await nextTick();
+    try {
+      await fetchAIResponse(userMessage);
+    } catch (e) {
+      messages.value[messages.value.length - 1].content = `发生错误: ${e.message || '请检查网络连接和API设置'}`;
+    }
+  } finally {
+    isLoading.value = false;
+    await nextTick();
+    scrollToBottom();
+  }
+};
+
+// 用户选择澄清方向
+const selectDirection = async (message, direction, index) => {
+  if (message.clarifySelected !== null || isLoading.value) return;
+
+  message.clarifySelected = index;
+  isLoading.value = true;
+
+  // 添加用户选择的消息
+  messages.value.push({ role: 'user', content: direction });
+  // 添加 AI 回复占位
+  messages.value.push({ role: 'assistant', content: '', thinking: [], thinkingCollapsed: false, thinkingAutoCollapsed: false });
+
+  await nextTick();
+  scrollToBottom();
+
+  try {
+    await fetchAIResponse(direction);
   } catch (error) {
     console.error('Error fetching AI response:', error);
-    // 更新最后一条消息为错误信息
     messages.value[messages.value.length - 1].content = `发生错误: ${error.message || '请检查网络连接和API设置'}`;
   } finally {
     isLoading.value = false;
@@ -398,11 +502,19 @@ const fetchAIResponse = async (userMessage) => {
             case 'done':
               {
                 const sid = json.session_id;
+                const traceId = json.trace_id;
+                // 更新 token 使用量
+                if (json.token_used !== undefined) tokenUsed.value = json.token_used;
+                if (json.token_max !== undefined) tokenMax.value = json.token_max;
                 if (sid && typeof sid === 'string' && sid.trim()) {
                   sessionId.value = sid;
                   localStorage.setItem('current_session_id', sid);
-                  // 保存思考过程到 localStorage
+                  // 保存 traceId 到消息对象
                   const lastMsg = messages.value[messages.value.length - 1];
+                  if (lastMsg && lastMsg.role === 'assistant' && traceId) {
+                    lastMsg.traceId = traceId;
+                  }
+                  // 保存思考过程到 localStorage
                   if (lastMsg && lastMsg.role === 'assistant') {
                     saveThinkingToHistory(sid, userMessage, lastMsg.thinking);
                   }
@@ -431,6 +543,39 @@ const fetchAIResponse = async (userMessage) => {
   } catch (error) {
     console.error('Fetch error:', error);
     throw error;
+  }
+};
+
+// 提交用户反馈
+const submitFeedback = async (message, score) => {
+  const traceId = message.traceId;
+  if (!traceId) {
+    showToast('反馈失败：缺少TraceID');
+    return;
+  }
+
+  const reason = score <= 2 ? '回答不准确' : '';
+
+  try {
+    const token = localStorage.getItem('jwt_token') || userStore.token;
+    const response = await fetch(apiConfig.endpoints.evaluationFeedback, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({ traceId, score, reason })
+    });
+
+    const json = await response.json();
+    if (json.code === 200) {
+      message.feedback = score;
+      showToast(score >= 4 ? '感谢鼓励！' : '感谢反馈，我们会持续优化');
+    } else {
+      showToast('反馈失败');
+    }
+  } catch (e) {
+    showToast('反馈失败');
   }
 };
 
@@ -479,8 +624,22 @@ watch(() => route.params.sessionId, async (newSessionId) => {
   }
 }, { immediate: true });
 
-// 组件挂载时的额外初始化（路由参数的会话加载由 watcher 处理）
-onMounted(() => {
+// 组件挂载时：如果没有路由 sessionId，从 localStorage 恢复上次会话
+onMounted(async () => {
+  if (!route.params.sessionId) {
+    const savedSessionId = localStorage.getItem('current_session_id');
+    if (savedSessionId) {
+      sessionId.value = savedSessionId;
+      try {
+        const result = await sessionStore.getSession(savedSessionId);
+        if (result.success && sessionStore.currentSession) {
+          loadSessionHistory(sessionStore.currentSession);
+        }
+      } catch (e) {
+        console.warn('恢复会话失败:', e);
+      }
+    }
+  }
   scrollToBottom();
 });
 
@@ -588,6 +747,78 @@ const loadSessionHistory = (session) => {
   background: var(--color-surface);
   border-color: var(--color-primary);
   color: var(--color-primary);
+}
+
+/* ==================== 澄清方向选择 ==================== */
+.clarify-message {
+  font-size: 14px;
+  color: var(--color-text);
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.clarify-directions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.clarify-direction-btn {
+  all: unset;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-light);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-size: 13px;
+  color: var(--color-text);
+  line-height: 1.5;
+}
+
+.clarify-direction-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.clarify-direction-btn:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  background: var(--color-card);
+}
+
+.clarify-dir-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.clarify-dir-text {
+  flex: 1;
+}
+
+.clarify-selected {
+  border-color: var(--color-primary);
+  background: var(--color-surface);
+  opacity: 0.85;
+}
+
+.clarify-selected .clarify-dir-index {
+  background: var(--color-primary);
+}
+
+.clarify-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* ==================== 消息容器 ==================== */
@@ -927,5 +1158,32 @@ const loadSessionHistory = (session) => {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--color-text-lightest);
+}
+
+/* ==================== 用户反馈 ==================== */
+.feedback-bar {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+  padding-top: 6px;
+}
+
+.feedback-btn {
+  font-size: 18px;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  user-select: none;
+}
+
+.feedback-btn:hover {
+  opacity: 1;
+  transform: scale(1.2);
+}
+
+.feedback-thanks {
+  font-size: 11px;
+  color: var(--color-text-lighter);
+  margin-top: 6px;
 }
 </style>

@@ -60,14 +60,12 @@ public class RerankerService {
                 return documents;
             }
 
-            // 3. 根据精排结果重新排序并过滤
+            // 3. 根据精排结果重新排序
             List<Map<String, Object>> rerankedDocs = new ArrayList<>();
             for (RerankResult result : response.results) {
-                if (result.relevanceScore >= config.getScoreThreshold()) {
-                    Map<String, Object> doc = new HashMap<>(documents.get(result.index));
-                    doc.put("rerank_score", result.relevanceScore);
-                    rerankedDocs.add(doc);
-                }
+                Map<String, Object> doc = new HashMap<>(documents.get(result.index));
+                doc.put("rerank_score", result.relevanceScore);
+                rerankedDocs.add(doc);
             }
 
             // 4. 按精排分数排序
@@ -76,17 +74,46 @@ public class RerankerService {
                     (double) a.getOrDefault("rerank_score", 0.0)
             ));
 
-            // 5. 取 topN
-            int topN = Math.min(config.getTopN(), rerankedDocs.size());
-            rerankedDocs = rerankedDocs.subList(0, topN);
+            // 5. 动态 top-N 策略
+            rerankedDocs = dynamicTopN(rerankedDocs);
 
-            log.info("精排完成: 输入{}条, 输出{}条, 阈值={}", documents.size(), rerankedDocs.size(), config.getScoreThreshold());
+            log.info("精排完成: 输入{}条, 输出{}条", documents.size(), rerankedDocs.size());
             return rerankedDocs;
 
         } catch (Exception e) {
             log.error("精排失败，返回原始结果: {}", e.getMessage());
             return documents;
         }
+    }
+
+    /**
+     * 动态 top-N 策略：
+     * - 分数 > 0.7：全部保留（高质量结果）
+     * - 分数 0.5-0.7：最多保留 2 条（中等质量）
+     * - 分数 < 0.5：丢弃
+     */
+    private List<Map<String, Object>> dynamicTopN(List<Map<String, Object>> rerankedDocs) {
+        List<Map<String, Object>> high = new ArrayList<>();
+        List<Map<String, Object>> medium = new ArrayList<>();
+
+        for (Map<String, Object> doc : rerankedDocs) {
+            double score = (double) doc.getOrDefault("rerank_score", 0.0);
+            if (score > 0.7) {
+                high.add(doc);
+            } else if (score >= 0.5) {
+                medium.add(doc);
+            }
+        }
+
+        // 中等质量最多保留 2 条
+        List<Map<String, Object>> result = new ArrayList<>(high);
+        result.addAll(medium.subList(0, Math.min(2, medium.size())));
+
+        log.info("动态 top-N: 高质量{}条, 中等质量{}条(保留{}), 丢弃{}条",
+                high.size(), medium.size(), Math.min(2, medium.size()),
+                rerankedDocs.size() - high.size() - medium.size());
+
+        return result;
     }
 
     /**

@@ -73,6 +73,11 @@ export default defineConfig({
       '/review/': {
         target: BACKEND_TARGET,
         changeOrigin: true
+      },
+      // 评估体系接口代理
+      '/evaluation/': {
+        target: BACKEND_TARGET,
+        changeOrigin: true
       }
     }
   }

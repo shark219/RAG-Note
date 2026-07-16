@@ -16,6 +16,9 @@ front/dist/
 front/package-lock.json
 front/pnpm-lock.yaml
 
+# ==================== Claude Code ====================
+.claude/
+
 # ==================== IDE ====================
 .idea/
 .vscode/
@@ -61,6 +64,7 @@ node_modules
 *.sqlite3
 
 # ==================== Python (Django 用户服务) ====================
+LangChain-RAG-FastAPI-Service-master/DjangoUserService/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -70,6 +74,7 @@ venv/
 migrations/
 
 # ==================== ChromaDB ====================
+chroma/
 chromadb/
 chroma_data/
 bm25_index/

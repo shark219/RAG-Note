@@ -3,6 +3,9 @@ package com.rag.notebook.agent;
 import com.rag.notebook.chat.entity.ChatMessage;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.config.ApplicationProperties;
+import com.rag.notebook.evaluation.entity.RagTrace;
+import com.rag.notebook.evaluation.repository.RagTraceRepository;
+import com.rag.notebook.rag.QualityReviewer;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.agent.tool.ToolSpecifications;
@@ -38,44 +41,75 @@ public class AgentService {
     private final ApplicationProperties props;
     private final Executor taskExecutor;
     private final ContextManager contextManager;
+    private final RagTraceRepository traceRepository;
+    private final QualityReviewer qualityReviewer;
+    private final SupervisorService supervisorService;
+    private final WriterService writerService;
+    private final TokenCounter tokenCounter;
     private final List<ToolSpecification> toolSpecifications;
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
                         ChatService chatService, ApplicationProperties props,
                         @Qualifier("taskExecutor") Executor taskExecutor,
-                        ContextManager contextManager) {
+                        ContextManager contextManager,
+                        RagTraceRepository traceRepository,
+                        QualityReviewer qualityReviewer,
+                        SupervisorService supervisorService,
+                        WriterService writerService,
+                        TokenCounter tokenCounter) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
         this.chatService = chatService;
         this.props = props;
         this.taskExecutor = taskExecutor;
         this.contextManager = contextManager;
+        this.traceRepository = traceRepository;
+        this.qualityReviewer = qualityReviewer;
+        this.supervisorService = supervisorService;
+        this.writerService = writerService;
+        this.tokenCounter = tokenCounter;
         // 从 @Tool 注解自动提取工具定义
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
 
     public SseEmitter streamAgentResponse(String query, String sessionId, String userId) {
-        SseEmitter emitter = new SseEmitter(120000L);
+        // 多 Agent 流水线可能耗时较长，超时设为 5 分钟
+        SseEmitter emitter = new SseEmitter(300000L);
 
         SecurityContext securityContext = SecurityContextHolder.getContext();
+        String traceId = UUID.randomUUID().toString().replace("-", "");
 
         CompletableFuture.runAsync(() -> {
             SecurityContextHolder.setContext(securityContext);
+            long startTime = System.currentTimeMillis();
             try {
+                // 先保存用户消息（确保即使后续处理超时，用户消息也在数据库里）
+                chatService.addMessage(sessionId, userId, "human", query);
+
                 // 加载会话历史，滑动窗口 + 摘要压缩
                 List<ChatMessage> history = chatService.getSessionMessages(sessionId);
-                ChatLanguageModel chatModel = modelFactory.createChatModel();
+                ChatLanguageModel chatModel = modelFactory.createBalancedModel();
                 List<dev.langchain4j.data.message.ChatMessage> historyMessages =
                         contextManager.buildMessages(history, chatModel);
 
-                // 构建消息列表：系统提示 + 压缩后的历史 + 用户新消息
-                List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
-                messages.add(SystemMessage.from(loadSystemPrompt()));
-                messages.addAll(historyMessages);
-                messages.add(UserMessage.from(query));
+                // Supervisor 规划：判断是否需要多 Agent 流水线
+                List<SubTask> subTasks = supervisorService.plan(query);
 
-                // 使用 function calling 处理
-                String response = processWithFunctionCalling(messages, userId, emitter, sessionId);
+                String response;
+                if (subTasks.size() < 2) {
+                    // 简单查询或单子任务：走原有单 Agent 流程（更快）
+                    List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
+                    messages.add(SystemMessage.from(loadSystemPrompt()));
+                    messages.addAll(historyMessages);
+                    messages.add(UserMessage.from(query));
+                    response = processWithFunctionCalling(messages, userId, emitter, sessionId, query);
+                } else {
+                    // 复杂查询：走多 Agent 流水线
+                    response = executePipeline(subTasks, query, userId, emitter);
+                }
+
+                // 保存 AI 回复
+                chatService.addMessage(sessionId, userId, "ai", response);
 
                 // 发送最终回复（流式分块）
                 sendSseEvent(emitter, "thinking", Map.of(
@@ -93,23 +127,56 @@ public class AgentService {
                     Thread.sleep(50);
                 }
 
-                // 保存到历史
-                chatService.addMessage(sessionId, userId, "human", query);
-                chatService.addMessage(sessionId, userId, "ai", response);
+                // 获取 RAG 的 traceId，如果没有则使用 Agent 自己生成的
+                String ragTraceId = agentTools.getLatestTraceId();
+                String finalTraceId = ragTraceId != null ? ragTraceId : traceId;
+                log.info("Agent done - ragTraceId={}, finalTraceId={}, sessionId={}", ragTraceId, finalTraceId, sessionId);
 
-                sendSseEvent(emitter, "done", Map.of("session_id", sessionId));
-                emitter.complete();
+                // 计算 token 使用量
+                List<ChatMessage> allHistory = chatService.getSessionMessages(sessionId);
+                int usedTokens = tokenCounter.estimateEntityTokens(allHistory);
+                int maxTokens = 32000; // 与 ContextManager.MAX_CONTEXT_TOKENS 一致
+
+                Map<String, Object> doneData = new HashMap<>();
+                doneData.put("session_id", sessionId);
+                doneData.put("trace_id", finalTraceId);
+                doneData.put("token_used", usedTokens);
+                doneData.put("token_max", maxTokens);
+                sendSseEvent(emitter, "done", doneData);
+
+                // 如果没有 RAG trace，保存一个基础 trace（用于用户反馈）
+                if (ragTraceId == null) {
+                    try {
+                        RagTrace basicTrace = new RagTrace();
+                        basicTrace.setTraceId(traceId);
+                        basicTrace.setUserId(userId);
+                        basicTrace.setQuery(query);
+                        basicTrace.setFinalAnswer(response);
+                        basicTrace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
+                        traceRepository.save(basicTrace);
+                    } catch (Exception ex) {
+                        log.warn("Failed to save basic trace: {}", ex.getMessage());
+                    }
+                }
+
+                safeComplete(emitter);
 
             } catch (Exception e) {
                 log.error("Agent stream failed: {}", e.getMessage(), e);
+                // 保存错误消息到会话（不让对话丢失）
+                try {
+                    chatService.addMessage(sessionId, userId, "ai", "处理请求时发生错误: " + e.getMessage());
+                } catch (Exception ignored) {}
                 try {
                     sendSseEvent(emitter, "error", Map.of(
                             "content", "处理请求时发生错误: " + e.getMessage(),
                             "session_id", sessionId
                     ));
-                    emitter.complete();
+                    safeComplete(emitter);
                 } catch (IOException ex) {
-                    emitter.completeWithError(ex);
+                    try {
+                        emitter.completeWithError(ex);
+                    } catch (IllegalStateException ignored) {}
                 }
             } finally {
                 SecurityContextHolder.clearContext();
@@ -120,13 +187,125 @@ public class AgentService {
     }
 
     /**
+     * 多 Agent 流水线：并行执行子任务 → Writer 合成
+     */
+    private String executePipeline(List<SubTask> subTasks, String query,
+                                   String userId, SseEmitter emitter) throws IOException {
+        sendSseEvent(emitter, "thinking", Map.of(
+                "stage", "planning",
+                "content", "已拆分为 " + subTasks.size() + " 个子任务，正在并行执行"
+        ));
+
+        // 1. 并行执行各子任务
+        Map<String, String> results = new LinkedHashMap<>();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        for (SubTask task : subTasks) {
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    sendSseEvent(emitter, "thinking", Map.of(
+                            "stage", "researching",
+                            "content", "[" + task.getId() + "] " + task.getLabel() + " 执行中"
+                    ));
+
+                    String result = executeSubTask(task, userId);
+                    synchronized (results) {
+                        results.put(task.getId(), result);
+                    }
+
+                    log.info("子任务 [{}] {} 完成, {} 字", task.getId(), task.getLabel(), result.length());
+                } catch (Exception e) {
+                    log.warn("子任务 [{}] 失败: {}", task.getId(), e.getMessage());
+                    synchronized (results) {
+                        results.put(task.getId(), "执行失败: " + e.getMessage());
+                    }
+                }
+            }, taskExecutor);
+            futures.add(future);
+        }
+
+        // 等待所有子任务完成
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        // 2. Writer 合成
+        sendSseEvent(emitter, "thinking", Map.of(
+                "stage", "writing",
+                "content", "正在整合 " + results.size() + " 个子任务结果"
+        ));
+
+        String finalAnswer = writerService.synthesize(query, subTasks, results);
+
+        // 3. 质量审查
+        List<Map<String, Object>> reviewDocs = results.values().stream()
+                .map(r -> Map.<String, Object>of("content", r.length() > 500 ? r.substring(0, 500) : r))
+                .toList();
+
+        if (!reviewDocs.isEmpty()) {
+            QualityReviewer.ReviewResult review = qualityReviewer.reviewAnswer(query, reviewDocs, finalAnswer);
+            if (!review.approved()) {
+                log.info("Pipeline 回答审查未通过: {}, 重新合成", review.reason());
+                // 带反馈重新合成
+                finalAnswer = writerService.synthesize(
+                        query + "\n\n注意：" + review.feedback(), subTasks, results);
+            }
+        }
+
+        log.info("Pipeline 完成: {} 个子任务, 最终回答 {} 字", subTasks.size(), finalAnswer.length());
+        return finalAnswer;
+    }
+
+    /**
+     * 执行单个子任务：构造临时 Agent 循环
+     */
+    private String executeSubTask(SubTask task, String userId) {
+        ChatLanguageModel chatModel = modelFactory.createPreciseModel();
+
+        // 构造子任务的系统提示，明确告诉 LLM 用什么工具
+        String systemPrompt = "你是一个笔记助手，正在执行一个子任务。\n\n"
+                + "任务描述：" + task.getDescription() + "\n"
+                + "\n可用工具说明："
+                + "\n- searchNotes(query): 搜索用户的笔记，传入搜索关键词"
+                + "\n- ragSummary(query): 从知识库检索文档，传入查询内容"
+                + "\n- getNoteStats(): 获取笔记统计（无需参数）"
+                + "\n- getTodayReviews(): 获取今日复习（无需参数）"
+                + "\n- createNote(title, content): 创建笔记"
+                + "\n- whatTimeIsNow(): 获取当前时间"
+                + (task.getToolHint() != null ? "\n\n必须使用工具: " + task.getToolHint() : "")
+                + "\n\n请直接调用工具执行任务，不要自己编造内容。";
+
+        List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
+        messages.add(SystemMessage.from(systemPrompt));
+        messages.add(UserMessage.from(task.getDescription()));
+
+        // 最多 2 轮工具调用（子任务应该更轻量）
+        for (int i = 0; i < 2; i++) {
+            Response<AiMessage> response = chatModel.generate(messages, toolSpecifications);
+            AiMessage aiMessage = response.content();
+
+            if (aiMessage.hasToolExecutionRequests()) {
+                messages.add(aiMessage);
+                for (ToolExecutionRequest toolRequest : aiMessage.toolExecutionRequests()) {
+                    String toolResult = executeToolWithUserId(toolRequest.name(), toolRequest.arguments(), userId);
+                    messages.add(ToolExecutionResultMessage.from(toolRequest, toolResult));
+                }
+            } else {
+                return aiMessage.text();
+            }
+        }
+
+        // 达到最大轮次，强制生成
+        Response<AiMessage> finalResponse = chatModel.generate(messages);
+        return finalResponse.content().text();
+    }
+
+    /**
      * LangChain4j function calling 循环
      */
     private String processWithFunctionCalling(
             List<dev.langchain4j.data.message.ChatMessage> messages,
-            String userId, SseEmitter emitter, String sessionId) throws IOException {
+            String userId, SseEmitter emitter, String sessionId, String query) throws IOException {
 
-        ChatLanguageModel chatModel = modelFactory.createChatModel();
+        ChatLanguageModel chatModel = modelFactory.createPreciseModel();
 
         // Agent 循环：最多 3 轮工具调用
         for (int i = 0; i < 3; i++) {
@@ -165,14 +344,70 @@ public class AgentService {
                 }
                 // 继续循环，让 LLM 基于工具结果生成回复
             } else {
-                // LLM 不需要调工具，直接返回文本
-                return aiMessage.text();
+                // LLM 不需要调工具，返回文本前做质量审查
+                String answer = aiMessage.text();
+                return reviewAndRetryIfNeeded(chatModel, messages, answer, emitter, query);
             }
         }
 
         // 达到最大轮次，最终调用一次（不带工具定义）
         Response<AiMessage> finalResponse = chatModel.generate(messages);
-        return finalResponse.content().text();
+        String answer = finalResponse.content().text();
+        return reviewAndRetryIfNeeded(chatModel, messages, answer, emitter, query);
+    }
+
+    /**
+     * 回答质量审查：不达标时追加反馈重试一次
+     */
+    private String reviewAndRetryIfNeeded(ChatLanguageModel chatModel,
+                                          List<dev.langchain4j.data.message.ChatMessage> messages,
+                                          String answer, SseEmitter emitter,
+                                          String query) throws IOException {
+        // 提取工具结果作为参考文档
+        List<Map<String, Object>> toolDocs = messages.stream()
+                .filter(m -> m instanceof ToolExecutionResultMessage)
+                .map(m -> {
+                    String content = ((ToolExecutionResultMessage) m).text();
+                    return Map.<String, Object>of("content", content.length() > 500 ? content.substring(0, 500) : content);
+                })
+                .toList();
+
+        if (toolDocs.isEmpty()) {
+            return answer;
+        }
+
+        QualityReviewer.ReviewResult review = qualityReviewer.reviewAnswer(query, toolDocs, answer);
+        if (review.approved()) {
+            return answer;
+        }
+
+        log.info("Agent 回答审查未通过: {}, 尝试重试", review.reason());
+        sendSseEvent(emitter, "thinking", Map.of(
+                "stage", "review",
+                "content", "回答质量不足，正在优化: " + review.reason()
+        ));
+
+        // 追加反馈消息，让 LLM 重新生成
+        messages.add(AiMessage.from(answer));
+        messages.add(UserMessage.from(
+                "你的回答质量不够好，请根据以下反馈重新回答：\n" + review.feedback()
+                        + "\n\n请直接给出改进后的回答，不要调用工具。"
+        ));
+
+        try {
+            // 重试时使用平衡模型，提升回答质量
+            ChatLanguageModel balancedModel = modelFactory.createBalancedModel();
+            Response<AiMessage> retryResponse = balancedModel.generate(messages);
+            String retryAnswer = retryResponse.content().text();
+            if (retryAnswer != null && !retryAnswer.isBlank()) {
+                log.info("Agent 回答重试成功");
+                return retryAnswer;
+            }
+        } catch (Exception e) {
+            log.warn("Agent 回答重试失败: {}", e.getMessage());
+        }
+
+        return answer;
     }
 
     /**
@@ -228,7 +463,22 @@ public class AgentService {
         Map<String, Object> event = new HashMap<>();
         event.put("type", type);
         event.putAll(data);
-        emitter.send(SseEmitter.event().data(event));
+        try {
+            emitter.send(SseEmitter.event().data(event));
+        } catch (IllegalStateException e) {
+            log.debug("SSE send skipped (emitter completed): type={}", type);
+        } catch (IOException e) {
+            // 客户端刷新/关闭页面导致的连接中断，忽略即可
+            log.debug("SSE send skipped (client disconnected): type={}, msg={}", type, e.getMessage());
+        }
+    }
+
+    private void safeComplete(SseEmitter emitter) {
+        try {
+            emitter.complete();
+        } catch (IllegalStateException e) {
+            log.debug("SSE emitter already completed");
+        }
     }
 
     private String loadSystemPrompt() {

@@ -136,6 +136,15 @@ const routes = [
       keepAlive: false
     }
   },
+  {
+    path: '/evaluation',
+    name: 'EvaluationDashboard',
+    component: () => import('../views/EvaluationDashboard.vue'),
+    meta: {
+      title: '评估后台',
+      keepAlive: false
+    }
+  },
 ]
 
 const router = createRouter({

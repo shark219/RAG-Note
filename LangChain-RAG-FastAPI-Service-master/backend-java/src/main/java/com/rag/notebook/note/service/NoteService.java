@@ -258,15 +258,25 @@ public class NoteService {
         // 删除笔记
         noteRepository.delete(note);
 
-        // 删除关联的复习记录
-        reviewRecordRepository.deleteByNoteId(noteId);
-
-        // 删除向量索引
+        // 删除关联的复习记录（使用原生 SQL，绕过 Hibernate 实体追踪）
         try {
-            vectorStoreService.deleteNoteVector(noteId, userId);
+            int deleted = reviewRecordRepository.deleteByNoteIdNative(noteId);
+            log.debug("删除复习记录: noteId={}, count={}", noteId, deleted);
         } catch (Exception e) {
-            log.warn("Failed to delete note vector: {}", e.getMessage());
+            log.warn("删除复习记录失败: {}", e.getMessage());
         }
+
+        // 事务提交后再删除向量（避免向量操作失败导致事务回滚）
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    vectorStoreService.deleteNoteVector(noteId, userId);
+                } catch (Exception e) {
+                    log.warn("Failed to delete note vector after commit: {}", e.getMessage());
+                }
+            }
+        });
     }
 
     public NoteListResponse searchNotes(String userId, String query) {

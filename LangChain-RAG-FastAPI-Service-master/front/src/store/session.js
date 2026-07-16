@@ -21,42 +21,37 @@ export const useSessionStore = defineStore('session', {
       try {
         this.loading = true;
         const token = localStorage.getItem('jwt_token');
-        
-        const response = await axios.get(`${apiConfig.endpoints.getUserSessions}/${userId}`, {
+        const url = `${apiConfig.endpoints.getUserSessions}/${userId}`;
+        console.log('请求会话列表:', url, 'token:', token ? token.substring(0, 20) + '...' : 'null');
+
+        const response = await axios.get(url, {
           headers: {
             Authorization: `Bearer ${token}`
           }
         });
-        
-        // 正确处理响应数据，从 response.data.data.sessions 获取会话列表
+
+        console.log('会话API响应:', response.data);
         const sessionsData = response.data.data?.sessions || [];
-        
-        // 将会话数据转换为前端需要的格式
+        console.log('解析到会话数据:', sessionsData.length, '条');
+
         this.sessions = sessionsData.map(session => ({
           session_id: session.session_id || session.sessionId || session.id,
           title: session.title,
           created_at: session.created_at,
           updated_at: session.updated_at
         }));
-        
-        // 按照更新时间和创建时间综合排序（优先按更新时间，其次按创建时间）
+
         this.sessions.sort((a, b) => {
           const dateA = new Date(a.updated_at || a.created_at);
           const dateB = new Date(b.updated_at || b.created_at);
-          return dateB - dateA; // 降序排列，最新的在前面
+          return dateB - dateA;
         });
-        
 
-        return {
-          success: true,
-          data: this.sessions
-        };
+        console.log('store.sessions:', this.sessions);
+        return { success: true, data: this.sessions };
       } catch (error) {
-        console.error('获取用户会话失败:', error);
-        return {
-          success: false,
-          message: error.response?.data?.message || '获取会话失败'
-        };
+        console.error('获取用户会话失败:', error.response?.status, error.response?.data || error.message);
+        return { success: false, message: error.response?.data?.message || '获取会话失败' };
       } finally {
         this.loading = false;
       }

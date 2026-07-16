@@ -47,8 +47,14 @@ public class DocumentProcessor {
 
             progressCallback.accept("splitting", originalFilename);
             String content = tika.parseToString(file);
-            List<String> chunks = splitText(content, props.getChroma().getChunkSize(),
+            // 在每个切片前加文件名前缀，提升关键词检索命中率
+            String filePrefix = "[文件: " + originalFilename + "]\n";
+            List<String> rawChunks = splitText(content, props.getChroma().getChunkSize(),
                     props.getChroma().getChunkOverlap());
+            List<String> chunks = new ArrayList<>();
+            for (String chunk : rawChunks) {
+                chunks.add(filePrefix + chunk);
+            }
 
             progressCallback.accept("storing", originalFilename);
             Map<String, Object> metadata = Map.of(

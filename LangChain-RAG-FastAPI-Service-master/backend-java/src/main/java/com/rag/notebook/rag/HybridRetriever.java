@@ -10,11 +10,10 @@ import java.util.stream.Collectors;
  * 混合检索服务：向量检索 + BM25 + 多 Query 扩展 + RRF 融合 + Cross-Encoder 精排
  *
  * 检索流程：
- * 1. 多 Query 扩展：将用户查询改写为 N 个语义等价版本
+ * 1. 多 Query 扩展：将用户查询改写为 N 个语义等价版本（不限长度）
  * 2. 每个查询版本分别执行：向量检索 + BM25 检索
  * 3. RRF 融合：将所有路的检索结果用 Reciprocal Rank Fusion 合并排序
- * 4. Cross-Encoder 精排：使用智谱 AI rerank API 重新打分
- * 5. 阈值过滤：过滤掉低相关性的结果
+ * 4. Cross-Encoder 精排：使用智谱 AI rerank API 重新打分 + 阈值过滤
  */
 @Slf4j
 @Service
@@ -41,14 +40,13 @@ public class HybridRetriever {
     /**
      * 混合检索知识库文档
      *
-     * @param userId    用户ID
-     * @param query     原始短查询（用于 Query 扩展）
-     * @param hydeQuery HyDE 假设文档（用于向量检索，语义更丰富）
-     * @param topK      返回结果数
-     * @return RRF 融合后的排序结果
+     * @param userId 用户ID
+     * @param query  原始查询
+     * @param topK   返回结果数
+     * @return RRF 融合 + 精排后的结果
      */
-    public List<Map<String, Object>> searchKnowledge(String userId, String query, String hydeQuery, int topK) {
-        // 1. 多 Query 扩展（用原始短查询，不用 HyDE 长文档）
+    public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK) {
+        // 1. 多 Query 扩展
         List<String> queries = queryExpander.expand(query);
         log.info("知识库混合检索: 原始查询='{}', 扩展为 {} 个版本", truncate(query, 30), queries.size());
 
@@ -56,7 +54,7 @@ public class HybridRetriever {
         List<List<Map<String, Object>>> allRankings = new ArrayList<>();
 
         for (String q : queries) {
-            // 向量检索（用扩展后的查询做向量检索）
+            // 向量检索
             List<Map<String, Object>> vectorResults = vectorStoreService.searchKnowledge(userId, q, topK * 2);
             allRankings.add(vectorResults);
 
@@ -68,22 +66,10 @@ public class HybridRetriever {
             allRankings.add(bm25Results);
         }
 
-        // 额外：用 HyDE 假设文档做向量检索 + BM25 检索
-        if (hydeQuery != null && !hydeQuery.equals(query)) {
-            List<Map<String, Object>> hydeVectorResults = vectorStoreService.searchKnowledge(userId, hydeQuery, topK * 2);
-            allRankings.add(hydeVectorResults);
-
-            List<Map<String, Object>> hydeBm25Results = bm25Service.search(userId, hydeQuery, topK * 2);
-            hydeBm25Results = hydeBm25Results.stream()
-                    .filter(r -> "knowledge_base".equals(r.get("source")))
-                    .collect(Collectors.toList());
-            allRankings.add(hydeBm25Results);
-        }
-
         // 3. RRF 融合
         List<Map<String, Object>> fused = rrfFusion(allRankings, topK * 2);
 
-        // 4. Cross-Encoder 精排
+        // 4. Cross-Encoder 精排 + 动态 top-N
         fused = rerankerService.rerank(query, fused);
 
         log.info("知识库混合检索完成: {} 个查询版本 × {}路, 精排后返回 {} 条",
@@ -95,7 +81,7 @@ public class HybridRetriever {
     /**
      * 混合检索笔记
      */
-    public List<Map<String, Object>> searchNotes(String userId, String query, String hydeQuery, int topK) {
+    public List<Map<String, Object>> searchNotes(String userId, String query, int topK) {
         List<String> queries = queryExpander.expand(query);
         log.info("笔记混合检索: 原始查询='{}', 扩展为 {} 个版本", truncate(query, 30), queries.size());
 
@@ -114,22 +100,10 @@ public class HybridRetriever {
             allRankings.add(bm25Results);
         }
 
-        // 额外：用 HyDE 假设文档做向量检索 + BM25 检索
-        if (hydeQuery != null && !hydeQuery.equals(query)) {
-            List<Map<String, Object>> hydeVectorResults = vectorStoreService.searchNotes(userId, hydeQuery, topK * 2);
-            allRankings.add(hydeVectorResults);
-
-            List<Map<String, Object>> hydeBm25Results = bm25Service.search(userId, hydeQuery, topK * 2);
-            hydeBm25Results = hydeBm25Results.stream()
-                    .filter(r -> "note".equals(r.get("source")))
-                    .collect(Collectors.toList());
-            allRankings.add(hydeBm25Results);
-        }
-
         // RRF 融合
         List<Map<String, Object>> fused = rrfFusion(allRankings, topK * 2);
 
-        // Cross-Encoder 精排
+        // Cross-Encoder 精排 + 动态 top-N
         fused = rerankerService.rerank(query, fused);
 
         log.info("笔记混合检索完成: 精排后返回 {} 条", fused.size());

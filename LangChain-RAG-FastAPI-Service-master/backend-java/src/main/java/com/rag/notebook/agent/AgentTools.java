@@ -22,16 +22,25 @@ public class AgentTools {
     private final NoteService noteService;
     private final ReviewService reviewService;
 
+    // 存储最新的 traceId，供 AgentService 读取
+    private String latestTraceId;
+
     public AgentTools(RagService ragService, NoteService noteService, ReviewService reviewService) {
         this.ragService = ragService;
         this.noteService = noteService;
         this.reviewService = reviewService;
     }
 
+    public String getLatestTraceId() {
+        return latestTraceId;
+    }
+
     @Tool("从用户上传的知识库文档中检索相关内容并生成摘要，适用于用户提到知识库、文档、资料等场景")
     public String ragSummary(@P("用户的查询问题") String query, @ToolMemoryId String userId) {
         try {
             Map<String, Object> result = ragService.getDocumentsAndSummary(userId, query);
+            // 捕获 traceId
+            this.latestTraceId = ragService.getLatestTraceId();
             StringBuilder sb = new StringBuilder();
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> docs = (List<Map<String, Object>>) result.get("documents");
@@ -69,6 +78,12 @@ public class AgentTools {
                 sb.append(i + 1).append(". ").append(note.title());
                 if (note.category() != null) sb.append(" [").append(note.category()).append("]");
                 if (note.tags() != null) sb.append(" 标签:").append(note.tags());
+                // 内容预览（最多 300 字）
+                String content = note.content();
+                if (content != null && !content.isEmpty()) {
+                    String preview = content.length() > 300 ? content.substring(0, 300) + "..." : content;
+                    sb.append("\n   内容: ").append(preview);
+                }
                 sb.append("\n");
             }
             return sb.toString();

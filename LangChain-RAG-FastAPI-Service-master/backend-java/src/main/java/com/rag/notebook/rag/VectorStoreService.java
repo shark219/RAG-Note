@@ -188,16 +188,25 @@ public class VectorStoreService {
      * 从 ChromaDB 删除笔记的所有切片
      */
     private void deleteNoteChunksFromChroma(String noteId) {
-        // 查询并删除所有属于该笔记的向量
-        // 由于 ChromaDB 不支持按 metadata 批量删除，这里使用 REST API
-        try {
-            String chromaUrl = props.getChroma().getUrl();
-            String collectionName = props.getChroma().getNotesCollection();
-            String collectionId = getCollectionId(collectionName);
+        String chromaUrl = props.getChroma().getUrl();
+        String collectionName = props.getChroma().getNotesCollection();
 
+        // 第一次尝试（可能使用缓存的 collection ID）
+        boolean success = tryDeleteFromChroma(chromaUrl, collectionName, noteId, false);
+        if (success) return;
+
+        // 第二次尝试：清除缓存，重新获取 collection ID
+        log.info("ChromaDB 删除失败，清除缓存后重试: noteId={}", noteId);
+        clearCollectionIdCache(collectionName);
+        tryDeleteFromChroma(chromaUrl, collectionName, noteId, true);
+    }
+
+    private boolean tryDeleteFromChroma(String chromaUrl, String collectionName, String noteId, boolean isRetry) {
+        try {
+            String collectionId = getCollectionId(collectionName);
             if (collectionId == null) {
-                log.error("无法获取笔记Collection ID");
-                return;
+                log.error("无法获取笔记Collection ID{}", isRetry ? "（重试）" : "");
+                return false;
             }
 
             String deleteUrl = chromaUrl + "/api/v1/collections/" + collectionId + "/delete";
@@ -211,10 +220,13 @@ public class VectorStoreService {
             ResponseEntity<String> response = restTemplate.exchange(deleteUrl, HttpMethod.POST, entity, String.class);
 
             if (response.getStatusCode() == HttpStatus.OK) {
-                log.info("笔记旧向量删除成功: noteId={}", noteId);
+                log.info("笔记向量删除成功{}: noteId={}", isRetry ? "（重试）" : "", noteId);
+                return true;
             }
+            return false;
         } catch (Exception e) {
-            log.warn("笔记旧向量删除失败: noteId={}, error={}", noteId, e.getMessage());
+            log.warn("笔记向量删除{}失败: noteId={}, error={}", isRetry ? "重试" : "尝试", noteId, e.getMessage());
+            return false;
         }
     }
 
@@ -223,11 +235,21 @@ public class VectorStoreService {
      */
     @Transactional
     public void deleteNoteVector(String noteId, String userId) {
-        // 1. 从 MySQL 删除 NoteChunk
+        // 1. 先查询 chunks（用于 BM25 删除，必须在 MySQL 删除前查询）
+        List<NoteChunk> chunks = noteChunkRepository.findByNoteIdOrderByChunkIndexAsc(noteId);
+
+        // 2. 从 BM25 索引删除（在 MySQL 删除前，因为需要 chunkIndex）
+        for (NoteChunk chunk : chunks) {
+            String chunkKey = noteId + "_" + chunk.getChunkIndex();
+            bm25Service.deleteDocument(userId, chunkKey);
+        }
+        log.info("BM25索引已删除: noteId={}, chunks={}", noteId, chunks.size());
+
+        // 3. 从 MySQL 删除 NoteChunk
         noteChunkRepository.deleteByNoteId(noteId);
         log.info("笔记切片已从MySQL删除: noteId={}", noteId);
 
-        // 2. 从 ChromaDB 删除（按 note_id 批量删除）
+        // 4. 从 ChromaDB 删除（按 note_id 批量删除）
         if (chromaAvailable) {
             try {
                 deleteNoteChunksFromChroma(noteId);
@@ -236,13 +258,6 @@ public class VectorStoreService {
                 log.error("笔记向量删除失败，记录待清理任务: noteId={}, error={}", noteId, e.getMessage());
                 saveNoteCleanupTask(noteId, userId, props.getChroma().getNotesCollection());
             }
-        }
-
-        // 3. 从 BM25 索引删除（删除所有 chunk）
-        List<NoteChunk> chunks = noteChunkRepository.findByNoteIdOrderByChunkIndexAsc(noteId);
-        for (NoteChunk chunk : chunks) {
-            String chunkKey = noteId + "_" + chunk.getChunkIndex();
-            bm25Service.deleteDocument(userId, chunkKey);
         }
     }
 
@@ -395,9 +410,16 @@ public class VectorStoreService {
 
             // 2. 批量构建元数据和准备内容
             List<TextSegment> segments = new ArrayList<>();
+            List<String> validContents = new ArrayList<>();
             for (int i = 0; i < chunks.size(); i++) {
                 String key = md5 + "_" + i;
                 String content = chunks.get(i);
+
+                // 跳过空切片
+                if (content == null || content.isBlank()) {
+                    log.warn("跳过空切片: key={}", key);
+                    continue;
+                }
 
                 Map<String, Object> meta = new HashMap<>();
                 meta.put("chunk_id", key);
@@ -409,19 +431,21 @@ public class VectorStoreService {
                 meta.put("content", content);
 
                 segments.add(TextSegment.from(content, dev.langchain4j.data.document.Metadata.from(meta)));
+                validContents.add(content);
             }
 
             // 3. 分批处理（批量 Embedding + 分批写入 ChromaDB）
             int batchSize = 10;  // 每批处理 10 个 chunks（减小批量避免超时）
-            int totalBatches = (int) Math.ceil((double) chunks.size() / batchSize);
+            int totalSegments = segments.size();
+            int totalBatches = (int) Math.ceil((double) totalSegments / batchSize);
             int processedCount = 0;
 
             for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
                 int start = batchIndex * batchSize;
-                int end = Math.min(start + batchSize, chunks.size());
+                int end = Math.min(start + batchSize, totalSegments);
 
                 List<TextSegment> batchSegments = segments.subList(start, end);
-                List<String> batchContents = chunks.subList(start, end);
+                List<String> batchContents = validContents.subList(start, end);
 
                 // 批量 Embedding
                 List<Embedding> batchEmbeddings = batchEmbed(batchContents);
@@ -433,12 +457,12 @@ public class VectorStoreService {
 
                 // 发送进度回调
                 if (progressCallback != null) {
-                    int progress = (int) ((double) processedCount / chunks.size() * 100);
+                    int progress = (int) ((double) processedCount / totalSegments * 100);
                     progressCallback.accept("processing",
-                            String.format("向量化进度: %d/%d (%d%%)", processedCount, chunks.size(), progress));
+                            String.format("向量化进度: %d/%d (%d%%)", processedCount, totalSegments, progress));
                 }
 
-                log.info("ChromaDB批量写入进度: docId={}, {}/{} chunks", docId, processedCount, chunks.size());
+                log.info("ChromaDB批量写入进度: docId={}, {}/{} chunks", docId, processedCount, totalSegments);
 
                 // 批次之间添加短暂延迟，避免 ChromaDB 过载
                 if (batchIndex < totalBatches - 1) {
@@ -446,7 +470,7 @@ public class VectorStoreService {
                 }
             }
 
-            log.info("ChromaDB写入成功: docId={}, chunks={}", docId, chunks.size());
+            log.info("ChromaDB写入成功: docId={}, chunks={}", docId, totalSegments);
 
             // 写入成功后，更新MySQL状态为completed
             markVectorCompleted(docId);
@@ -611,7 +635,17 @@ public class VectorStoreService {
             }
 
         } catch (Exception e) {
-            log.error("Chroma删除异常: docId={}, error={}", docId, e.getMessage(), e);
+            // 集合不存在时清缓存
+            if (e.getMessage() != null && e.getMessage().contains("InvalidCollection")) {
+                String cacheKey = COLLECTION_ID_CACHE_PREFIX + props.getChroma().getCollection();
+                try {
+                    redisTemplate.delete(cacheKey);
+                    log.info("集合不存在，已清除缓存: {}", cacheKey);
+                } catch (Exception ex) {
+                    log.warn("清除缓存失败: {}", ex.getMessage());
+                }
+            }
+            log.error("Chroma删除异常: docId={}, error={}", docId, e.getMessage());
             return false;
         }
     }
