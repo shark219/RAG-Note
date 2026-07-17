@@ -45,6 +45,9 @@ public class EvaluationReport {
     @Column(name = "total_score")
     private Integer totalScore;
 
+    @Column(name = "harmonic_mean")
+    private Double harmonicMean;
+
     @Column(name = "level", length = 16)
     private String level;
 

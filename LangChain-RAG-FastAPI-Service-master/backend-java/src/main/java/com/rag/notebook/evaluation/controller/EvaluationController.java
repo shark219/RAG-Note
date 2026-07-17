@@ -4,16 +4,19 @@ import com.rag.notebook.common.auth.UserId;
 import com.rag.notebook.common.result.ApiResponse;
 import com.rag.notebook.evaluation.entity.EvaluationReport;
 import com.rag.notebook.evaluation.entity.RagTrace;
+import com.rag.notebook.evaluation.entity.TestCase;
 import com.rag.notebook.evaluation.repository.EvaluationReportRepository;
 import com.rag.notebook.evaluation.repository.RagTraceRepository;
+import com.rag.notebook.evaluation.repository.TestCaseRepository;
 import com.rag.notebook.evaluation.service.EvaluationService;
+import com.rag.notebook.evaluation.service.RegressionTestService;
+import com.rag.notebook.evaluation.service.TestCaseGenerator;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/evaluation")
@@ -22,18 +25,26 @@ public class EvaluationController {
     private final EvaluationService evaluationService;
     private final RagTraceRepository traceRepository;
     private final EvaluationReportRepository reportRepository;
+    private final TestCaseRepository testCaseRepository;
+    private final TestCaseGenerator testCaseGenerator;
+    private final RegressionTestService regressionTestService;
 
     public EvaluationController(EvaluationService evaluationService,
                                 RagTraceRepository traceRepository,
-                                EvaluationReportRepository reportRepository) {
+                                EvaluationReportRepository reportRepository,
+                                TestCaseRepository testCaseRepository,
+                                TestCaseGenerator testCaseGenerator,
+                                RegressionTestService regressionTestService) {
         this.evaluationService = evaluationService;
         this.traceRepository = traceRepository;
         this.reportRepository = reportRepository;
+        this.testCaseRepository = testCaseRepository;
+        this.testCaseGenerator = testCaseGenerator;
+        this.regressionTestService = regressionTestService;
     }
 
-    /**
-     * 用户反馈：提交对回答的评分
-     */
+    // ========== 反馈 ==========
+
     @PostMapping("/feedback")
     public ApiResponse<Void> submitFeedback(@RequestBody FeedbackRequest request) {
         RagTrace trace = traceRepository.findById(request.getTraceId()).orElse(null);
@@ -46,9 +57,8 @@ public class EvaluationController {
         return ApiResponse.success("反馈提交成功");
     }
 
-    /**
-     * 查看单条评估报告
-     */
+    // ========== 报告查询 ==========
+
     @GetMapping("/report/{traceId}")
     public ApiResponse<EvaluationReport> getReport(@PathVariable String traceId) {
         EvaluationReport report = reportRepository.findTopByTraceIdOrderByCreatedAtDesc(traceId).orElse(null);
@@ -58,9 +68,6 @@ public class EvaluationController {
         return ApiResponse.success(report);
     }
 
-    /**
-     * 批量查看评估报告
-     */
     @GetMapping("/reports")
     public ApiResponse<List<EvaluationReport>> getReports(
             @RequestParam(defaultValue = "0") int page,
@@ -74,9 +81,8 @@ public class EvaluationController {
         return ApiResponse.success(reports.subList(start, end));
     }
 
-    /**
-     * 手动触发批量评估
-     */
+    // ========== 批量评估 ==========
+
     @PostMapping("/batch")
     public ApiResponse<Map<String, Object>> batchEvaluate(
             @RequestParam(defaultValue = "0") int days) {
@@ -95,9 +101,8 @@ public class EvaluationController {
         ));
     }
 
-    /**
-     * 查看整体统计
-     */
+    // ========== 统计 ==========
+
     @GetMapping("/stats")
     public ApiResponse<Map<String, Object>> getStats() {
         LocalDateTime todayStart = LocalDate.now().atStartOfDay();
@@ -105,12 +110,10 @@ public class EvaluationController {
 
         Map<String, Object> stats = new HashMap<>();
 
-        // 今日统计
         stats.put("todayTraceCount", traceRepository.countByDate(todayStart));
         stats.put("todayAvgLatency", traceRepository.avgLatencyByDate(todayStart));
         stats.put("todayAvgFeedback", traceRepository.avgUserFeedbackByDate(todayStart));
 
-        // 本周统计
         stats.put("weekReportCount", reportRepository.countByDate(weekStart));
         stats.put("weekAvgScore", reportRepository.avgTotalScoreByDate(weekStart));
         stats.put("weekAvgPrecision", reportRepository.avgContextPrecisionByDate(weekStart));
@@ -119,24 +122,158 @@ public class EvaluationController {
         stats.put("weekAvgRelevancy", reportRepository.avgAnswerRelevancyByDate(weekStart));
         stats.put("weekLowScoreCount", reportRepository.countLowScoreByDate(weekStart));
 
-        // 低分样本数
         stats.put("totalLowScoreReports", reportRepository.findLowScoreReports().size());
 
         return ApiResponse.success(stats);
     }
 
-    /**
-     * 获取低分样本列表
-     */
     @GetMapping("/low-scores")
     public ApiResponse<List<EvaluationReport>> getLowScores() {
         return ApiResponse.success(reportRepository.findLowScoreReports());
     }
 
-    // 请求体
+    // ========== Phase 3: 趋势数据 ==========
+
+    @GetMapping("/trend")
+    public ApiResponse<Map<String, Object>> getTrend(
+            @RequestParam(defaultValue = "30") int days) {
+
+        LocalDateTime start = LocalDate.now().minusDays(days).atStartOfDay();
+        List<EvaluationReport> reports = reportRepository.findByCreatedAtAfter(start);
+
+        Map<String, List<EvaluationReport>> grouped = reports.stream()
+                .collect(Collectors.groupingBy(
+                        r -> r.getCreatedAt().toLocalDate().toString()
+                ));
+
+        List<String> dates = new ArrayList<>();
+        List<Double> faithfulnessTrend = new ArrayList<>();
+        List<Double> relevancyTrend = new ArrayList<>();
+        List<Double> precisionTrend = new ArrayList<>();
+        List<Double> recallTrend = new ArrayList<>();
+        List<Double> scoreTrend = new ArrayList<>();
+
+        grouped.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> {
+                    dates.add(entry.getKey());
+                    List<EvaluationReport> dayReports = entry.getValue();
+                    faithfulnessTrend.add(avg(dayReports, EvaluationReport::getFaithfulness));
+                    relevancyTrend.add(avg(dayReports, EvaluationReport::getAnswerRelevancy));
+                    precisionTrend.add(avg(dayReports, EvaluationReport::getContextPrecision));
+                    recallTrend.add(avg(dayReports, EvaluationReport::getContextRecall));
+                    scoreTrend.add(avgInt(dayReports, EvaluationReport::getTotalScore));
+                });
+
+        return ApiResponse.success(Map.of(
+                "dates", dates,
+                "faithfulness", faithfulnessTrend,
+                "answerRelevancy", relevancyTrend,
+                "contextPrecision", precisionTrend,
+                "contextRecall", recallTrend,
+                "totalScore", scoreTrend
+        ));
+    }
+
+    // ========== Phase 3: 评级分布 ==========
+
+    @GetMapping("/distribution")
+    public ApiResponse<Map<String, Object>> getDistribution(
+            @RequestParam(defaultValue = "30") int days) {
+
+        LocalDateTime start = LocalDate.now().minusDays(days).atStartOfDay();
+        List<EvaluationReport> reports = reportRepository.findByCreatedAtAfter(start);
+
+        long excellent = reports.stream().filter(r -> "优秀".equals(r.getLevel())).count();
+        long good = reports.stream().filter(r -> "良好".equals(r.getLevel())).count();
+        long pass = reports.stream().filter(r -> "及格".equals(r.getLevel())).count();
+        long fail = reports.stream().filter(r -> "不及格".equals(r.getLevel())).count();
+
+        return ApiResponse.success(Map.of(
+                "excellent", excellent,
+                "good", good,
+                "pass", pass,
+                "fail", fail,
+                "total", reports.size()
+        ));
+    }
+
+    // ========== Phase 3: 诊断分布 ==========
+
+    @GetMapping("/diagnosis-stats")
+    public ApiResponse<Map<String, Object>> getDiagnosisStats(
+            @RequestParam(defaultValue = "30") int days) {
+
+        LocalDateTime start = LocalDate.now().minusDays(days).atStartOfDay();
+        List<EvaluationReport> reports = reportRepository.findByCreatedAtAfter(start);
+
+        long hallucination = reports.stream().filter(r -> r.getDiagnosis() != null && r.getDiagnosis().contains("幻觉")).count();
+        long irrelevant = reports.stream().filter(r -> r.getDiagnosis() != null && r.getDiagnosis().contains("答非所问")).count();
+        long retrievalLow = reports.stream().filter(r -> r.getDiagnosis() != null && r.getDiagnosis().contains("检索精度低")).count();
+        long recallLow = reports.stream().filter(r -> r.getDiagnosis() != null && r.getDiagnosis().contains("检索召回低")).count();
+        long normal = reports.stream().filter(r -> r.getDiagnosis() != null && r.getDiagnosis().contains("正常")).count();
+
+        return ApiResponse.success(Map.of(
+                "hallucination", hallucination,
+                "irrelevant", irrelevant,
+                "retrievalLow", retrievalLow,
+                "recallLow", recallLow,
+                "normal", normal
+        ));
+    }
+
+    // ========== Phase 2: 测试用例生成 ==========
+
+    @PostMapping("/test-cases/generate")
+    public ApiResponse<Map<String, Object>> generateTestCases(
+            @UserId String userId,
+            @RequestParam(defaultValue = "10") int count) {
+
+        int generated = testCaseGenerator.generateTestCases(userId, count);
+        return ApiResponse.success("测试用例生成完成", Map.of(
+                "generated", generated,
+                "total", testCaseRepository.findByUserIdOrderByCreatedAtDesc(userId).size()
+        ));
+    }
+
+    @GetMapping("/test-cases")
+    public ApiResponse<List<TestCase>> getTestCases(@UserId String userId) {
+        return ApiResponse.success(testCaseRepository.findByUserIdOrderByCreatedAtDesc(userId));
+    }
+
+    // ========== Phase 2: 回归测试 ==========
+
+    @PostMapping("/regression")
+    public ApiResponse<Map<String, Object>> runRegressionTest(@UserId String userId) {
+        Map<String, Object> result = regressionTestService.runRegressionTest(userId);
+        return ApiResponse.success("回归测试完成", result);
+    }
+
+    // ========== 工具方法 ==========
+
+    private double avg(List<EvaluationReport> reports, java.util.function.Function<EvaluationReport, Double> getter) {
+        return reports.stream()
+                .map(getter)
+                .filter(Objects::nonNull)
+                .mapToDouble(d -> d)
+                .average()
+                .orElse(0.0);
+    }
+
+    private double avgInt(List<EvaluationReport> reports, java.util.function.Function<EvaluationReport, Integer> getter) {
+        return reports.stream()
+                .map(getter)
+                .filter(Objects::nonNull)
+                .mapToDouble(d -> d)
+                .average()
+                .orElse(0.0);
+    }
+
+    // ========== 请求体 ==========
+
     public static class FeedbackRequest {
         private String traceId;
-        private Integer score;  // 1-5
+        private Integer score;
         private String reason;
 
         public String getTraceId() { return traceId; }

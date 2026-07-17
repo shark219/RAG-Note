@@ -1,5 +1,6 @@
 package com.rag.notebook.evaluation.service;
 
+import com.rag.notebook.config.ApplicationProperties;
 import com.rag.notebook.evaluation.entity.EvaluationReport;
 import com.rag.notebook.evaluation.entity.RagTrace;
 import com.rag.notebook.evaluation.repository.EvaluationReportRepository;
@@ -10,7 +11,9 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 
 @Slf4j
 @Service
@@ -19,17 +22,21 @@ public class BatchEvaluationService {
     private final RagTraceRepository traceRepository;
     private final EvaluationReportRepository reportRepository;
     private final EvaluationService evaluationService;
+    private final ApplicationProperties props;
+    private final Random random = new Random();
 
     public BatchEvaluationService(RagTraceRepository traceRepository,
                                   EvaluationReportRepository reportRepository,
-                                  EvaluationService evaluationService) {
+                                  EvaluationService evaluationService,
+                                  ApplicationProperties props) {
         this.traceRepository = traceRepository;
         this.reportRepository = reportRepository;
         this.evaluationService = evaluationService;
+        this.props = props;
     }
 
     /**
-     * 每天凌晨 2 点自动评估前一天的 Trace
+     * 每天凌晨 2 点自动评估前一天的 Trace（带采样策略）
      */
     @Scheduled(cron = "0 0 2 * * ?")
     public void dailyEvaluation() {
@@ -46,13 +53,84 @@ public class BatchEvaluationService {
 
         log.info("发现 {} 条待评估的 Trace", traces.size());
 
-        int evaluated = evaluationService.batchEvaluate(traces);
+        // 采样策略
+        List<RagTrace> toEvaluate = sampleTraces(traces);
+        log.info("采样后 {} 条待评估", toEvaluate.size());
 
-        log.info("每日评估完成: 总计 {} 条，成功评估 {} 条", traces.size(), evaluated);
+        int evaluated = evaluationService.batchEvaluate(toEvaluate);
+
+        log.info("每日评估完成: 总计 {} 条，采样 {} 条，成功评估 {} 条",
+                traces.size(), toEvaluate.size(), evaluated);
 
         // 输出低分样本统计
         List<EvaluationReport> lowScores = reportRepository.findLowScoreReports();
         log.info("累计低分样本: {} 条", lowScores.size());
+    }
+
+    /**
+     * 采样策略：
+     * - 高优先级：用户低分反馈（1-2 分）→ 必须评估
+     * - 高优先级：规则评估预判不及格（耗时 > 15s 或检索为空）→ 必须评估
+     * - 中优先级：其他 Trace → 按比例采样
+     * - 低优先级：高相似度（>0.8）+ 短耗时（<5s）→ 跳过
+     */
+    private List<RagTrace> sampleTraces(List<RagTrace> traces) {
+        double sampleRate = props.getEvaluation().getSampleRate();
+        List<RagTrace> result = new ArrayList<>();
+
+        for (RagTrace trace : traces) {
+            // 高优先级：用户低分反馈 → 必须评估
+            if (trace.getUserFeedback() != null && trace.getUserFeedback() <= 2) {
+                result.add(trace);
+                continue;
+            }
+
+            // 高优先级：规则预判不及格 → 必须评估
+            if (isRuleFail(trace)) {
+                result.add(trace);
+                continue;
+            }
+
+            // 低优先级：高相似度 + 短耗时 → 跳过
+            if (isHighQuality(trace)) {
+                continue;
+            }
+
+            // 中优先级：按比例采样
+            if (random.nextDouble() < sampleRate) {
+                result.add(trace);
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * 规则预判：是否大概率不及格
+     */
+    private boolean isRuleFail(RagTrace trace) {
+        // 耗时过长
+        if (trace.getTotalLatencyMs() != null && trace.getTotalLatencyMs() > 15000) {
+            return true;
+        }
+        // 检索为空
+        if (trace.getRetrievedDocs() == null || trace.getRetrievedDocs().isEmpty()) {
+            return true;
+        }
+        // 回答过短
+        if (trace.getFinalAnswer() != null && trace.getFinalAnswer().length() < 20) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 高质量判断：大概率没问题，可跳过评估
+     */
+    private boolean isHighQuality(RagTrace trace) {
+        boolean highSimilarity = trace.getAvgSimilarity() != null && trace.getAvgSimilarity() > 0.8;
+        boolean fastResponse = trace.getTotalLatencyMs() != null && trace.getTotalLatencyMs() < 5000;
+        return highSimilarity && fastResponse;
     }
 
     /**

@@ -40,6 +40,9 @@ public class RagTrace {
     @Column(name = "final_answer", columnDefinition = "TEXT")
     private String finalAnswer;
 
+    @Column(name = "ground_truth", columnDefinition = "TEXT")
+    private String groundTruth;
+
     @Column(name = "total_latency_ms")
     private Long totalLatencyMs;
 

@@ -20,6 +20,8 @@ public interface EvaluationReportRepository extends JpaRepository<EvaluationRepo
     @Query("SELECT r FROM EvaluationReport r WHERE r.createdAt >= :start AND r.createdAt < :end ORDER BY r.createdAt DESC")
     List<EvaluationReport> findByDateRange(@Param("start") LocalDateTime start, @Param("end") LocalDateTime end);
 
+    List<EvaluationReport> findByCreatedAtAfter(LocalDateTime start);
+
     @Query("SELECT r FROM EvaluationReport r WHERE r.totalScore < 60 ORDER BY r.totalScore ASC")
     List<EvaluationReport> findLowScoreReports();
 

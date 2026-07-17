@@ -12,6 +12,8 @@ import dev.langchain4j.model.embedding.EmbeddingModel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
+
 @Slf4j
 @Component
 public class ModelFactory {
@@ -84,6 +86,36 @@ public class ModelFactory {
      */
     public ChatLanguageModel createCreativeModel() {
         return createChatModel(TEMP_CREATIVE);
+    }
+
+    /**
+     * 创建评估专用模型（temperature=0，确定性输出，超时 120 秒）
+     * 用于 RAGAS 质量评估，保证同一输入多次评估结果一致
+     */
+    public ChatLanguageModel createEvaluationModel() {
+        String type = props.getLlm().getType();
+        if ("ZHIPU".equalsIgnoreCase(type)) {
+            return OpenAiChatModel.builder()
+                    .apiKey(props.getLlm().getZhipu().getApiKey())
+                    .baseUrl(props.getLlm().getZhipu().getBaseUrl())
+                    .modelName(props.getLlm().getZhipu().getModel())
+                    .temperature(0.0)
+                    .timeout(Duration.ofSeconds(120))
+                    .build();
+        } else if ("OLLAMA".equalsIgnoreCase(type)) {
+            return OllamaChatModel.builder()
+                    .baseUrl(props.getLlm().getOllama().getBaseUrl())
+                    .modelName(props.getLlm().getOllama().getModel())
+                    .temperature(0.0)
+                    .timeout(Duration.ofSeconds(120))
+                    .build();
+        } else {
+            return QwenChatModel.builder()
+                    .apiKey(props.getLlm().getAliyun().getApiKey())
+                    .modelName(props.getLlm().getAliyun().getModel())
+                    .temperature(0.0f)
+                    .build();
+        }
     }
 
     public EmbeddingModel createEmbeddingModel() {

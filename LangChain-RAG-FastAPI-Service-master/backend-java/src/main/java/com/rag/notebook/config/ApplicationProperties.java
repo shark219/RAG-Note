@@ -18,6 +18,7 @@ public class ApplicationProperties {
     private Md5 md5 = new Md5();
     private String extractedImagesDir = "data/extracted_images";
     private RateLimit rateLimit = new RateLimit();
+    private Evaluation evaluation = new Evaluation();
 
     @Data
     public static class Jwt {
@@ -130,5 +131,14 @@ public class ApplicationProperties {
     @Data
     public static class RateLimit {
         private boolean enabled = false;
+    }
+
+    @Data
+    public static class Evaluation {
+        private double faithfulnessWeight = 0.4;
+        private double answerRelevancyWeight = 0.35;
+        private double contextPrecisionWeight = 0.25;
+        private double contextRecallWeight = 0.2;
+        private double sampleRate = 0.2;
     }
 }
