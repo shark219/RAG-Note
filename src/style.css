@@ -1,0 +1,50 @@
+:root {
+  --color-bg-1: #fff;
+  --color-bg-2: #f7f8fa;
+  --color-bg-3: #f2f3f5;
+  --color-text-1: #1d2129;
+  --color-text-2: #4e5969;
+  --color-text-3: #86909c;
+  --color-border: #e5e6eb;
+  --color-primary: #165dff;
+  --color-primary-light: #e8f3ff;
+  --sidebar-width: 240px;
+  --header-height: 60px;
+}
+
+[data-theme="dark"] {
+  --color-bg-1: #17171a;
+  --color-bg-2: #232324;
+  --color-bg-3: #2a2a2b;
+  --color-text-1: #f0f0f0;
+  --color-text-2: #b0b0b0;
+  --color-text-3: #707070;
+  --color-border: #3a3a3b;
+  --color-primary: #3c7eff;
+  --color-primary-light: #1a2a4a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol',
+    'Noto Color Emoji';
+  background-color: var(--color-bg-2);
+  color: var(--color-text-1);
+}
+
+.page-container {
+  padding: 16px;
+  height: 100%;
+  overflow: auto;
+}
+
+.card-container {
+  background: var(--color-bg-1);
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
