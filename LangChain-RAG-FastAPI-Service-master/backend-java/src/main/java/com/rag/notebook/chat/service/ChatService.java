@@ -37,6 +37,7 @@ public class ChatService {
     private final AgentService agentService;
     private final RagService ragService;
     private final ReorderService reorderService;
+    private final FileExtractorService fileExtractorService;
 
     @Value("${app.upload.dir:data/uploads}")
     private String uploadDir;
@@ -48,7 +49,8 @@ public class ChatService {
                        ChatPromptRepository promptRepository,
                        @Lazy AgentService agentService,
                        RagService ragService,
-                       ReorderService reorderService) {
+                       ReorderService reorderService,
+                       FileExtractorService fileExtractorService) {
         this.sessionManager = sessionManager;
         this.messageRepository = messageRepository;
         this.sessionRepository = sessionRepository;
@@ -57,6 +59,7 @@ public class ChatService {
         this.agentService = agentService;
         this.ragService = ragService;
         this.reorderService = reorderService;
+        this.fileExtractorService = fileExtractorService;
     }
 
     // ========== 消息查询 ==========
@@ -292,6 +295,11 @@ public class ChatService {
         attachment.setFilePath(filePath);
         attachment.setFileSize(file.getSize());
         attachment.setContentType(file.getContentType());
+        // 提取文件文本内容
+        File savedFile = new File(filePath);
+        String extractedText = fileExtractorService.extractText(savedFile, originalName, file.getContentType());
+        attachment.setExtractedText(extractedText);
+
         attachment = attachmentRepository.save(attachment);
 
         Map<String, Object> result = new HashMap<>();
@@ -335,6 +343,33 @@ public class ChatService {
         attachment.setStatus("deleted");
         attachmentRepository.save(attachment);
         log.info("删除附件: attachmentId={}, userId={}", attachmentId, userId);
+    }
+
+    /**
+     * 根据 fileIds 构建附件内容上下文，注入 LLM 消息
+     */
+    public String buildAttachmentContext(List<String> fileIds, String userId) {
+        if (fileIds == null || fileIds.isEmpty()) return null;
+
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (String fileId : fileIds) {
+            ChatAttachment attachment = attachmentRepository.findById(fileId).orElse(null);
+            if (attachment == null || !"active".equals(attachment.getStatus())) continue;
+            if (!attachment.getUserId().equals(userId)) continue;
+            if (attachment.getExtractedText() == null || attachment.getExtractedText().isBlank()) continue;
+
+            count++;
+            sb.append("附件").append(count).append("：").append(attachment.getOriginalName()).append("\n");
+            sb.append(attachment.getExtractedText()).append("\n\n");
+        }
+
+        if (count == 0) return null;
+
+        return "===== 附件内容开始 =====\n"
+                + sb
+                + "===== 附件内容结束 =====\n\n"
+                + "请基于以上附件内容回答用户问题。\n";
     }
 
     // ========== 提示词管理 ==========

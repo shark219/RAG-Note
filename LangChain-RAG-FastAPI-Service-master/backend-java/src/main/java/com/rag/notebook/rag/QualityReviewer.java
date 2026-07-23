@@ -58,7 +58,7 @@ public class QualityReviewer {
             for (int i = 0; i < count; i++) {
                 Map<String, Object> doc = documents.get(i);
                 String content = (String) doc.getOrDefault("content", "");
-                if (content.length() > 500) content = content.substring(0, 500);
+                if (content.length() > 1500) content = content.substring(0, 1500);
                 String title = (String) doc.getOrDefault("title", doc.getOrDefault("filename", "未知"));
                 docBuilder.append("【").append(i + 1).append("】").append(title).append("\n").append(content).append("\n\n");
             }
@@ -94,12 +94,12 @@ public class QualityReviewer {
             for (int i = 0; i < count; i++) {
                 Map<String, Object> doc = documents.get(i);
                 String content = (String) doc.getOrDefault("content", "");
-                if (content.length() > 500) content = content.substring(0, 500);
+                if (content.length() > 1500) content = content.substring(0, 1500);
                 docBuilder.append("【").append(i + 1).append("】").append(content).append("\n\n");
             }
 
             // 截断回答避免超长
-            String truncatedAnswer = answer.length() > 1000 ? answer.substring(0, 1000) : answer;
+            String truncatedAnswer = answer.length() > 3000 ? answer.substring(0, 3000) : answer;
 
             String prompt = template
                     .replace("{query}", query)

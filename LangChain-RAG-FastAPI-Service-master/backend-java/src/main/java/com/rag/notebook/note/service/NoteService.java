@@ -280,15 +280,11 @@ public class NoteService {
     }
 
     public NoteListResponse searchNotes(String userId, String query) {
-        List<Map<String, Object>> results = vectorStoreService.searchNotes(userId, query, 10);
-        List<NoteResponse> notes = new ArrayList<>();
-
-        for (Map<String, Object> result : results) {
-            String noteId = (String) result.get("note_id");
-            if (noteId == null) continue;
-            noteRepository.findById(noteId).ifPresent(note -> notes.add(toResponse(note)));
-        }
-
+        // 使用 SQL LIKE 搜索标题和内容（支持中文，简单可靠）
+        List<Note> matched = noteRepository.searchByKeyword(userId, query);
+        List<NoteResponse> notes = matched.stream()
+                .map(this::toResponse)
+                .collect(Collectors.toList());
         return new NoteListResponse(notes, notes.size());
     }
 

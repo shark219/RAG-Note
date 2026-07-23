@@ -39,6 +39,9 @@ public class ChatAttachment {
     @Column(name = "content_type", length = 100)
     private String contentType;
 
+    @Column(name = "extracted_text", columnDefinition = "TEXT")
+    private String extractedText;
+
     @Column(name = "status", length = 20)
     private String status = "active"; // active, deleted
 

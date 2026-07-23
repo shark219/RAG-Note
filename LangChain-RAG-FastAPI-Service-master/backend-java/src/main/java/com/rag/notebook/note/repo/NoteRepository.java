@@ -25,4 +25,7 @@ public interface NoteRepository extends JpaRepository<Note, String> {
     long countUncategorized(@Param("userId") String userId);
 
     long countByUserId(String userId);
+
+    @Query("SELECT n FROM Note n WHERE n.userId = :userId AND (n.title LIKE %:keyword% OR n.content LIKE %:keyword%) ORDER BY n.updatedAt DESC")
+    List<Note> searchByKeyword(@Param("userId") String userId, @Param("keyword") String keyword);
 }

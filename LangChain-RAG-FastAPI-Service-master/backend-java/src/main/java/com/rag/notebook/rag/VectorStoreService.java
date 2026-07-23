@@ -103,11 +103,6 @@ public class VectorStoreService {
      */
     @Transactional
     public void addNoteVector(Note note) {
-        if (!chromaAvailable) {
-            log.warn("ChromaDB不可用，无法添加笔记向量: noteId={}", note.getId());
-            return;
-        }
-
         String text = buildNoteText(note);
         String title = note.getTitle() != null ? note.getTitle() : "";
 
@@ -127,10 +122,7 @@ public class VectorStoreService {
         }
         noteChunkRepository.saveAll(chunkEntities);
 
-        // 3. 异步写入 ChromaDB
-        writeNoteToChromaAsync(note.getId(), note.getUserId(), title, chunks);
-
-        // 4. 写入 BM25 索引
+        // 3. 写入 BM25 索引（不依赖 ChromaDB）
         for (int i = 0; i < chunks.size(); i++) {
             String chunkKey = note.getId() + "_" + i;
             bm25Service.addDocument(note.getUserId(), chunkKey, chunks.get(i),
@@ -138,7 +130,14 @@ public class VectorStoreService {
                             "note_id", note.getId(), "title", title, "user_id", note.getUserId()));
         }
 
-        log.info("笔记向量添加成功: noteId={}, chunks={}", note.getId(), chunks.size());
+        // 4. 异步写入 ChromaDB（可选，失败不影响 BM25）
+        if (chromaAvailable) {
+            writeNoteToChromaAsync(note.getId(), note.getUserId(), title, chunks);
+        } else {
+            log.warn("ChromaDB不可用，跳过向量索引: noteId={}", note.getId());
+        }
+
+        log.info("笔记索引完成: noteId={}, chunks={}", note.getId(), chunks.size());
     }
 
     /**

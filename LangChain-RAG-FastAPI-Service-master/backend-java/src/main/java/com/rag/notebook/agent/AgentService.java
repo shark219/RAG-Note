@@ -72,7 +72,35 @@ public class AgentService {
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
 
+    // 知识库相关工具名
+    private static final Set<String> KNOWLEDGE_TOOLS = Set.of("ragSummary");
+    // 笔记相关工具名
+    private static final Set<String> NOTE_TOOLS = Set.of(
+            "searchNotes", "getNoteStats", "getTodayReviews",
+            "markReviewed", "createNote", "getRelatedNotes");
+
+    /**
+     * 根据用户开关过滤工具列表
+     */
+    private List<ToolSpecification> filterTools(boolean enableKnowledge, boolean enableNotes) {
+        return toolSpecifications.stream()
+                .filter(tool -> {
+                    String name = tool.name();
+                    if (KNOWLEDGE_TOOLS.contains(name)) return enableKnowledge;
+                    if (NOTE_TOOLS.contains(name)) return enableNotes;
+                    return true; // 通用工具（如 whatTimeIsNow）始终可用
+                })
+                .toList();
+    }
+
     public SseEmitter streamAgentResponse(String query, String sessionId, String userId) {
+        return streamAgentResponse(query, sessionId, userId, false, true, true, null);
+    }
+
+    public SseEmitter streamAgentResponse(String query, String sessionId, String userId,
+                                            boolean regenerate,
+                                            boolean enableKnowledge, boolean enableNotes,
+                                            List<String> fileIds) {
         // 多 Agent 流水线可能耗时较长，超时设为 5 分钟
         SseEmitter emitter = new SseEmitter(300000L);
 
@@ -83,8 +111,10 @@ public class AgentService {
             SecurityContextHolder.setContext(securityContext);
             long startTime = System.currentTimeMillis();
             try {
-                // 先保存用户消息（确保即使后续处理超时，用户消息也在数据库里）
-                chatService.addMessage(sessionId, userId, "human", query);
+                // 先保存用户消息（重新生成时跳过，因为用户消息已存在）
+                if (!regenerate) {
+                    chatService.addMessage(sessionId, userId, "human", query);
+                }
 
                 // 加载会话历史，滑动窗口 + 摘要压缩
                 List<ChatMessage> history = chatService.getSessionMessages(sessionId);
@@ -92,7 +122,18 @@ public class AgentService {
                 List<dev.langchain4j.data.message.ChatMessage> historyMessages =
                         contextManager.buildMessages(history, chatModel);
 
-                // Supervisor 规划：判断是否需要多 Agent 流水线
+                // 根据用户开关过滤工具列表
+                List<ToolSpecification> activeTools = filterTools(enableKnowledge, enableNotes);
+                log.info("工具过滤: enableKnowledge={}, enableNotes={}, 可用工具数={}",
+                        enableKnowledge, enableNotes, activeTools.size());
+
+                // 构建附件上下文（注入给执行层，不传给 Supervisor）
+                String attachmentContext = chatService.buildAttachmentContext(fileIds, userId);
+                String queryWithContext = attachmentContext != null
+                        ? attachmentContext + "用户问题：" + query
+                        : query;
+
+                // Supervisor 规划：判断是否需要多 Agent 流水线（只传用户原始问题）
                 List<SubTask> subTasks = supervisorService.plan(query);
 
                 String response;
@@ -101,8 +142,8 @@ public class AgentService {
                     List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
                     messages.add(SystemMessage.from(loadSystemPrompt()));
                     messages.addAll(historyMessages);
-                    messages.add(UserMessage.from(query));
-                    response = processWithFunctionCalling(messages, userId, emitter, sessionId, query);
+                    messages.add(UserMessage.from(queryWithContext));
+                    response = processWithFunctionCalling(messages, userId, emitter, sessionId, query, activeTools);
                 } else {
                     // 复杂查询：走多 Agent 流水线
                     response = executePipeline(subTasks, query, userId, emitter);
@@ -303,14 +344,15 @@ public class AgentService {
      */
     private String processWithFunctionCalling(
             List<dev.langchain4j.data.message.ChatMessage> messages,
-            String userId, SseEmitter emitter, String sessionId, String query) throws IOException {
+            String userId, SseEmitter emitter, String sessionId, String query,
+            List<ToolSpecification> activeTools) throws IOException {
 
         ChatLanguageModel chatModel = modelFactory.createPreciseModel();
 
         // Agent 循环：最多 3 轮工具调用
         for (int i = 0; i < 3; i++) {
             // 发送消息 + 工具定义给 LLM
-            Response<AiMessage> chatResponse = chatModel.generate(messages, toolSpecifications);
+            Response<AiMessage> chatResponse = chatModel.generate(messages, activeTools);
             AiMessage aiMessage = chatResponse.content();
 
             // LLM 要求调用工具
@@ -368,7 +410,7 @@ public class AgentService {
                 .filter(m -> m instanceof ToolExecutionResultMessage)
                 .map(m -> {
                     String content = ((ToolExecutionResultMessage) m).text();
-                    return Map.<String, Object>of("content", content.length() > 500 ? content.substring(0, 500) : content);
+                    return Map.<String, Object>of("content", content.length() > 1500 ? content.substring(0, 1500) : content);
                 })
                 .toList();
 
@@ -391,7 +433,7 @@ public class AgentService {
         messages.add(AiMessage.from(answer));
         messages.add(UserMessage.from(
                 "你的回答质量不够好，请根据以下反馈重新回答：\n" + review.feedback()
-                        + "\n\n请直接给出改进后的回答，不要调用工具。"
+                        + "\n\n请直接给出改进后的回答，不要加任何前缀语，不要调用工具。"
         ));
 
         try {
@@ -400,6 +442,8 @@ public class AgentService {
             Response<AiMessage> retryResponse = balancedModel.generate(messages);
             String retryAnswer = retryResponse.content().text();
             if (retryAnswer != null && !retryAnswer.isBlank()) {
+                // 去掉 LLM 习惯性添加的前缀语
+                retryAnswer = retryAnswer.replaceAll("^(了解您的反馈[，,].*?[：:]\n?)", "").trim();
                 log.info("Agent 回答重试成功");
                 return retryAnswer;
             }

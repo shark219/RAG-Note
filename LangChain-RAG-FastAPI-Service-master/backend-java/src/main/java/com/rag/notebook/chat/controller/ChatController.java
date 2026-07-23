@@ -139,7 +139,9 @@ public class ChatController {
         if (sessionId == null || sessionId.isEmpty()) {
             sessionId = UUID.randomUUID().toString().replace("-", "");
         }
-        return agentService.streamAgentResponse(request.getQuery(), sessionId, userId);
+        return agentService.streamAgentResponse(request.getQuery(), sessionId, userId,
+                request.isRegenerate(), request.isEnableKnowledge(), request.isEnableNotes(),
+                request.getFileIds());
     }
 
     /**
