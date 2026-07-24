@@ -32,6 +32,9 @@ public class AgentTools {
     // 存储最新的 traceId，供 AgentService 读取
     private String latestTraceId;
 
+    // 结构化结果缓存：AgentLoop 执行工具后从这里读取 ToolResult
+    private final ThreadLocal<ToolResult> lastResult = new ThreadLocal<>();
+
     public AgentTools(RagService ragService, NoteService noteService, ReviewService reviewService) {
         this.ragService = ragService;
         this.noteService = noteService;
@@ -42,11 +45,22 @@ public class AgentTools {
         return latestTraceId;
     }
 
+    /** 获取最近一次工具调用的结构化结果 */
+    public ToolResult getLastResult() {
+        ToolResult r = lastResult.get();
+        lastResult.remove();
+        return r;
+    }
+
+    /** 设置结构化结果（供 AgentLoop 在异常时调用） */
+    public void setResult(ToolResult result) {
+        lastResult.set(result);
+    }
+
     @Tool("从用户上传的知识库文档中检索相关内容并生成摘要。触发场景：用户提到'知识库'、'文档'、'资料'、'上传的文件'、'根据文档'等关键词时必须调用此工具")
     public String ragSummary(@P("用户的查询问题，用于检索知识库") String query, @ToolMemoryId String userId) {
         try {
             Map<String, Object> result = ragService.getDocumentsAndSummary(userId, query);
-            // 捕获 traceId
             this.latestTraceId = ragService.getLatestTraceId();
             StringBuilder sb = new StringBuilder();
             @SuppressWarnings("unchecked")
@@ -61,8 +75,11 @@ public class AgentTools {
                 }
             }
             sb.append("\n摘要：\n").append(result.get("summary"));
-            return sb.toString();
+            String display = sb.toString();
+            setResult(ToolResult.success(display));
+            return display;
         } catch (Exception e) {
+            setResult(ToolResult.error("RAG检索失败: " + e.getMessage(), "RAG_ERROR", true));
             return "RAG检索失败: " + e.getMessage();
         }
     }
@@ -72,20 +89,86 @@ public class AgentTools {
         return LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
     }
 
-    @Tool("搜索用户自己的笔记。触发场景：用户提到'笔记'、'搜索'、'查找'、'找找'、'我的笔记'、'记录'等关键词时必须调用此工具。例如：'帮我找一下线程池相关的笔记'、'我之前记过什么'、'搜索笔记'")
-    public String searchNotes(@P("搜索关键词，从用户问题中提取核心词") String query, @ToolMemoryId String userId) {
+    @Tool("列出用户的笔记目录，返回笔记标题、ID和内容摘要，适合浏览总览。触发场景：用户说'我有哪些笔记'、'看看我的笔记'、'笔记列表'、'你能看到我的笔记吗'、'最近写了什么'、'笔记都有啥'、'我的笔记'、'我的笔记里写了什么'时调用此工具。注意：如果用户想看特定主题的笔记，用 searchNotes；如果用户想看具体某篇笔记的完整内容，先用 searchNotes 或 listNotes 获取 noteId 再用 getNote。getNote 因 NOTE_NOT_FOUND 失败时，也可用 listNotes 浏览全部笔记来定位")
+    public String listNotes(
+            @P("获取几条，默认20") String count,
+            @P("按分类筛选，不筛选传空字符串") String category,
+            @ToolMemoryId String userId) {
+        try {
+            int n = 20;
+            try { n = Integer.parseInt(count); } catch (Exception ignored) {}
+            var result = noteService.listNotes(userId, 1, n,
+                    (category != null && !category.isEmpty()) ? category : null, null);
+            if (result.notes().isEmpty()) {
+                setResult(ToolResult.empty("暂无笔记。"));
+                return "暂无笔记。";
+            }
+            StringBuilder sb = new StringBuilder("你的笔记列表（共 " + result.totalCount() + " 篇）：\n\n");
+            for (int i = 0; i < result.notes().size(); i++) {
+                var note = result.notes().get(i);
+                sb.append(i + 1).append(". ").append(note.title())
+                        .append(" [ID: ").append(note.id()).append("]");
+                if (note.category() != null) sb.append(" [").append(note.category()).append("]");
+                if (note.tags() != null) sb.append(" ").append(note.tags());
+                sb.append("\n");
+                String content = note.content();
+                if (content != null && !content.isEmpty()) {
+                    String preview = content.length() > 200 ? content.substring(0, 200) + "..." : content;
+                    preview = preview.replaceAll("\\n+", " ").replaceAll("\\s+", " ").trim();
+                    sb.append("   摘要：").append(preview).append("\n");
+                }
+                sb.append("\n");
+            }
+            if (result.totalCount() > n) {
+                sb.append("...还有 ").append(result.totalCount() - n).append(" 篇未显示");
+            }
+            String display = sb.toString();
+            setResult(ToolResult.success(display));
+            return display;
+        } catch (Exception e) {
+            setResult(ToolResult.error("获取笔记列表失败: " + e.getMessage(), "LIST_ERROR", true));
+            return "获取笔记列表失败: " + e.getMessage();
+        }
+    }
+
+    @Tool("读取一篇笔记的完整内容。前置条件：必须已知有效的 noteId（从 listNotes 或 searchNotes 返回结果中提取）。触发场景：用户说'看看xxx笔记'、'打开xxx'、'xxx写了什么'、'读一下xxx'、'给我看看xxx'、'这篇笔记'时调用此工具。注意：标题不是 noteId，搜索关键词不是 noteId，绝不能自己编造 ID。如果不知道有效 noteId，应先用 searchNotes 或 listNotes 定位笔记。常见失败 NOTE_NOT_FOUND 说明提供的 noteId 无效，应重新定位笔记而不是重复相同调用")
+    public String getNote(
+            @P("笔记ID（必须是 listNotes 或 searchNotes 返回结果中提取的有效 ID，不能自己编造）") String noteId,
+            @ToolMemoryId String userId) {
+        try {
+            var note = noteService.getNote(userId, noteId);
+            StringBuilder sb = new StringBuilder();
+            sb.append("# ").append(note.title()).append("\n\n");
+            if (note.category() != null) sb.append("分类：").append(note.category()).append("\n");
+            if (note.tags() != null) sb.append("标签：").append(note.tags()).append("\n");
+            sb.append("创建：").append(note.createdAt()).append("  更新：").append(note.updatedAt()).append("\n");
+            sb.append("---\n\n");
+            sb.append(note.content() != null ? note.content() : "(空笔记)");
+            sb.append("\n\n[重要] 以上是笔记的完整Markdown内容，展示给用户时请保留原始格式（标题、列表、代码块等），不要转换为纯文本。");
+            String display = sb.toString();
+            setResult(ToolResult.success(display));
+            return display;
+        } catch (Exception e) {
+            setResult(ToolResult.error("读取笔记失败: " + e.getMessage(), "NOTE_NOT_FOUND", true));
+            return "读取笔记失败: " + e.getMessage();
+        }
+    }
+
+    @Tool("按关键词搜索笔记内容，返回匹配笔记的标题、ID 和内容摘要。前置条件：需要有明确的搜索关键词。触发场景：用户说'找一下xxx笔记'、'搜索xxx'、'有没有关于xxx的笔记'、'我之前记过xxx吗'、'查找xxx'时调用此工具。适用场景：用户想看特定主题的笔记但不知道 noteId 时，或 getNote 因 NOTE_NOT_FOUND 失败后需要重新定位笔记时。注意：如果用户只是想看'有哪些笔记'、'笔记列表'，应该用 listNotes 而不是 searchNotes。常见失败 EMPTY（搜索无结果）说明关键词可能太窄或太具体，应该换更通用/简短的关键词重试")
+    public String searchNotes(@P("搜索关键词，从用户问题中提取核心词（建议先用简短通用词，无结果再精确）") String query, @ToolMemoryId String userId) {
         try {
             var result = noteService.searchNotes(userId, query);
             if (result.notes().isEmpty()) {
+                setResult(ToolResult.empty("未找到相关笔记。"));
                 return "未找到相关笔记。";
             }
             StringBuilder sb = new StringBuilder("找到以下相关笔记：\n");
             for (int i = 0; i < Math.min(5, result.notes().size()); i++) {
                 var note = result.notes().get(i);
-                sb.append(i + 1).append(". ").append(note.title());
+                sb.append(i + 1).append(". ").append(note.title())
+                        .append(" [ID: ").append(note.id()).append("]");
                 if (note.category() != null) sb.append(" [").append(note.category()).append("]");
                 if (note.tags() != null) sb.append(" 标签:").append(note.tags());
-                // 内容预览（最多 300 字）
                 String content = note.content();
                 if (content != null && !content.isEmpty()) {
                     String preview = content.length() > 300 ? content.substring(0, 300) + "..." : content;
@@ -93,8 +176,11 @@ public class AgentTools {
                 }
                 sb.append("\n");
             }
-            return sb.toString();
+            String display = sb.toString();
+            setResult(ToolResult.success(display));
+            return display;
         } catch (Exception e) {
+            setResult(ToolResult.error("搜索笔记失败: " + e.getMessage(), "SEARCH_ERROR", true));
             return "搜索笔记失败: " + e.getMessage();
         }
     }

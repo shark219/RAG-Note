@@ -47,6 +47,7 @@ public class AgentService {
     private final WriterService writerService;
     private final TokenCounter tokenCounter;
     private final AgentLoop agentLoop;
+    private final ResponseComposer responseComposer;
     private final List<ToolSpecification> toolSpecifications;
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
@@ -58,7 +59,8 @@ public class AgentService {
                         SupervisorService supervisorService,
                         WriterService writerService,
                         TokenCounter tokenCounter,
-                        AgentLoop agentLoop) {
+                        AgentLoop agentLoop,
+                        ResponseComposer responseComposer) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
         this.chatService = chatService;
@@ -71,6 +73,7 @@ public class AgentService {
         this.writerService = writerService;
         this.tokenCounter = tokenCounter;
         this.agentLoop = agentLoop;
+        this.responseComposer = responseComposer;
         // 从 @Tool 注解自动提取工具定义
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
@@ -79,9 +82,9 @@ public class AgentService {
     private static final Set<String> KNOWLEDGE_TOOLS = Set.of("ragSummary");
     // 笔记相关工具名
     private static final Set<String> NOTE_TOOLS = Set.of(
-            "searchNotes", "getRecentNotes", "getNoteStats", "getTodayReviews",
-            "markReviewed", "createNote", "editNote", "appendNote", "deleteNote",
-            "getRelatedNotes", "mergeNotes", "scheduleReview");
+            "listNotes", "getNote", "searchNotes", "getRecentNotes", "getNoteStats",
+            "getTodayReviews", "markReviewed", "createNote", "editNote", "appendNote",
+            "deleteNote", "getRelatedNotes", "mergeNotes", "scheduleReview");
     // 通用工具名（不受开关控制）
     private static final Set<String> UTILITY_TOOLS = Set.of(
             "whatTimeIsNow", "fetchUrl", "generateDiagram");
@@ -154,11 +157,34 @@ public class AgentService {
                     if (!subTasks.isEmpty() && subTasks.get(0).getToolHint() != null) {
                         forceToolHint = subTasks.get(0).getToolHint();
                         forceToolDesc = subTasks.get(0).getDescription();
-                        systemPrompt += "\n\n[重要] 上级建议调用 " + forceToolHint + " 工具，描述：" + forceToolDesc;
-                        log.info("注入 Supervisor 工具提示: tool={}, desc={}", forceToolHint, forceToolDesc);
+                        boolean mustUse = subTasks.get(0).isMustUseTool();
+
+                        if (mustUse) {
+                            systemPrompt += "\n\n[必须执行] 任务要求调用 " + forceToolHint + " 工具（关键词：" + forceToolDesc + "）。"
+                                    + "你必须先调用此工具获取数据，不允许跳过直接回答。"
+                                    + "如果用户问的是笔记，用 searchNotes 而不是 ragSummary。";
+                        } else {
+                            systemPrompt += "\n\n[参考] 上级建议的工具：" + forceToolHint + "（关键词：" + forceToolDesc + "）。"
+                                    + "你必须根据用户实际意图选择正确的工具。"
+                                    + "如果用户问的是笔记，用 searchNotes 而不是 ragSummary。";
+                        }
+                        log.info("注入 Supervisor 工具提示: tool={}, desc={}, mustUse={}", forceToolHint, forceToolDesc, mustUse);
                     }
 
-                    response = agentLoop.run(systemPrompt, queryWithContext, historyMessages, userId, activeTools, emitter, forceToolHint, forceToolDesc);
+                    AgentLoopResult loopResult = agentLoop.run(systemPrompt, queryWithContext,
+                            historyMessages, userId, activeTools, emitter, forceToolHint, forceToolDesc);
+
+                    sendSseEvent(emitter, "thinking", Map.of(
+                            "stage", "composing",
+                            "content", "正在组织回答"
+                    ));
+
+                    // 从 AgentState 提取干净证据，交给 Composer 生成自然回答
+                    EvidencePack evidencePack = EvidencePack.from(loopResult.state());
+                    response = responseComposer.compose(evidencePack, loopResult.outcome());
+
+                    log.info("Composer 完成: outcome={}, 证据笔记 {} 篇, 回答 {} 字",
+                            loopResult.outcome(), evidencePack.notes().size(), response.length());
                 } else {
                     // 复杂查询：走多 Agent 流水线
                     response = executePipeline(subTasks, query, userId, emitter);
@@ -320,7 +346,9 @@ public class AgentService {
         String systemPrompt = "你是一个笔记助手，正在执行一个子任务。\n\n"
                 + "任务描述：" + task.getDescription() + "\n"
                 + "\n可用工具说明："
-                + "\n- searchNotes(query): 搜索用户的笔记，传入搜索关键词"
+                + "\n- listNotes(count, category): 列出笔记目录，获取笔记标题和ID"
+                + "\n- getNote(noteId): 读取一篇笔记的完整内容"
+                + "\n- searchNotes(query): 按关键词搜索笔记内容"
                 + "\n- getRecentNotes(count): 获取最近编辑的笔记"
                 + "\n- ragSummary(query): 从知识库检索文档，传入查询内容"
                 + "\n- getNoteStats(): 获取笔记统计（无需参数）"
@@ -487,6 +515,13 @@ public class AgentService {
         try {
             Map<String, String> args = parseToolArguments(arguments);
             return switch (toolName) {
+                case "listNotes" -> agentTools.listNotes(
+                        args.getOrDefault("count", "20"),
+                        args.getOrDefault("category", ""),
+                        userId);
+                case "getNote" -> agentTools.getNote(
+                        args.getOrDefault("noteId", ""),
+                        userId);
                 case "ragSummary" -> agentTools.ragSummary(args.getOrDefault("query", ""), userId);
                 case "searchNotes" -> agentTools.searchNotes(args.getOrDefault("query", ""), userId);
                 case "getNoteStats" -> agentTools.getNoteStats(userId);

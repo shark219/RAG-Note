@@ -28,4 +28,11 @@ public interface NoteRepository extends JpaRepository<Note, String> {
 
     @Query("SELECT n FROM Note n WHERE n.userId = :userId AND (n.title LIKE %:keyword% OR n.content LIKE %:keyword%) ORDER BY n.updatedAt DESC")
     List<Note> searchByKeyword(@Param("userId") String userId, @Param("keyword") String keyword);
+
+    @Query("SELECT DISTINCT n FROM Note n WHERE n.userId = :userId AND (" +
+            "n.title LIKE %:k1% OR n.content LIKE %:k1% OR " +
+            "n.title LIKE %:k2% OR n.content LIKE %:k2%) ORDER BY n.updatedAt DESC")
+    List<Note> searchByTwoKeywords(@Param("userId") String userId,
+                                    @Param("k1") String k1,
+                                    @Param("k2") String k2);
 }

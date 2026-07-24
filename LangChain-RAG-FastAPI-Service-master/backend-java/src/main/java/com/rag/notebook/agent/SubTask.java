@@ -23,4 +23,10 @@ public class SubTask {
 
     /** 建议使用的工具（可选，如 "ragSummary", "searchNotes"） */
     private String toolHint;
+
+    /** 是否强制要求调用工具（true = 不允许跳过） */
+    private boolean mustUseTool;
+
+    /** 所需的最低证据级别（可选，如 "CONTENT_EVIDENCE"）。为空时由 CompletionGate 自动推断 */
+    private String requiredEvidenceLevel;
 }

@@ -90,6 +90,7 @@ public class SupervisorService {
                 task.setLabel(node.has("label") ? node.get("label").asText() : "子任务" + (i + 1));
                 task.setDescription(node.has("description") ? node.get("description").asText() : "");
                 task.setToolHint(node.has("tool") ? node.get("tool").asText() : null);
+                task.setMustUseTool(node.has("mustUseTool") && node.get("mustUseTool").asBoolean());
                 subTasks.add(task);
             }
 

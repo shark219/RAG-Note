@@ -5,9 +5,15 @@
 判断规则：
 1. 简单查询（单一意图）→ 返回空数组 []
    - 搜索/查找笔记
+   - 读取某篇笔记内容（如"看看xxx"、"xxx写了什么"）
    - 创建/编辑笔记
    - 查看统计/复习计划
    - 简单知识问题
+
+**重要区分：**
+- "笔记"是用户自己写的 → 用 searchNotes，不是 ragSummary
+- "知识库"是用户上传的文档 → 用 ragSummary
+- 如果用户提到"笔记"、"写了什么"、"记录"，一定是 searchNotes，绝对不是 ragSummary
 
 2. 复杂查询（复合意图）→ 拆分为 2-4 个子任务
    - 同时涉及多个不同类型的操作（如"搜索笔记 + 总结知识库"）
@@ -32,11 +38,16 @@
 - mergeNotes: 合并多篇笔记，description 是合并要求。触发：合并、整合笔记
 
 输出格式（严格JSON数组）：
-[{"label":"标签","description":"具体的搜索查询词或操作描述","tool":"工具名"}]
+[{"label":"标签","description":"具体的搜索查询词或操作描述","tool":"工具名","mustUseTool":true}]
+
+mustUseTool 说明：
+- true = Agent 必须调用此工具，不允许跳过直接回答
+- 涉及笔记、知识库、文档查询时，mustUseTool 必须为 true
+- 简单闲聊、通用知识问题时返回空数组 []，不需要 mustUseTool
 
 示例：
 查询："帮我整理 AI 学习笔记并总结知识库里的内容"
-→ [{"label":"搜索AI笔记","description":"AI 机器学习 深度学习","tool":"searchNotes"},{"label":"检索知识库","description":"人工智能 机器学习 基本概念","tool":"ragSummary"}]
+→ [{"label":"搜索AI笔记","description":"AI 机器学习 深度学习","tool":"searchNotes","mustUseTool":true},{"label":"检索知识库","description":"人工智能 机器学习 基本概念","tool":"ragSummary","mustUseTool":true}]
 
 查询："帮我创建一篇关于 RAG 的笔记"
 → []
@@ -45,10 +56,19 @@
 → []
 
 查询："帮我整理笔记然后创建一份总结"
-→ [{"label":"搜索笔记","description":"机器学习 笔记","tool":"searchNotes"},{"label":"检索知识库","description":"机器学习 总结","tool":"ragSummary"}]
+→ [{"label":"搜索笔记","description":"机器学习 笔记","tool":"searchNotes","mustUseTool":true},{"label":"检索知识库","description":"机器学习 总结","tool":"ragSummary","mustUseTool":true}]
 
 查询："搜索笔记"
 → []
 
+查询："长江三峡写了什么"
+→ [{"label":"搜索三峡笔记","description":"长江三峡","tool":"searchNotes","mustUseTool":true}]
+
+查询："看看我的笔记"
+→ [{"label":"列出笔记","description":"","tool":"listNotes","mustUseTool":true}]
+
 查询："今天有什么要复习的？"
+→ [{"label":"查看复习列表","description":"","tool":"getTodayReviews","mustUseTool":true}]
+
+查询："什么是JVM垃圾回收"
 → []

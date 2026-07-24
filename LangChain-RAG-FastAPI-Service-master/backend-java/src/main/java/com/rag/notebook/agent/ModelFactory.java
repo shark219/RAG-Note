@@ -44,6 +44,13 @@ public class ModelFactory {
      * @param temperature 温度值：0.0-1.0，越低越精确，越高越有创意
      */
     public ChatLanguageModel createChatModel(double temperature) {
+        return createChatModel(temperature, Duration.ofSeconds(180));
+    }
+
+    /**
+     * 使用指定温度和超时创建聊天模型
+     */
+    public ChatLanguageModel createChatModel(double temperature, Duration timeout) {
         String type = props.getLlm().getType();
         if ("ZHIPU".equalsIgnoreCase(type)) {
             return OpenAiChatModel.builder()
@@ -51,12 +58,14 @@ public class ModelFactory {
                     .baseUrl(props.getLlm().getZhipu().getBaseUrl())
                     .modelName(props.getLlm().getZhipu().getModel())
                     .temperature(temperature)
+                    .timeout(timeout)
                     .build();
         } else if ("OLLAMA".equalsIgnoreCase(type)) {
             return OllamaChatModel.builder()
                     .baseUrl(props.getLlm().getOllama().getBaseUrl())
                     .modelName(props.getLlm().getOllama().getModel())
                     .temperature(temperature)
+                    .timeout(timeout)
                     .build();
         } else {
             return QwenChatModel.builder()

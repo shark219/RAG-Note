@@ -280,8 +280,15 @@ public class NoteService {
     }
 
     public NoteListResponse searchNotes(String userId, String query) {
-        // 使用 SQL LIKE 搜索标题和内容（支持中文，简单可靠）
-        List<Note> matched = noteRepository.searchByKeyword(userId, query);
+        // 按空格拆分关键词，任意一个词匹配即可（OR 逻辑）
+        // 例如 "长江三峡 笔记" → 匹配包含"长江三峡"或"笔记"的笔记
+        String[] keywords = query.trim().split("\\s+");
+        List<Note> matched;
+        if (keywords.length >= 2) {
+            matched = noteRepository.searchByTwoKeywords(userId, keywords[0], keywords[1]);
+        } else {
+            matched = noteRepository.searchByKeyword(userId, query.trim());
+        }
         List<NoteResponse> notes = matched.stream()
                 .map(this::toResponse)
                 .collect(Collectors.toList());
