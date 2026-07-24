@@ -425,6 +425,32 @@ public class AgentTools {
                 "请直接输出Mermaid代码，用 ```mermaid 代码块包裹。";
     }
 
+    @Tool("根据指定笔记内容生成思维导图（Markdown格式）。前置条件：需要有效的 noteId。触发场景：用户说'生成思维导图'、'画个脑图'、'整理成思维导图'、'帮我梳理xxx笔记的结构'时调用此工具。如果用户说\"笔记里\"、\"这篇笔记\"但没有提供 noteId，先用 searchNotes 或从上下文获取 noteId")
+    public String generateMindMap(
+            @P("笔记ID，通过 searchNotes 获取或从对话上下文中获取") String noteId,
+            @ToolMemoryId String userId) {
+        try {
+            var note = noteService.getNote(userId, noteId);
+            String title = note.title();
+            String content = note.content() != null ? note.content() : "";
+
+            String display = "笔记《" + title + "》的完整内容：\n\n"
+                    + content + "\n\n"
+                    + "---\n"
+                    + "请基于以上内容，生成一份 Markdown 格式的思维导图。要求：\n"
+                    + "1. 用 # ## ### 表示层级结构\n"
+                    + "2. 用 - 列表表示分支\n"
+                    + "3. 提取核心概念作为节点\n"
+                    + "4. 结构清晰、层次分明\n"
+                    + "5. 不要编造笔记中不存在的内容";
+            setResult(ToolResult.success(display));
+            return display;
+        } catch (Exception e) {
+            setResult(ToolResult.error("生成思维导图失败: " + e.getMessage(), "NOTE_NOT_FOUND", true));
+            return "生成思维导图失败: " + e.getMessage();
+        }
+    }
+
     @Tool("安排笔记的复习时间。触发场景：用户说'安排复习'、'设置复习时间'、'提醒我复习xxx'时调用此工具，需要先用 searchNotes 获取笔记ID")
     public String scheduleReview(
             @P("笔记ID，通过 searchNotes 获取") String noteId,

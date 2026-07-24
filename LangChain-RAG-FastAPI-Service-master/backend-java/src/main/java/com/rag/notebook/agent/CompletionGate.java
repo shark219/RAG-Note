@@ -58,6 +58,7 @@ public class CompletionGate {
         AgentState.TaskIntent intent = state.inferIntent();
         if (intent != AgentState.TaskIntent.WRITE_NOTE
                 && intent != AgentState.TaskIntent.REVIEW
+                && intent != AgentState.TaskIntent.GENERATE_ARTIFACT
                 && (involvesNote(state.getTaskGoal()) || involvesNote(state.getOriginalQuery()))) {
             EvidenceLevel required = inferRequiredEvidence(state);
             if (!state.hasEvidence(required)) {

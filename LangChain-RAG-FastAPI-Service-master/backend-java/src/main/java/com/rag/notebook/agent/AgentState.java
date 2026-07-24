@@ -348,6 +348,7 @@ public class AgentState {
         KNOWLEDGE_QA,
         STATS,
         REVIEW,
+        GENERATE_ARTIFACT,
         GENERAL
     }
 
@@ -359,6 +360,10 @@ public class AgentState {
             "getTodayReviews", "markReviewed", "scheduleReview"
     );
 
+    private static final java.util.Set<String> ARTIFACT_TOOLS = java.util.Set.of(
+            "generateMindMap", "generateDiagram"
+    );
+
     /**
      * 推断当前任务的意图类型。
      * 优先级：requiredTool（Supervisor显式指定） > toolHistory（实际发生的操作） > 默认GENERAL
@@ -367,6 +372,7 @@ public class AgentState {
         if (requiredTool != null && !requiredTool.isBlank()) {
             if (WRITE_TOOLS.contains(requiredTool)) return TaskIntent.WRITE_NOTE;
             if (REVIEW_TOOLS.contains(requiredTool)) return TaskIntent.REVIEW;
+            if (ARTIFACT_TOOLS.contains(requiredTool)) return TaskIntent.GENERATE_ARTIFACT;
             if ("getNote".equals(requiredTool)) return TaskIntent.READ_NOTE;
             if ("searchNotes".equals(requiredTool) || "getRelatedNotes".equals(requiredTool)) return TaskIntent.SEARCH_NOTE;
             if ("listNotes".equals(requiredTool) || "getRecentNotes".equals(requiredTool)) return TaskIntent.LIST_NOTES;
@@ -378,6 +384,7 @@ public class AgentState {
             if (r.quality() == ResultQuality.GOOD) {
                 if (WRITE_TOOLS.contains(r.toolName())) return TaskIntent.WRITE_NOTE;
                 if (REVIEW_TOOLS.contains(r.toolName())) return TaskIntent.REVIEW;
+                if (ARTIFACT_TOOLS.contains(r.toolName())) return TaskIntent.GENERATE_ARTIFACT;
             }
         }
 

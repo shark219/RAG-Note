@@ -45,13 +45,16 @@ public class AgentLoop {
     private final ToolResultEvaluator evaluator;
     private final ModelFactory modelFactory;
     private final CompletionGate completionGate;
+    private final ConversationContextManager contextManager;
 
     public AgentLoop(AgentTools agentTools, ToolResultEvaluator evaluator,
-                     ModelFactory modelFactory, CompletionGate completionGate) {
+                     ModelFactory modelFactory, CompletionGate completionGate,
+                     ConversationContextManager contextManager) {
         this.agentTools = agentTools;
         this.evaluator = evaluator;
         this.modelFactory = modelFactory;
         this.completionGate = completionGate;
+        this.contextManager = contextManager;
     }
 
     /**
@@ -62,7 +65,8 @@ public class AgentLoop {
      */
     public AgentLoopResult run(String systemPrompt, String userQuery,
                       List<ChatMessage> historyMessages,
-                      String userId, List<ToolSpecification> activeTools,
+                      String userId, String sessionId,
+                      List<ToolSpecification> activeTools,
                       SseEmitter emitter,
                       String forceToolHint, String forceToolDesc) throws IOException {
 
@@ -157,6 +161,8 @@ public class AgentLoop {
                             state.markWriteConfirmation(toolName + " 执行成功");
                             log.info("写操作确认: {} 已成功执行", toolName);
                         }
+                        // 更新会话上下文（当前活跃笔记追踪）
+                        updateSessionContext(sessionId, toolName, toolArgs, rawResult);
                     } else if (eval.quality() == ResultQuality.POOR) {
                         // POOR：工具执行成功但证据不足 → 算"已执行"但不升级证据
                         anyProgress = true;  // 对 Rule 1 来说，工具已成功调用
@@ -481,6 +487,19 @@ public class AgentLoop {
     // ============================================================
 
     /**
+     * 更新会话上下文（当前活跃笔记追踪）
+     */
+    private void updateSessionContext(String sessionId, String toolName, String toolArgs, String rawResult) {
+        if (sessionId == null) return;
+        try {
+            ConversationContext ctx = contextManager.getOrCreate(sessionId);
+            ctx.updateFromToolCall(toolName, toolArgs, rawResult);
+        } catch (Exception e) {
+            log.debug("更新会话上下文失败: {}", e.getMessage());
+        }
+    }
+
+    /**
      * 判断是否为写操作工具
      */
     private boolean isWriteTool(String toolName) {
@@ -668,6 +687,8 @@ public class AgentLoop {
                         args.getOrDefault("noteId", ""),
                         args.getOrDefault("days", "1"),
                         userId);
+                case "generateMindMap" -> agentTools.generateMindMap(
+                        args.getOrDefault("noteId", ""), userId);
                 case "whatTimeIsNow" -> agentTools.whatTimeIsNow();
                 default -> "未知工具: " + toolName;
             };

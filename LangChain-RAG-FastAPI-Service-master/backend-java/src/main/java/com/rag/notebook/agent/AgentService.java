@@ -48,6 +48,7 @@ public class AgentService {
     private final TokenCounter tokenCounter;
     private final AgentLoop agentLoop;
     private final ResponseComposer responseComposer;
+    private final ConversationContextManager convCtxManager;
     private final List<ToolSpecification> toolSpecifications;
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
@@ -60,7 +61,8 @@ public class AgentService {
                         WriterService writerService,
                         TokenCounter tokenCounter,
                         AgentLoop agentLoop,
-                        ResponseComposer responseComposer) {
+                        ResponseComposer responseComposer,
+                        ConversationContextManager ctxManager) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
         this.chatService = chatService;
@@ -74,6 +76,7 @@ public class AgentService {
         this.tokenCounter = tokenCounter;
         this.agentLoop = agentLoop;
         this.responseComposer = responseComposer;
+        this.convCtxManager = ctxManager;
         // 从 @Tool 注解自动提取工具定义
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
@@ -171,8 +174,12 @@ public class AgentService {
                         log.info("注入 Supervisor 工具提示: tool={}, desc={}, mustUse={}", forceToolHint, forceToolDesc, mustUse);
                     }
 
-                    AgentLoopResult loopResult = agentLoop.run(systemPrompt, queryWithContext,
-                            historyMessages, userId, activeTools, emitter, forceToolHint, forceToolDesc);
+                    // 上下文解析：将"这篇笔记"、"给它xxx"等代词引用解析为实际 noteId
+                    String resolvedQuery = convCtxManager.resolveReferences(queryWithContext, sessionId);
+
+                    AgentLoopResult loopResult = agentLoop.run(systemPrompt, resolvedQuery,
+                            historyMessages, userId, sessionId, activeTools, emitter,
+                            forceToolHint, forceToolDesc);
 
                     sendSseEvent(emitter, "thinking", Map.of(
                             "stage", "composing",
@@ -554,6 +561,8 @@ public class AgentService {
                         args.getOrDefault("noteId", ""),
                         args.getOrDefault("days", "1"),
                         userId);
+                case "generateMindMap" -> agentTools.generateMindMap(
+                        args.getOrDefault("noteId", ""), userId);
                 case "whatTimeIsNow" -> agentTools.whatTimeIsNow();
                 default -> "未知工具: " + toolName;
             };
