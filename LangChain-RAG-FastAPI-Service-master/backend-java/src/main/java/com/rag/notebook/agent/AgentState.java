@@ -323,71 +323,43 @@ public class AgentState {
     }
 
     /**
-     * 证据级别（内容深度维度）
+     * 证据级别（信息深度维度）
      *
      * 区分工具结果的信息量，让 CompletionGate 根据任务需求做判断：
      * - "我有哪些笔记？" → LIST 就够
      * - "找一下线程池笔记" → SEARCH 就够
      * - "长江三峡那篇写了什么？" → 必须 CONTENT
+     * - "生成思维导图" → ARTIFACT（生成类任务，不需要检索证据）
      */
     public enum EvidenceLevel {
         NONE,             // 无任何证据
         LIST_EVIDENCE,    // 仅有标题和摘要（listNotes）
         SEARCH_EVIDENCE,  // 有匹配内容和预览（searchNotes）
-        CONTENT_EVIDENCE  // 有完整笔记正文（getNote）
+        CONTENT_EVIDENCE, // 有完整笔记正文（getNote）
+        ARTIFACT_EVIDENCE // 已生成产物（generateMindMap, generateDiagram）
     }
 
     /**
-     * 任务意图分类，用于 CompletionGate 区分读写语义。
+     * 根据 Supervisor 指定的工具，推断完成目标所需的最低证据级别。
+     *
+     * 设计原则：不是"这是什么任务类型"，而是"这个工具会产生什么级别的证据"。
+     * 避免任务类型爆炸（READ/WRITE/GENERATE/ANALYZE...），
+     * 改为：工具 → 预期证据级别。
+     *
+     * @return 所需最低证据级别，null 表示不需要证据检查（写操作、统计等）
      */
-    public enum TaskIntent {
-        WRITE_NOTE,
-        READ_NOTE,
-        SEARCH_NOTE,
-        LIST_NOTES,
-        KNOWLEDGE_QA,
-        STATS,
-        REVIEW,
-        GENERATE_ARTIFACT,
-        GENERAL
-    }
+    public EvidenceLevel expectedEvidenceLevel() {
+        if (requiredTool == null || requiredTool.isBlank()) return null;
 
-    private static final java.util.Set<String> WRITE_TOOLS = java.util.Set.of(
-            "createNote", "editNote", "appendNote", "deleteNote", "mergeNotes"
-    );
-
-    private static final java.util.Set<String> REVIEW_TOOLS = java.util.Set.of(
-            "getTodayReviews", "markReviewed", "scheduleReview"
-    );
-
-    private static final java.util.Set<String> ARTIFACT_TOOLS = java.util.Set.of(
-            "generateMindMap", "generateDiagram"
-    );
-
-    /**
-     * 推断当前任务的意图类型。
-     * 优先级：requiredTool（Supervisor显式指定） > toolHistory（实际发生的操作） > 默认GENERAL
-     */
-    public TaskIntent inferIntent() {
-        if (requiredTool != null && !requiredTool.isBlank()) {
-            if (WRITE_TOOLS.contains(requiredTool)) return TaskIntent.WRITE_NOTE;
-            if (REVIEW_TOOLS.contains(requiredTool)) return TaskIntent.REVIEW;
-            if (ARTIFACT_TOOLS.contains(requiredTool)) return TaskIntent.GENERATE_ARTIFACT;
-            if ("getNote".equals(requiredTool)) return TaskIntent.READ_NOTE;
-            if ("searchNotes".equals(requiredTool) || "getRelatedNotes".equals(requiredTool)) return TaskIntent.SEARCH_NOTE;
-            if ("listNotes".equals(requiredTool) || "getRecentNotes".equals(requiredTool)) return TaskIntent.LIST_NOTES;
-            if ("ragSummary".equals(requiredTool)) return TaskIntent.KNOWLEDGE_QA;
-            if ("getNoteStats".equals(requiredTool)) return TaskIntent.STATS;
-        }
-
-        for (ToolCallRecord r : toolHistory) {
-            if (r.quality() == ResultQuality.GOOD) {
-                if (WRITE_TOOLS.contains(r.toolName())) return TaskIntent.WRITE_NOTE;
-                if (REVIEW_TOOLS.contains(r.toolName())) return TaskIntent.REVIEW;
-                if (ARTIFACT_TOOLS.contains(r.toolName())) return TaskIntent.GENERATE_ARTIFACT;
-            }
-        }
-
-        return TaskIntent.GENERAL;
+        return switch (requiredTool) {
+            case "generateMindMap", "generateDiagram" -> EvidenceLevel.ARTIFACT_EVIDENCE;
+            case "getNote" -> EvidenceLevel.CONTENT_EVIDENCE;
+            case "searchNotes", "ragSummary", "getRelatedNotes" -> EvidenceLevel.SEARCH_EVIDENCE;
+            case "listNotes", "getRecentNotes" -> EvidenceLevel.LIST_EVIDENCE;
+            // 写操作、统计、复习：不需要检索证据，由 writeConfirmation 或工具成功直接判断
+            case "createNote", "editNote", "appendNote", "deleteNote", "mergeNotes",
+                 "getNoteStats", "getTodayReviews", "markReviewed", "scheduleReview" -> null;
+            default -> null;
+        };
     }
 }

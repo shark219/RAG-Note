@@ -434,15 +434,15 @@ public class AgentTools {
             String title = note.title();
             String content = note.content() != null ? note.content() : "";
 
-            String display = "笔记《" + title + "》的完整内容：\n\n"
+            String display = "已获取笔记《" + title + "》的完整内容：\n\n"
                     + content + "\n\n"
                     + "---\n"
-                    + "请基于以上内容，生成一份 Markdown 格式的思维导图。要求：\n"
-                    + "1. 用 # ## ### 表示层级结构\n"
+                    + "任务：将以上笔记内容整理为 Markdown 格式的思维导图，直接输出给用户。\n"
+                    + "1. 用 # ## ### 表示层级\n"
                     + "2. 用 - 列表表示分支\n"
                     + "3. 提取核心概念作为节点\n"
-                    + "4. 结构清晰、层次分明\n"
-                    + "5. 不要编造笔记中不存在的内容";
+                    + "4. 不要编造不存在的内容\n"
+                    + "5. 不要再次调用工具，直接输出思维导图";
             setResult(ToolResult.success(display));
             return display;
         } catch (Exception e) {

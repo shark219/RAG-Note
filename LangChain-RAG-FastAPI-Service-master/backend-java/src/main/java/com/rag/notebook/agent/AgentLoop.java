@@ -234,8 +234,9 @@ public class AgentLoop {
         switch (eval.quality()) {
             case GOOD -> {
                 sb.append("状态：成功\n");
-                // 提示 LLM 可以利用这个结果
-                if ("searchNotes".equals(toolName) || "listNotes".equals(toolName)) {
+                if ("generateMindMap".equals(toolName) || "generateDiagram".equals(toolName)) {
+                    sb.append("任务完成：产物已生成。请直接基于工具返回的内容回答用户，不要再调用此工具。\n");
+                } else if ("searchNotes".equals(toolName) || "listNotes".equals(toolName)) {
                     sb.append("提示：已获得笔记列表/搜索结果。")
                             .append("如果用户想看具体某篇笔记的内容，请用返回的 noteId 调用 getNote。\n");
                 }
@@ -514,10 +515,10 @@ public class AgentLoop {
      */
     private void upgradeEvidenceFromTool(String toolName, AgentState state) {
         switch (toolName) {
+            case "generateMindMap", "generateDiagram" -> state.upgradeEvidence(AgentState.EvidenceLevel.ARTIFACT_EVIDENCE);
             case "getNote" -> state.upgradeEvidence(AgentState.EvidenceLevel.CONTENT_EVIDENCE);
             case "searchNotes" -> state.upgradeEvidence(AgentState.EvidenceLevel.SEARCH_EVIDENCE);
             case "listNotes" -> state.upgradeEvidence(AgentState.EvidenceLevel.LIST_EVIDENCE);
-            // ragSummary 不设置笔记证据级别（它来自知识库）
         }
     }
 
@@ -526,6 +527,8 @@ public class AgentLoop {
      */
     private void extractFactsFromSuccess(String toolName, String args, String result, AgentState state) {
         switch (toolName) {
+            case "generateMindMap" -> state.addKnownFact("已成功生成思维导图，任务完成");
+            case "generateDiagram" -> state.addKnownFact("已成功生成图表，任务完成");
             case "searchNotes" -> {
                 // 提取搜索到的笔记 ID 列表
                 if (result.contains("[ID:")) {
