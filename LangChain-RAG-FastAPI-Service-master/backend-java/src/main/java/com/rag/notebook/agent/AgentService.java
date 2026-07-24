@@ -157,10 +157,15 @@ public class AgentService {
                     // 如果 Supervisor 给出了工具提示，注入到系统提示中
                     String forceToolHint = null;
                     String forceToolDesc = null;
+                    String goalDescription = null;
+                    java.util.List<String> requiredArtifacts = null;
+                    String stopCondition = null;
+
                     if (!subTasks.isEmpty() && subTasks.get(0).getToolHint() != null) {
-                        forceToolHint = subTasks.get(0).getToolHint();
-                        forceToolDesc = subTasks.get(0).getDescription();
-                        boolean mustUse = subTasks.get(0).isMustUseTool();
+                        SubTask task = subTasks.get(0);
+                        forceToolHint = task.getToolHint();
+                        forceToolDesc = task.getDescription();
+                        boolean mustUse = task.isMustUseTool();
 
                         if (mustUse) {
                             systemPrompt += "\n\n[必须执行] 任务要求调用 " + forceToolHint + " 工具（关键词：" + forceToolDesc + "）。"
@@ -171,7 +176,14 @@ public class AgentService {
                                     + "你必须根据用户实际意图选择正确的工具。"
                                     + "如果用户问的是笔记，用 searchNotes 而不是 ragSummary。";
                         }
-                        log.info("注入 Supervisor 工具提示: tool={}, desc={}, mustUse={}", forceToolHint, forceToolDesc, mustUse);
+
+                        // 提取目标追踪字段
+                        goalDescription = task.getGoal();
+                        requiredArtifacts = task.getRequiredArtifacts();
+                        stopCondition = task.getStopCondition();
+
+                        log.info("注入 Supervisor 工具提示: tool={}, desc={}, mustUse={}, goal={}, artifacts={}",
+                                forceToolHint, forceToolDesc, mustUse, goalDescription, requiredArtifacts);
                     }
 
                     // 上下文解析：将"这篇笔记"、"给它xxx"等代词引用解析为实际 noteId
@@ -179,7 +191,8 @@ public class AgentService {
 
                     AgentLoopResult loopResult = agentLoop.run(systemPrompt, resolvedQuery,
                             historyMessages, userId, sessionId, activeTools, emitter,
-                            forceToolHint, forceToolDesc);
+                            forceToolHint, forceToolDesc,
+                            goalDescription, requiredArtifacts, stopCondition);
 
                     sendSseEvent(emitter, "thinking", Map.of(
                             "stage", "composing",

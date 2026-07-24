@@ -38,7 +38,26 @@
 - mergeNotes: 合并多篇笔记，description 是合并要求。触发：合并、整合笔记
 
 输出格式（严格JSON数组）：
-[{"label":"标签","description":"具体的搜索查询词或操作描述","tool":"工具名","mustUseTool":true}]
+[{"label":"标签","description":"具体的搜索查询词或操作描述","tool":"工具名","mustUseTool":true,"goal":"目标描述","requiredArtifacts":["产物1","产物2"],"stopCondition":"停止条件描述"}]
+
+字段说明：
+- label: 简短标签，不超过10个字
+- description: 给 Agent 的具体指令
+- tool: 必须使用的工具名
+- mustUseTool: true=必须调用工具
+- goal: 【新增】任务目标的一句话描述，如"生成古诗词笔记思维导图"、"追加作者信息到笔记"。让 Agent 明确知道何时完成
+- requiredArtifacts: 【新增】完成目标需要产出的产物列表，如["mindmap"]、["note_updated"]。Agent 产出所有 artifact 后自动停止
+  - generateMindMap → ["mindmap"]
+  - generateDiagram → ["diagram"]
+  - createNote → ["note_created"]
+  - editNote/appendNote → ["note_updated"]
+  - deleteNote → ["note_deleted"]
+  - mergeNotes → ["notes_merged"]
+  - 纯检索（searchNotes/listNotes/getNote/ragSummary）→ []
+- stopCondition: 【新增】一句话描述任务完成的标志，如"思维导图已生成"、"作者信息已追加"
+
+重要：对于复合任务（如"追加作者信息+生成思维导图"），requiredArtifacts 必须包含所有产物：
+[{"label":"增强笔记","description":"...","tool":"appendNote","mustUseTool":true,"goal":"增强古诗词笔记并生成思维导图","requiredArtifacts":["note_updated","mindmap"],"stopCondition":"作者信息已追加、思维导图已生成"}]
 
 mustUseTool 说明：
 - true = Agent 必须调用此工具，不允许跳过直接回答
@@ -47,7 +66,7 @@ mustUseTool 说明：
 
 示例：
 查询："帮我整理 AI 学习笔记并总结知识库里的内容"
-→ [{"label":"搜索AI笔记","description":"AI 机器学习 深度学习","tool":"searchNotes","mustUseTool":true},{"label":"检索知识库","description":"人工智能 机器学习 基本概念","tool":"ragSummary","mustUseTool":true}]
+→ [{"label":"搜索AI笔记","description":"AI 机器学习 深度学习","tool":"searchNotes","mustUseTool":true,"goal":"整理AI学习笔记","requiredArtifacts":[],"stopCondition":"找到相关AI笔记"},{"label":"检索知识库","description":"人工智能 机器学习 基本概念","tool":"ragSummary","mustUseTool":true,"goal":"检索知识库内容","requiredArtifacts":[],"stopCondition":"获取知识库摘要"}]
 
 查询："帮我创建一篇关于 RAG 的笔记"
 → []
@@ -56,19 +75,22 @@ mustUseTool 说明：
 → []
 
 查询："帮我整理笔记然后创建一份总结"
-→ [{"label":"搜索笔记","description":"机器学习 笔记","tool":"searchNotes","mustUseTool":true},{"label":"检索知识库","description":"机器学习 总结","tool":"ragSummary","mustUseTool":true}]
+→ [{"label":"搜索笔记","description":"机器学习 笔记","tool":"searchNotes","mustUseTool":true,"goal":"整理机器学习笔记","requiredArtifacts":[],"stopCondition":"找到相关笔记"},{"label":"检索知识库","description":"机器学习 总结","tool":"ragSummary","mustUseTool":true,"goal":"检索知识库","requiredArtifacts":[],"stopCondition":"获取知识库内容"}]
 
 查询："搜索笔记"
 → []
 
 查询："长江三峡写了什么"
-→ [{"label":"搜索三峡笔记","description":"长江三峡","tool":"searchNotes","mustUseTool":true}]
+→ [{"label":"搜索三峡笔记","description":"长江三峡","tool":"searchNotes","mustUseTool":true,"goal":"读取长江三峡笔记内容","requiredArtifacts":["search_results"],"stopCondition":"获取到长江三峡笔记ID"}]
 
 查询："看看我的笔记"
-→ [{"label":"列出笔记","description":"","tool":"listNotes","mustUseTool":true}]
+→ [{"label":"列出笔记","description":"","tool":"listNotes","mustUseTool":true,"goal":"浏览笔记目录","requiredArtifacts":["note_list"],"stopCondition":"获取笔记列表"}]
 
 查询："今天有什么要复习的？"
-→ [{"label":"查看复习列表","description":"","tool":"getTodayReviews","mustUseTool":true}]
+→ [{"label":"查看复习列表","description":"","tool":"getTodayReviews","mustUseTool":true,"goal":"获取今日复习计划","requiredArtifacts":["today_reviews"],"stopCondition":"获取复习列表"}]
 
 查询："什么是JVM垃圾回收"
 → []
+
+查询："能给我笔记里生成思维导图吗"
+→ [{"label":"生成思维导图","description":"为笔记内容生成思维导图","tool":"generateMindMap","mustUseTool":true,"goal":"生成思维导图","requiredArtifacts":["mindmap"],"stopCondition":"思维导图已生成"}]

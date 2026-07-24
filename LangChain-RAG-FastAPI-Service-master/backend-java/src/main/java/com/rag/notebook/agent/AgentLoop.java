@@ -45,15 +45,18 @@ public class AgentLoop {
     private final ToolResultEvaluator evaluator;
     private final ModelFactory modelFactory;
     private final CompletionGate completionGate;
+    private final GoalEvaluator goalEvaluator;
     private final ConversationContextManager contextManager;
 
     public AgentLoop(AgentTools agentTools, ToolResultEvaluator evaluator,
                      ModelFactory modelFactory, CompletionGate completionGate,
+                     GoalEvaluator goalEvaluator,
                      ConversationContextManager contextManager) {
         this.agentTools = agentTools;
         this.evaluator = evaluator;
         this.modelFactory = modelFactory;
         this.completionGate = completionGate;
+        this.goalEvaluator = goalEvaluator;
         this.contextManager = contextManager;
     }
 
@@ -68,7 +71,8 @@ public class AgentLoop {
                       String userId, String sessionId,
                       List<ToolSpecification> activeTools,
                       SseEmitter emitter,
-                      String forceToolHint, String forceToolDesc) throws IOException {
+                      String forceToolHint, String forceToolDesc,
+                      String goalDescription, List<String> requiredArtifacts, String stopCondition) throws IOException {
 
         AgentState state = new AgentState(userQuery);
         java.util.Set<String> forcedTools = new java.util.HashSet<>();
@@ -79,6 +83,23 @@ public class AgentLoop {
             state.setToolRequired(true);
             state.setTaskGoal(forceToolDesc);
             log.info("任务约束: requiredTool={}, goal={}", forceToolHint, forceToolDesc);
+        }
+
+        // 设置目标追踪（核心新增：让 Agent 知道"要产出什么、何时停止"）
+        if (goalDescription != null && !goalDescription.isBlank()) {
+            state.setGoalDescription(goalDescription);
+            state.setRequiredArtifacts(requiredArtifacts);
+            state.setStopCondition(stopCondition);
+            state.setTaskStatus(TaskStatus.EXECUTING);
+            log.info("目标追踪: goal={}, requiredArtifacts={}, stopCondition={}",
+                    goalDescription, requiredArtifacts, stopCondition);
+        } else if (forceToolHint != null && !forceToolHint.isBlank()) {
+            // 无明确目标但有工具约束时，自动推断
+            state.setGoalDescription(forceToolDesc != null ? forceToolDesc : "使用 " + forceToolHint + " 完成用户请求");
+            state.setRequiredArtifacts(inferArtifactsForTool(forceToolHint));
+            state.setTaskStatus(TaskStatus.EXECUTING);
+        } else {
+            state.setTaskStatus(TaskStatus.EXECUTING);
         }
 
         List<ChatMessage> messages = new ArrayList<>();
@@ -156,13 +177,33 @@ public class AgentLoop {
                         anyProgress = true;
                         upgradeEvidenceFromTool(toolName, state);
                         extractFactsFromSuccess(toolName, toolArgs, rawResult, state);
-                        // 写操作成功：标记确认，供 CompletionGate 识别
+                        // 写操作成功：标记确认
                         if (isWriteTool(toolName)) {
                             state.markWriteConfirmation(toolName + " 执行成功");
                             log.info("写操作确认: {} 已成功执行", toolName);
                         }
                         // 更新会话上下文（当前活跃笔记追踪）
                         updateSessionContext(sessionId, toolName, toolArgs, rawResult);
+
+                        // ========== 核心新增：GoalEvaluator 主动判断目标是否达成 ==========
+                        GoalEvaluator.GoalEvaluation goalEval = goalEvaluator.evaluateAfterToolSuccess(state, toolName);
+                        if (goalEval.isAchieved()) {
+                            log.info("GoalEvaluator: 目标已达成 → 工具 {} 成功后直接结束循环", toolName);
+                            // 将目标达成信息作为最终工具结果注入
+                            String finalObservation = buildGoalAchievedObservation(toolName, rawResult, goalEval, state);
+                            // 替换最后一条消息为目标达成版本
+                            messages.set(messages.size() - 1,
+                                    ToolExecutionResultMessage.from(req, finalObservation));
+                            return AgentLoopResult.ready(state);
+                        }
+                        // 目标未达成但工具有进展：在 Observation 中追加进度信息
+                        if (goalEval.progressMessage() != null) {
+                            // 更新最后一条消息，附加目标进度
+                            String enhancedMsg = observationMsg + "\n\n" + goalEval.progressMessage();
+                            messages.set(messages.size() - 1,
+                                    ToolExecutionResultMessage.from(req, enhancedMsg));
+                        }
+                        // ========== GoalEvaluator 检查结束 ==========
                     } else if (eval.quality() == ResultQuality.POOR) {
                         // POOR：工具执行成功但证据不足 → 算"已执行"但不升级证据
                         anyProgress = true;  // 对 Rule 1 来说，工具已成功调用
@@ -185,12 +226,28 @@ public class AgentLoop {
                 // LLM 返回文本，未调用工具
                 String answer = aiMessage.text();
 
-                // CompletionGate：检查是否满足结束条件
+                // 先走 GoalEvaluator（目标驱动判断）
+                GoalEvaluator.GoalEvaluation goalEval = goalEvaluator.evaluateOnTextResponse(state, answer);
+                if (goalEval.isBlocked()) {
+                    log.info("GoalEvaluator 拦截，原因: {}", goalEval.message());
+                    state.markNoProgress();
+                    String retryPrompt = goalEval.progressMessage() != null
+                            ? goalEval.progressMessage()
+                            : "[系统：任务尚未完成]\n\n" + goalEval.message() + "\n\n请继续调用工具完成任务。";
+                    messages.add(UserMessage.from(retryPrompt));
+                    continue;
+                }
+
+                if (goalEval.isAchieved()) {
+                    log.info("GoalEvaluator 放行，Agent Loop 完成，共 {} 轮", i + 1);
+                    return AgentLoopResult.ready(state);
+                }
+
+                // GoalEvaluator 无法判断，回退到 CompletionGate
                 CompletionGate.GateResult gate = completionGate.check(state, answer);
                 if (!gate.allowed()) {
                     log.info("CompletionGate 拦截，原因: {}", gate.reason());
                     state.markNoProgress();
-                    // 注入带状态上下文的丰富重试提示
                     String richRetryPrompt = buildRichRetryPrompt(gate, state);
                     messages.add(UserMessage.from(richRetryPrompt));
                     continue;
@@ -709,6 +766,44 @@ public class AgentLoop {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * 目标达成时的最终 Observation：明确告诉 LLM"任务已完成，不要再调工具"。
+     */
+    private String buildGoalAchievedObservation(String toolName, String rawResult,
+                                                 GoalEvaluator.GoalEvaluation goalEval, AgentState state) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(rawResult);
+        sb.append("\n\n---\n");
+        sb.append("[目标已达成]\n");
+        sb.append("状态：任务完成\n");
+        if (goalEval.message() != null) {
+            sb.append("原因：").append(goalEval.message()).append("\n");
+        }
+        sb.append("已产出：").append(String.join(", ", state.getProducedArtifacts())).append("\n");
+        sb.append("目标：").append(state.getGoalDescription()).append("\n\n");
+        sb.append("请基于以上工具结果直接回答用户，不要再调用任何工具。");
+        return sb.toString();
+    }
+
+    /**
+     * 根据单个工具名推断需要的 artifact 列表。
+     * 用于 Supervisor 没有明确给出 goal 时的自动推断。
+     */
+    private List<String> inferArtifactsForTool(String toolName) {
+        return switch (toolName) {
+            case "generateMindMap" -> List.of("mindmap");
+            case "generateDiagram" -> List.of("diagram");
+            case "createNote" -> List.of("note_created");
+            case "editNote", "appendNote" -> List.of("note_updated");
+            case "deleteNote" -> List.of("note_deleted");
+            case "mergeNotes" -> List.of("notes_merged");
+            case "getNote" -> List.of("note_content");
+            case "searchNotes" -> List.of("search_results");
+            case "listNotes" -> List.of("note_list");
+            default -> List.of(toolName + "_done");
+        };
     }
 
     private void sendSseEvent(SseEmitter emitter, String type, Map<String, Object> data) throws IOException {

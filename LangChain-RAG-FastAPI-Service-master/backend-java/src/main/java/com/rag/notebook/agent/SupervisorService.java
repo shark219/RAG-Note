@@ -91,6 +91,18 @@ public class SupervisorService {
                 task.setDescription(node.has("description") ? node.get("description").asText() : "");
                 task.setToolHint(node.has("tool") ? node.get("tool").asText() : null);
                 task.setMustUseTool(node.has("mustUseTool") && node.get("mustUseTool").asBoolean());
+
+                // 解析新增的目标追踪字段
+                task.setGoal(node.has("goal") ? node.get("goal").asText() : null);
+                if (node.has("requiredArtifacts") && node.get("requiredArtifacts").isArray()) {
+                    java.util.List<String> artifacts = new ArrayList<>();
+                    for (JsonNode artifactNode : node.get("requiredArtifacts")) {
+                        artifacts.add(artifactNode.asText());
+                    }
+                    task.setRequiredArtifacts(artifacts);
+                }
+                task.setStopCondition(node.has("stopCondition") ? node.get("stopCondition").asText() : null);
+
                 subTasks.add(task);
             }
 

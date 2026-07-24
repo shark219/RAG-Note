@@ -1,18 +1,24 @@
 package com.rag.notebook.agent;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
- * Agent 执行状态：记录工具调用历史、工作记忆和反思信息
+ * Agent 执行状态：记录工具调用历史、工作记忆、目标进度和任务状态机。
  *
- * 核心设计：状态不仅记录"做了什么"，还记录"学到了什么"，
- * 让模型在每轮决策时能看到不断增长的 knownFacts 和 failedActions。
+ * 核心设计：
+ *   1. 状态不仅记录"做了什么"，还记录"学到了什么"，
+ *      让模型在每轮决策时能看到不断增长的 knownFacts 和 failedActions。
+ *   2. 目标追踪：明确知道"要产出什么、已经产出了什么、还缺什么"，
+ *      让 GoalEvaluator 在工具成功后立即判断是否该结束，而不是等 LLM 自己猜。
  *
- * 证据级别：区分不同深度的工具结果，让 CompletionGate 做出更智能的判断。
+ * 证据级别：区分不同深度的工具结果
  *   LIST_EVIDENCE    — 只拿到了标题和摘要（listNotes）
  *   SEARCH_EVIDENCE  — 拿到了匹配内容和预览（searchNotes）
  *   CONTENT_EVIDENCE — 拿到了完整笔记正文（getNote）
+ *   ARTIFACT_EVIDENCE — 已生成产物（generateMindMap, generateDiagram）
  */
 public class AgentState {
 
@@ -20,24 +26,38 @@ public class AgentState {
     private final List<ToolCallRecord> toolHistory = new ArrayList<>();
     private String bestAnswer;
 
-    // 任务约束（由 Supervisor 设置）
+    // ========== 任务状态机 ==========
+    private TaskStatus taskStatus = TaskStatus.CREATED;
+
+    // ========== 任务约束（由 Supervisor 设置） ==========
     private String requiredTool;
     private boolean toolRequired;
     private String taskGoal;
 
-    // 工作记忆：执行过程中积累的事实（如"UI自动化不是有效noteId"）
+    // ========== 目标追踪 ==========
+    /** 任务目标描述（如"增强古诗词笔记并生成思维导图"） */
+    private String goalDescription;
+    /** 完成目标需要产出的 artifact 列表（如 ["note_updated", "mindmap"]） */
+    private final Set<String> requiredArtifacts = new LinkedHashSet<>();
+    /** 已经产出的 artifact 列表 */
+    private final Set<String> producedArtifacts = new LinkedHashSet<>();
+    /** 目标达成的停止条件描述 */
+    private String stopCondition;
+
+    // ========== 工作记忆 ==========
+    /** 执行过程中积累的事实（如"UI自动化不是有效noteId"） */
     private final List<String> workingMemory = new ArrayList<>();
 
-    // 失败动作记录：已执行且失败的工具+参数描述
+    /** 失败动作记录：已执行且失败的工具+参数描述 */
     private final List<String> failedActions = new ArrayList<>();
 
-    // 连续无进展计数器
+    /** 连续无进展计数器 */
     private int consecutiveNoProgress = 0;
 
-    // 当前达到的最高证据级别
+    /** 当前达到的最高证据级别 */
     private EvidenceLevel highestEvidence = EvidenceLevel.NONE;
 
-    // 写操作确认：非null表示一次写操作已成功完成
+    /** 写操作确认：非null表示一次写操作已成功完成 */
     private String writeConfirmation;
 
     public AgentState(String originalQuery) {
@@ -68,6 +88,40 @@ public class AgentState {
 
     public String getTaskGoal() {
         return taskGoal;
+    }
+
+    // --- 任务状态机 ---
+
+    public TaskStatus getTaskStatus() { return taskStatus; }
+    public void setTaskStatus(TaskStatus status) { this.taskStatus = status; }
+
+    public boolean isGoalAchieved() { return taskStatus == TaskStatus.GOAL_ACHIEVED; }
+
+    // --- 目标追踪 ---
+
+    public void setGoalDescription(String goal) { this.goalDescription = goal; }
+    public String getGoalDescription() { return goalDescription; }
+
+    public void setRequiredArtifacts(List<String> artifacts) {
+        this.requiredArtifacts.clear();
+        if (artifacts != null) this.requiredArtifacts.addAll(artifacts);
+    }
+    public List<String> getRequiredArtifacts() { return new ArrayList<>(requiredArtifacts); }
+
+    public void markArtifactProduced(String artifact) {
+        if (artifact != null) {
+            producedArtifacts.add(artifact);
+            addKnownFact("已产出: " + artifact);
+        }
+    }
+    public List<String> getProducedArtifacts() { return new ArrayList<>(producedArtifacts); }
+
+    public void setStopCondition(String condition) { this.stopCondition = condition; }
+    public String getStopCondition() { return stopCondition; }
+
+    /** 是否有明确目标 */
+    public boolean hasGoal() {
+        return goalDescription != null && !goalDescription.isBlank();
     }
 
     public String getOriginalQuery() {
@@ -270,11 +324,34 @@ public class AgentState {
      */
     public String buildStateSummary() {
         StringBuilder sb = new StringBuilder();
-        sb.append("目标：").append(originalQuery);
-        if (taskGoal != null && !taskGoal.isBlank()) {
-            sb.append("（").append(taskGoal).append("）");
+
+        // 目标进度
+        if (hasGoal()) {
+            sb.append("任务目标：").append(goalDescription).append("\n");
+            if (!requiredArtifacts.isEmpty()) {
+                sb.append("目标进度：").append(producedArtifacts.size())
+                        .append("/").append(requiredArtifacts.size()).append("\n");
+                if (!producedArtifacts.isEmpty()) {
+                    sb.append("已产出：").append(String.join(", ", producedArtifacts)).append("\n");
+                }
+                // 计算缺失的
+                List<String> missing = new ArrayList<>(requiredArtifacts);
+                missing.removeAll(producedArtifacts);
+                if (!missing.isEmpty()) {
+                    sb.append("还缺：").append(String.join(", ", missing)).append("\n");
+                }
+                if (stopCondition != null) {
+                    sb.append("停止条件：").append(stopCondition).append("\n");
+                }
+            }
+            sb.append("\n");
+        } else {
+            sb.append("用户请求：").append(originalQuery);
+            if (taskGoal != null && !taskGoal.isBlank()) {
+                sb.append("（").append(taskGoal).append("）");
+            }
+            sb.append("\n");
         }
-        sb.append("\n");
 
         if (!workingMemory.isEmpty()) {
             sb.append("已知事实：\n");
