@@ -31,6 +31,7 @@
 
     <div class="menu-list">
       <van-cell-group inset>
+        <van-cell title="RAG 评估" is-link @click="goToEvaluation" />
         <van-cell :title="$t('my.settings')" is-link @click="goToSettings" />
         <van-cell :title="$t('my.knowledgeBase')" is-link @click="goToKnowledgeBase" />
         <van-cell :title="$t('my.aboutUs')" is-link @click="goToAboutUs" />
@@ -77,6 +78,11 @@ const goToProfile = () => {
 };
 
 
+
+// 跳转到评估页面
+const goToEvaluation = () => {
+  router.push('/evaluation');
+};
 
 // 跳转到设置页面
 const goToSettings = () => {

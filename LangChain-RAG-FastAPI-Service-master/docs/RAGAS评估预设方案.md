@@ -30,7 +30,7 @@
 | 评估模型未隔离 | 复用通用 LLM，temperature=0.1，非确定性 |
 | 综合评分用加权平均 | 对低分项不敏感 |
 | 无可视化看板 | 评估结果只在数据库，无图表展示 |
-| 评估进度无实时反馈 | 批量评估无 SSE 推送 |
+| 评估结果无实时查询 | 批量评估后需手动查看报告 |
 
 ### 1.3 参照方案（smallyoung.cn）的优势
 
@@ -40,7 +40,6 @@
 | temperature=0 | 专用评估模型，确定性输出 |
 | 调和平均数 | 对低分更敏感，任何一个维度缺陷都会拉低综合分 |
 | Micrometer 监控 | Gauge/Counter/Timer，可接入 Prometheus + Grafana |
-| SSE 流式推送 | 评估进度实时推送到前端 |
 
 ### 1.4 参照方案的不足（本方案补足）
 
@@ -60,12 +59,14 @@
 
 ### 2.1 四维 LLM 评估指标
 
-| 指标 | 评估对象 | 需要 Ground Truth | 计算方式 |
-|------|---------|-----------------|---------|
-| Faithfulness | 生成器 | 否 | 声明拆分 → 逐个判断 SUPPORTED/NOT_SUPPORTED → 比例 |
-| Answer Relevancy | 生成器 | 否 | 反向生成 3 个问题 → Embedding 相似度 → 平均值 |
-| Context Recall | 检索器 | 是 | 参考答案拆句 → 逐个检查覆盖率 → 比例 |
-| Context Precision | 检索器 | 否 | 按位置加权：Precision@k × rel(k) |
+| 指标 | 评估对象 | 需要 Ground Truth | 使用场景 | 计算方式 |
+|------|---------|-----------------|---------|---------|
+| Faithfulness | 生成器 | 否 | 生产 + 回归 | 声明拆分 → 逐个判断 SUPPORTED/NOT_SUPPORTED → 比例 |
+| Answer Relevancy | 生成器 | 否 | 生产 + 回归 | 反向生成 3 个问题 → LLM 自评相似度 → 平均值 |
+| Context Precision | 检索器 | 否 | 生产 + 回归 | 按位置加权：Precision@k × rel(k) |
+| Context Recall | 检索器 | 是 | **仅回归测试** | 参考答案拆句 → 逐个检查覆盖率 → 比例 |
+
+> **Context Recall 仅用于回归测试**：生产环境的真实查询没有标准答案，无法使用 Context Recall。该指标仅在有测试数据集的回归测试场景中使用。
 
 ### 2.2 规则评估指标
 
@@ -81,18 +82,38 @@
 
 ### 2.3 综合评分
 
+**生产环境**（无 Ground Truth）：
 ```
-LLM 评估分 = Faithfulness × 0.3 + Answer Relevancy × 0.3 + Context Precision × 0.2 + Context Recall × 0.2
-规则评估分 = 100 - 各项扣分
+LLM 评估分 = Faithfulness × 0.4 + Answer Relevancy × 0.35 + Context Precision × 0.25
+规则评估分 = 100 - 各项扣分（归一化为 0-1）
 
 最终综合分 = 调和平均(LLM 评估分, 规则评估分)
 ```
 
-**调和平均数公式**：`H = 2 / (1/x1 + 1/x2)`
+**回归测试**（有 Ground Truth）：
+```
+LLM 评估分 = Faithfulness × 0.3 + Answer Relevancy × 0.3 + Context Precision × 0.2 + Context Recall × 0.2
+规则评估分 = 100 - 各项扣分（归一化为 0-1）
+
+最终综合分 = 调和平均(LLM 评估分, 规则评估分)
+```
+
+**权重可配置**：在 `application.yml` 中配置，不同部署环境可以调整：
+```yaml
+app.evaluation.weights:
+  faithfulness: 0.4
+  answer-relevancy: 0.35
+  context-precision: 0.25
+  context-recall: 0.2  # 仅回归测试使用
+```
+
+**调和平均数公式**：`H = n / (Σ 1/x_i)`
 
 调和平均对低分更敏感：
 - LLM 评估 0.9 + 规则评估 0.9 → 综合 0.9
 - LLM 评估 0.9 + 规则评估 0.3 → 综合 0.45（加权平均是 0.6，调和平均更低）
+
+**0 分保护**：指标为 0 时替换为 0.01，避免调和平均数崩溃。指标 < 0.1 时标记为"评估异常"。
 
 ### 2.4 评级标准
 
@@ -171,11 +192,13 @@ CLAIMS:
 FAITHFULNESS_SCORE: 0.XX
 ```
 
-**解析逻辑**：
-1. 用正则提取 `CLAIMS:` 到 `FAITHFULNESS_SCORE:` 之间的内容
-2. 逐行解析 `SUPPORTED` / `NOT_SUPPORTED`
-3. 计算比例：`SUPPORTED 数 / 总声明数`
-4. 如果解析失败，降级为整体打分
+**解析逻辑**（多层降级）：
+1. 第 1 层：精确正则匹配 `CLAIMS:` 和 `FAITHFULNESS_SCORE:`，逐行解析 `SUPPORTED/NOT_SUPPORTED`
+2. 第 2 层：宽松正则匹配关键词 `SUPPORTED` / `NOT_SUPPORTED`（兼容格式偏差）
+3. 第 3 层：只提取 `FAITHFULNESS_SCORE: 0.XX` 数值（忽略声明解析）
+4. 第 4 层：整体打分降级（调用原有 evaluateFaithfulness 逻辑）
+
+**Prompt 鲁棒性增强**：在 Prompt 中增加 2-3 个完整的输出示例，减少 LLM 格式偏差。解析失败时记录日志，用于后续优化 Prompt。
 
 ### 3.3 Answer Relevancy 反向生成
 
@@ -200,15 +223,7 @@ GENERATED_QUESTIONS:
 ANSWER_RELEVANCY_SCORE: 0.XX
 ```
 
-**增强**：除了 LLM 自评相似度，还可以用 Embedding 计算实际余弦相似度：
-```java
-// 用 Embedding 模型计算反向生成问题与原始问题的相似度
-double embeddingSimilarity = cosineSimilarity(
-    embed(originalQuestion),
-    embed(generatedQuestion)
-);
-// 最终得分 = LLM 自评 × 0.5 + Embedding 相似度 × 0.5
-```
+**说明**：得分直接使用 LLM 输出的相似度，不混合 Embedding 相似度。原因：Embedding 模型对中文的语义相似度计算质量参差不齐，混合后可能引入噪声。Embedding 相似度仅作为参考数据记录到报告中，不参与评分。
 
 ### 3.4 Context Recall 引入标准答案
 
@@ -310,29 +325,42 @@ double totalScore = harmonicMean(llmScore, ruleScore);
 ```
 输入：RagTrace（question, answer, contexts, ground_truth 可选）
   │
-  ├─ Step 1: LLM 评估（4 个并行 LLM 调用）
+  ├─ Step 1: LLM 评估（3-4 个并行 LLM 调用，总耗时 1-3 秒）
   │   ├─ Faithfulness → 声明拆分 → SUPPORTED/NOT_SUPPORTED → 比例
-  │   ├─ Answer Relevancy → 反向生成 3 问题 → 相似度 → 平均值
+  │   ├─ Answer Relevancy → 反向生成 3 问题 → LLM 自评相似度 → 平均值
   │   ├─ Context Precision → 位置加权 → 得分
-  │   └─ Context Recall（需 Ground Truth）→ 句子拆分 → 覆盖率
+  │   └─ Context Recall（需 Ground Truth，仅回归测试）→ 句子拆分 → 覆盖率
   │
-  ├─ Step 2: 规则评估（无 LLM 调用）
+  ├─ Step 2: 规则评估（无 LLM 调用，瞬时完成）
   │   ├─ 耗时检查
   │   ├─ Token 检查
   │   ├─ 相似度检查
   │   └─ 回答长度检查
   │
   ├─ Step 3: 综合评分
-  │   ├─ LLM 评估分 = 四指标加权
+  │   ├─ LLM 评估分 = 指标加权（生产环境 3 指标，回归测试 4 指标）
   │   ├─ 规则评估分 = 100 - 扣分
   │   └─ 综合分 = 调和平均(LLM 评估分, 规则评估分)
   │
   ├─ Step 4: 评级 + 诊断
   │   ├─ 评级：优秀/良好/及格/不及格
-  │   └─ 诊断：根据四指标组合反推问题出在哪
+  │   └─ 诊断：根据指标组合反推问题出在哪
   │
   └─ 输出：EvaluationReport
 ```
+
+### 4.2 采样评估策略（降低成本）
+
+不评估所有 Trace，按优先级分层：
+
+| 优先级 | 条件 | 是否评估 |
+|--------|------|---------|
+| 高 | 用户给了低分反馈（1-2 分） | 必须评估 |
+| 高 | 规则评估不及格（耗时 > 15s 或检索为空） | 必须评估 |
+| 中 | 其他 Trace | 按 20% 比例采样评估 |
+| 低 | 高相似度（>0.8）+ 短耗时（<5s） | 跳过（大概率没问题） |
+
+**效果**：假设每天 100 条 Trace，实际评估约 25-30 条，LLM 调用从 400+ 次降到 100 次左右。
 
 ### 4.2 批量评估流程（已有，保留）
 
@@ -349,40 +377,41 @@ double totalScore = harmonicMean(llmScore, ruleScore);
   → 输出周报日志
 ```
 
-### 4.3 SSE 实时评估（新增）
+### 4.3 实时评估（异步 + 轮询，不引入 SSE）
 
-新增 `/evaluation/evaluate/stream` 端点，评估过程中实时推送每个指标的进度：
+参照方案使用 SSE 流式推送评估进度，但对当前项目来说是过度工程：
+- 评估本身只需几秒，SSE 推送的价值不大
+- 前端轮询即可获取结果，不需要引入 WebFlux
+- 保持现有架构简单
+
+**替代方案**：异步评估 + 前端轮询
 
 ```java
-@GetMapping(value = "/evaluation/evaluate/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-public SseEmitter evaluateStream(@RequestParam String traceId) {
-    SseEmitter emitter = new SseEmitter(120000L);
+// 提交评估任务，返回 traceId（异步执行）
+@PostMapping("/evaluation/evaluate")
+public ApiResponse<Map<String, Object>> evaluate(@RequestParam String traceId) {
     CompletableFuture.runAsync(() -> {
         RagTrace trace = traceRepository.findById(traceId).orElse(null);
-        if (trace == null) {
-            sendEvent(emitter, "error", "Trace 不存在");
-            return;
-        }
-
-        sendEvent(emitter, "progress", "开始评估...");
-
-        // 逐个指标评估并推送
-        sendEvent(emitter, "progress", "评估忠实度...");
-        double faithfulness = evaluateFaithfulness(trace);
-        sendEvent(emitter, "metric", Map.of("name", "faithfulness", "score", faithfulness));
-
-        sendEvent(emitter, "progress", "评估答案相关性...");
-        double answerRelevancy = evaluateAnswerRelevancy(trace);
-        sendEvent(emitter, "metric", Map.of("name", "answer_relevancy", "score", answerRelevancy));
-
-        // ... 其他指标
-
-        sendEvent(emitter, "completed", Map.of("totalScore", totalScore, "level", level));
-        emitter.complete();
+        if (trace == null) return;
+        EvaluationReport report = evaluationService.evaluate(trace);
+        reportRepository.save(report);
     }, taskExecutor);
-    return emitter;
+    return ApiResponse.success(Map.of("traceId", traceId, "status", "processing"));
+}
+
+// 前端轮询查询结果
+@GetMapping("/evaluation/report/{traceId}")
+public ApiResponse<EvaluationReport> getReport(@PathVariable String traceId) {
+    EvaluationReport report = reportRepository
+        .findTopByTraceIdOrderByCreatedAtDesc(traceId).orElse(null);
+    if (report == null) {
+        return ApiResponse.success(null); // 评估中，前端继续轮询
+    }
+    return ApiResponse.success(report);
 }
 ```
+
+前端轮询策略：首次 1 秒后查询，之后每 2 秒查询一次，直到返回结果。
 
 ---
 
@@ -524,7 +553,7 @@ CREATE TABLE evaluation_test_cases (
 | `GET /evaluation/trend` | GET | 最近 N 天的四维指标趋势数据 |
 | `GET /evaluation/distribution` | GET | 评级分布统计 |
 | `GET /evaluation/diagnosis-stats` | GET | 问题类型分布统计 |
-| `GET /evaluation/evaluate/stream` | GET | SSE 实时评估进度 |
+| `POST /evaluation/evaluate` | POST | 异步提交评估任务（前端轮询结果） |
 
 ### 6.4 趋势数据接口设计
 
@@ -576,23 +605,28 @@ public ApiResponse<Map<String, Object>> getTrend(
 ### Phase 1：评估逻辑增强（1-2 天）
 
 - [ ] `ModelFactory` 新增 `createEvaluationModel()`（temperature=0）
-- [ ] `EvaluationService` 替换为声明拆分 Prompt（Faithfulness）
-- [ ] `EvaluationService` 新增反向生成逻辑（Answer Relevancy）
+- [ ] `EvaluationService` 替换为声明拆分 Prompt（Faithfulness），含多层降级解析
+- [ ] `EvaluationService` 新增反向生成逻辑（Answer Relevancy），纯 LLM 自评
 - [ ] `EvaluationService` 新增位置加权逻辑（Context Precision）
 - [ ] `RagTrace` 新增 `groundTruth` 字段
-- [ ] `EvaluationService` 支持 Ground Truth（Context Recall）
-- [ ] 综合评分改为调和平均数
+- [ ] `EvaluationService` 支持 Ground Truth（Context Recall，仅回归测试）
+- [ ] 综合评分改为调和平均数，支持 0 分保护
+- [ ] 权重配置化（`application.yml`）
+- [ ] 评估采样策略（高优先级必须评估，其他按比例采样）
+- [ ] LLM 评估调用并行化（CompletableFuture.allOf）
 
-### Phase 2：测试数据集（1 天）
+### Phase 2：测试数据集与回归测试（1 天）
 
 - [ ] 新建 `evaluation_test_cases` 表
 - [ ] 实现 `TestCaseGenerator`（LLM 自动生成测试用例）
-- [ ] 实现回归测试流程
+- [ ] 实现手动触发回归测试 API（`POST /evaluation/regression`）
+- [ ] 回归测试结果与上一次对比（而非与历史平均值对比）
+- [ ] 回归测试使用完整四指标（含 Context Recall）
 
 ### Phase 3：可视化看板（2-3 天）
 
 - [ ] 后端新增趋势/分布/诊断统计 API
-- [ ] 后端新增 SSE 实时评估接口
+- [ ] 后端新增异步评估 + 轮询查询接口
 - [ ] 前端新建 `/evaluation-dashboard` 页面
 - [ ] 前端集成 ECharts 图表
 - [ ] 前端低分样本列表 + 详情弹窗
@@ -606,7 +640,155 @@ public ApiResponse<Map<String, Object>> getTrend(
 
 ---
 
-## 八、与参照方案的差异总结
+## 八、苏格拉底式提问与方案优化
+
+### Q1：Ground Truth 从哪来？生产环境有标准答案吗？
+
+**问题**：方案说 Context Recall 需要 Ground Truth，但生产环境中用户的 RAG 查询是没有标准答案的。测试数据集可以自动生成，但生产环境的真实查询怎么办？
+
+**反思**：Context Recall 在生产环境中几乎无法使用，因为：
+- 真实用户提问不会有预先准备的标准答案
+- 即使用 LLM 自动生成 Ground Truth，那也是"用 LLM 生成的答案评估 LLM 生成的答案"，失去了评估意义
+
+**优化**：
+- Context Recall **仅用于回归测试**（有测试数据集的场景），不用于生产环境的实时评估
+- 生产环境的评估只用三个不需要 Ground Truth 的指标：Faithfulness、Answer Relevancy、Context Precision
+- 综合评分公式调整为：
+  ```
+  生产环境：综合分 = 调和平均(Faithfulness, Answer Relevancy, Context Precision, 规则评估分)
+  回归测试：综合分 = 调和平均(Faithfulness, Answer Relevancy, Context Precision, Context Recall, 规则评估分)
+  ```
+
+### Q2：每次评估 4-5 个 LLM 调用，成本可控吗？
+
+**问题**：每次评估需要 4 个 LLM 调用（Faithfulness + Answer Relevancy + Context Precision + Context Recall），加上 Answer Relevancy 反向生成问题的额外调用。每天评估 100 条 Trace 就是 500 次 LLM 调用，这个成本是否可承受？
+
+**反思**：
+- 以 GLM-4 为例，每次调用约 0.01-0.05 元，500 次约 5-25 元/天，月成本 150-750 元
+- 但评估用的是 temperature=0 的精确模型，Token 消耗比生成任务少
+- 真正的问题是：**是否每条 Trace 都需要评估？**
+
+**优化**：
+- **采样评估**：不评估所有 Trace，按比例采样（如 20%），降低成本
+- **分层评估**：
+  - 用户给了低分反馈（1-2 分）的 Trace → 必须评估（找出问题）
+  - 高相似度（>0.8）+ 短耗时（<5s）的 Trace → 跳过评估（大概率没问题）
+  - 其他 Trace → 按 20% 比例采样评估
+- **并行调用**：4 个 LLM 评估调用并行执行，总耗时从 4-12 秒降到 1-3 秒
+
+### Q3：temperature=0 就能保证评估结果确定吗？
+
+**问题**：即使 temperature=0，LLM 的输出也不是完全确定性的（可能受 API 负载、网络等因素影响）。同一 Trace 多次评估结果可能不同。
+
+**反思**：确实，temperature=0 只是减少了随机性，但不能完全消除。实际测试中，同一输入多次调用可能得到 0.85 和 0.87 这样微小的差异。
+
+**优化**：
+- **评估结果置信区间**：每个指标报告为 `0.85 ± 0.02`，而非单一数值
+- **多次评估取平均**：对关键 Trace（如低分样本）执行 3 次评估，取中位数
+- **阈值缓冲**：评级边界加缓冲区（如"良好"的阈值从 0.75 改为 0.73-0.77 之间视为"良好"）
+
+### Q4：声明拆分 Prompt 的输出格式不稳定怎么办？
+
+**问题**：Prompt 要求 LLM 按 `CLAIMS:\n- [声明] -> SUPPORTED/NOT_SUPPORTED` 格式输出，但 LLM 的输出格式并不总是稳定的。如果输出格式不符合预期，正则解析会失败。
+
+**反思**：这是 LLM-as-a-judge 的核心风险。常见的格式偏差：
+- LLM 输出 `1. 声明1 - SUPPORTED` 而非 `- [声明1] -> SUPPORTED`
+- LLM 输出中文标签 `支持/不支持` 而非 `SUPPORTED/NOT_SUPPORTED`
+- LLM 在 CLAIMS 前加了额外文字
+
+**优化**：
+- **多层降级解析**：
+  ```
+  第 1 层：精确正则匹配 "CLAIMS:" 和 "FAITHFULNESS_SCORE:"
+  第 2 层：宽松正则匹配 "SUPPORTED" / "NOT_SUPPORTED" 关键词
+  第 3 层：提取 FAITHFULNESS_SCORE 数值（忽略声明解析）
+  第 4 层：整体打分降级（调用原有 evaluateFaithfulness 逻辑）
+  ```
+- **Prompt 中增加格式示例**：在 Prompt 中给出 2-3 个完整的输出示例，减少格式偏差
+- **解析失败时记录日志**：收集格式偏差案例，用于后续优化 Prompt
+
+### Q5：四指标权重的依据是什么？
+
+**问题**：Faithfulness 0.3 + Answer Relevancy 0.3 + Context Precision 0.2 + Context Recall 0.2，这个权重分配的依据是什么？不同场景是否应该有不同的权重？
+
+**反思**：权重分配确实缺乏依据。不同场景对指标的敏感度不同：
+- **知识问答场景**：Faithfulness 最重要（不能编造），Answer Relevancy 次之
+- **创意写作场景**：Answer Relevancy 最重要（要回答到点上），Faithfulness 可以放宽
+- **文档检索场景**：Context Precision 最重要（检索结果要精准）
+
+**优化**：
+- **默认权重保持不变**（通用场景）
+- **支持权重配置化**：在 `application.yml` 中配置权重，不同部署环境可以调整
+  ```yaml
+  app.evaluation.weights:
+    faithfulness: 0.3
+    answer-relevancy: 0.3
+    context-precision: 0.2
+    context-recall: 0.2
+  ```
+- **后续根据用户反馈数据校准**：分析用户低分反馈与四指标的相关性，用回归分析自动优化权重
+
+### Q6：调和平均数遇到 0 分怎么办？
+
+**问题**：如果某个指标为 0（比如评估解析失败返回默认值 0.5，或者某个指标确实很差），调和平均数会严重被拉低。如果指标为 0，调和平均数直接变成 0。
+
+**反思**：当前方案中 `harmonicMean()` 方法用 `if (s > 0)` 过滤了 0 分，但这意味着 0 分的指标被完全忽略，这不合理。
+
+**优化**：
+- **0 分保护**：将 0 分替换为最小值 0.01，避免调和平均数崩溃
+- **异常值处理**：如果某个指标 < 0.1，标记为"评估异常"而非直接参与计算
+- **降级策略**：如果 LLM 评估解析失败，该指标不参与综合评分，用剩余指标的调和平均
+
+### Q7：评估延迟对用户体验的影响？
+
+**问题**：单条评估需要 4 个 LLM 调用，每个约 1-3 秒，串行执行需要 4-12 秒。如果用户提交反馈后等待评估结果，体验很差。
+
+**反思**：用户不应该等待评估结果。评估是后台任务，用户只需要提交反馈，评估结果后续查看即可。
+
+**优化**：
+- **评估完全异步化**：用户提交反馈 → 立即返回成功 → 后台异步执行评估 → 结果写入数据库
+- **不阻塞用户操作**：评估任务提交到线程池，不影响 RAG 调用的响应速度
+- **评估结果通知**：低分评估结果可以通过站内消息或邮件通知开发者（可选）
+
+### Q8：Embedding 相似度增强是否必要？
+
+**问题**：Answer Relevancy 的反向生成方案中，LLM 自评相似度和 Embedding 相似度各占 0.5。但 Embedding 模型的质量直接影响这个评估的准确性。如果 Embedding 模型本身质量不高，这个增强是否反而会引入噪声？
+
+**反思**：当前项目用的 Embedding 模型（智谱/通义千问）对中文的支持质量参差不齐。如果 Embedding 模型对"量子纠缠"和"粒子间关联"的相似度计算不准确，反而会拉低评估质量。
+
+**优化**：
+- **默认只用 LLM 自评**：Answer Relevancy 的得分直接用 LLM 输出的相似度，不混合 Embedding
+- **Embedding 相似度作为参考**：记录 Embedding 相似度到报告中，但不参与评分计算
+- **后续如果 Embedding 模型升级**，再考虑混合评分
+
+### Q9：回归测试什么时候触发？
+
+**问题**：方案说"综合分下降 > 5% → 告警"，但什么时候触发回归测试？每次 RAG 优化后？每天？每次部署？
+
+**反思**：回归测试应该是**手动触发**的，而非自动执行。因为：
+- 回归测试需要调用 RAG 系统生成回答，消耗真实 Token
+- 自动执行可能在非工作时间浪费资源
+- 回归测试应该在 RAG 优化后、部署前执行
+
+**优化**：
+- **手动触发**：提供 `POST /evaluation/regression` API，开发者在 RAG 优化后手动触发
+- **CI/CD 集成**（可选）：在部署流水线中加入回归测试步骤
+- **结果对比**：与上一次回归测试结果对比，而非与历史平均值对比
+
+### Q10：评估结果如何闭环到 RAG 优化？
+
+**问题**：方案只是诊断问题（"忠实度低 → 幻觉"），但没有说如何根据评估结果自动优化 RAG 参数。评估的意义是什么？
+
+**反思**：评估本身不是目的，**指导优化**才是。当前方案的诊断只是告诉开发者"哪里有问题"，但没有告诉"怎么改"。
+
+**优化**：
+- **诊断建议具体化**：不只说"优化 Prompt"，而是给出具体的 Prompt 修改建议
+- **A/B 测试支持**：记录评估结果时同时记录 RAG 配置版本（如 `rag_config_v1`），支持不同配置的效果对比
+- **优化效果追踪**：每次 RAG 优化后，对比优化前后的评估指标变化，量化优化效果
+
+---
+
+## 九、与参照方案的差异总结
 
 | 维度 | 参照方案（smallyoung） | 本方案 |
 |------|----------------------|--------|
@@ -624,5 +806,5 @@ public ApiResponse<Map<String, Object>> getTrend(
 | Trace 追踪 | 无 | 有（RagTrace 全链路） |
 | 测试数据集 | 无 | 有（LLM 自动生成） |
 | 监控 | Micrometer + Prometheus | 前端看板（ECharts） |
-| SSE 流式 | WebFlux Flux | SseEmitter |
+| 评估结果获取 | SSE 流式推送 | 异步提交 + 前端轮询 |
 | 回归测试 | 无 | 有（基线对比 + 告警） |
