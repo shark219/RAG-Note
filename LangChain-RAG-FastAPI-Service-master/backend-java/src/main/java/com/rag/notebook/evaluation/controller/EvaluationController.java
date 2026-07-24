@@ -76,7 +76,7 @@ public class EvaluationController {
     public ApiResponse<List<EvaluationReport>> getReports(
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size) {
-        List<EvaluationReport> reports = reportRepository.findAll();
+        List<EvaluationReport> reports = reportRepository.findAllByOrderByCreatedAtDesc();
         int start = page * size;
         int end = Math.min(start + size, reports.size());
         if (start >= reports.size()) {
