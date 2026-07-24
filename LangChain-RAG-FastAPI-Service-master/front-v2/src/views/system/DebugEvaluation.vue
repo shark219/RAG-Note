@@ -768,8 +768,8 @@ async function handleRunBatch() {
     const res: any = await evaluationApi.runBatch(7)
     const data = res?.data || res
     Message.success(`评估完成: ${data.evaluated}/${data.total}`)
-    loadOverview()
-    loadQuality()
+    await loadOverview()
+    await loadQuality()
   } catch (e) {
     Message.error('评估失败')
   } finally {
@@ -839,8 +839,8 @@ async function handleRegression() {
     const data = res?.data || res
     regressionResult.value = data
     Message.success(`回归测试完成: 平均分 ${data.avgScore}`)
-    loadOverview()
-    loadQuality()
+    await loadOverview()
+    await loadQuality()
   } catch (e) {
     Message.error('回归测试失败')
   } finally {

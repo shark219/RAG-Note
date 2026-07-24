@@ -15,6 +15,8 @@ public interface EvaluationReportRepository extends JpaRepository<EvaluationRepo
 
     Optional<EvaluationReport> findTopByTraceIdOrderByCreatedAtDesc(String traceId);
 
+    List<EvaluationReport> findAllByOrderByCreatedAtDesc();
+
     boolean existsByTraceId(String traceId);
 
     List<EvaluationReport> findByUserIdOrderByCreatedAtDesc(String userId);
