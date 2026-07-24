@@ -47,7 +47,8 @@ public class RagService {
     }
 
     /**
-     * 混合检索：多Query扩展 + 向量检索 + BM25 + RRF融合
+     * 混合检索：仅检索知识库（向量检索 + BM25 + RRF融合 + Rerank）
+     * 笔记检索由 searchNotes 工具负责
      */
     public List<Map<String, Object>> retrieveDocuments(String userId, String query) {
         // 混合检索知识库
@@ -55,17 +56,7 @@ public class RagService {
                 userId, query, props.getChroma().getK());
         knowledgeResults.forEach(r -> r.put("source_type", "knowledge_base"));
 
-        // 混合检索笔记
-        List<Map<String, Object>> noteResults = hybridRetriever.searchNotes(
-                userId, query, 3);
-        noteResults.forEach(r -> r.put("source_type", "note"));
-
-        // 合并：笔记优先，知识库在后
-        List<Map<String, Object>> merged = new ArrayList<>();
-        merged.addAll(noteResults);
-        merged.addAll(knowledgeResults);
-
-        return merged;
+        return knowledgeResults;
     }
 
     // 核心方法：传入用户ID和查询词，返回相关的文档列表和最终的AI总结

@@ -8,6 +8,7 @@ public record KnowledgeDocument(
         String filename,
         String originalFilename,
         String userId,
+        String md5,
         int chunkCount,
         String preview,
         String status,

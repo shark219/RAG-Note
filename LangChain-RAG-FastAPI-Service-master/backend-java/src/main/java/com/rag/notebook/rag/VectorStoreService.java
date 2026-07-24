@@ -334,6 +334,9 @@ public class VectorStoreService {
         // 0. MD5去重检查：如果已存在相同MD5的文档，跳过重复写入
         if (documentRepository.existsByUserIdAndMd5(userId, md5)) {
             log.info("文档已存在（MD5重复），跳过写入: userId={}, md5={}, filename={}", userId, md5, filename);
+            if (progressCallback != null) {
+                progressCallback.accept("skipping", originalFilename);
+            }
             return;
         }
 
@@ -512,7 +515,9 @@ public class VectorStoreService {
         // 1. 先查找文档
         Optional<KnowledgeDocument> docOpt = documentRepository.findByUserIdAndFilename(userId, filename);
         if (docOpt.isEmpty()) {
-            log.warn("文档不存在: userId={}, filename={}", userId, filename);
+            log.warn("MySQL文档不存在，尝试清理MD5记录: userId={}, filename={}", userId, filename);
+            // 即使MySQL记录不存在，也要清理MD5记录（防止残留）
+            cleanMd5ByFilename(userId, filename);
             return;
         }
 
@@ -542,6 +547,19 @@ public class VectorStoreService {
         md5Store.deleteByMd5(md5, userId);
 
         log.info("文档删除成功: userId={}, filename={}, docId={}, md5={}, chromaDeleted={}", userId, filename, docId, md5, chromaDeleted);
+    }
+
+    /**
+     * 根据文件名清理 MD5 记录（用于 MySQL 记录已不存在的情况）
+     */
+    private void cleanMd5ByFilename(String userId, String filename) {
+        List<Map<String, String>> records = md5Store.getUserRecords(userId);
+        for (Map<String, String> record : records) {
+            if (filename.equals(record.get("filename")) || filename.equals(record.get("original_filename"))) {
+                md5Store.deleteByMd5(record.get("md5"), userId);
+                log.info("已清理残留MD5记录: filename={}, md5={}", filename, record.get("md5"));
+            }
+        }
     }
 
     /**
@@ -809,7 +827,13 @@ public class VectorStoreService {
     public List<Map<String, Object>> getUserDocuments(String userId) {
         List<KnowledgeDocument> documents = documentRepository.findByUserIdOrderByCreatedAtDesc(userId);
 
-        return documents.stream().map(doc -> {
+        // 同时检查 MD5 store，补充可能遗漏的文档
+        List<Map<String, String>> md5Records = md5Store.getUserRecords(userId);
+        Set<String> existingMd5s = documents.stream()
+                .map(KnowledgeDocument::getMd5)
+                .collect(java.util.stream.Collectors.toSet());
+
+        List<Map<String, Object>> result = new ArrayList<>(documents.stream().map(doc -> {
             Map<String, Object> docMap = new HashMap<>();
             docMap.put("id", doc.getId());
             docMap.put("md5", doc.getMd5());
@@ -822,7 +846,28 @@ public class VectorStoreService {
             docMap.put("status", doc.getStatus());
             docMap.put("createdAt", doc.getCreatedAt());
             return docMap;
-        }).toList();
+        }).toList());
+
+        // 补充 MD5 store 中存在但 MySQL 中不存在的文档
+        for (Map<String, String> md5Record : md5Records) {
+            String md5 = md5Record.get("md5");
+            if (!existingMd5s.contains(md5)) {
+                Map<String, Object> docMap = new HashMap<>();
+                docMap.put("id", md5);
+                docMap.put("md5", md5);
+                docMap.put("filename", md5Record.get("filename"));
+                docMap.put("originalFilename", md5Record.get("original_filename"));
+                docMap.put("userId", userId);
+                docMap.put("chunkCount", 0);
+                docMap.put("preview", null);
+                docMap.put("fileSize", 0L);
+                docMap.put("status", "unknown");
+                docMap.put("createdAt", null);
+                result.add(docMap);
+            }
+        }
+
+        return result;
     }
 
     public Map<String, Object> getDocumentDetail(String userId, String filename) {

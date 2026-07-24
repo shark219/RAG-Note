@@ -46,6 +46,7 @@ public class AgentService {
     private final SupervisorService supervisorService;
     private final WriterService writerService;
     private final TokenCounter tokenCounter;
+    private final AgentLoop agentLoop;
     private final List<ToolSpecification> toolSpecifications;
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
@@ -56,7 +57,8 @@ public class AgentService {
                         QualityReviewer qualityReviewer,
                         SupervisorService supervisorService,
                         WriterService writerService,
-                        TokenCounter tokenCounter) {
+                        TokenCounter tokenCounter,
+                        AgentLoop agentLoop) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
         this.chatService = chatService;
@@ -68,6 +70,7 @@ public class AgentService {
         this.supervisorService = supervisorService;
         this.writerService = writerService;
         this.tokenCounter = tokenCounter;
+        this.agentLoop = agentLoop;
         // 从 @Tool 注解自动提取工具定义
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
@@ -76,8 +79,12 @@ public class AgentService {
     private static final Set<String> KNOWLEDGE_TOOLS = Set.of("ragSummary");
     // 笔记相关工具名
     private static final Set<String> NOTE_TOOLS = Set.of(
-            "searchNotes", "getNoteStats", "getTodayReviews",
-            "markReviewed", "createNote", "getRelatedNotes");
+            "searchNotes", "getRecentNotes", "getNoteStats", "getTodayReviews",
+            "markReviewed", "createNote", "editNote", "appendNote", "deleteNote",
+            "getRelatedNotes", "mergeNotes", "scheduleReview");
+    // 通用工具名（不受开关控制）
+    private static final Set<String> UTILITY_TOOLS = Set.of(
+            "whatTimeIsNow", "fetchUrl", "generateDiagram");
 
     /**
      * 根据用户开关过滤工具列表
@@ -138,12 +145,20 @@ public class AgentService {
 
                 String response;
                 if (subTasks.size() < 2) {
-                    // 简单查询或单子任务：走原有单 Agent 流程（更快）
-                    List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
-                    messages.add(SystemMessage.from(loadSystemPrompt()));
-                    messages.addAll(historyMessages);
-                    messages.add(UserMessage.from(queryWithContext));
-                    response = processWithFunctionCalling(messages, userId, emitter, sessionId, query, activeTools);
+                    // 简单查询或单子任务：使用 Agent Loop（LLM 自主决策）
+                    String systemPrompt = loadSystemPrompt();
+
+                    // 如果 Supervisor 给出了工具提示，注入到系统提示中
+                    String forceToolHint = null;
+                    String forceToolDesc = null;
+                    if (!subTasks.isEmpty() && subTasks.get(0).getToolHint() != null) {
+                        forceToolHint = subTasks.get(0).getToolHint();
+                        forceToolDesc = subTasks.get(0).getDescription();
+                        systemPrompt += "\n\n[重要] 上级建议调用 " + forceToolHint + " 工具，描述：" + forceToolDesc;
+                        log.info("注入 Supervisor 工具提示: tool={}, desc={}", forceToolHint, forceToolDesc);
+                    }
+
+                    response = agentLoop.run(systemPrompt, queryWithContext, historyMessages, userId, activeTools, emitter, forceToolHint, forceToolDesc);
                 } else {
                     // 复杂查询：走多 Agent 流水线
                     response = executePipeline(subTasks, query, userId, emitter);
@@ -306,10 +321,19 @@ public class AgentService {
                 + "任务描述：" + task.getDescription() + "\n"
                 + "\n可用工具说明："
                 + "\n- searchNotes(query): 搜索用户的笔记，传入搜索关键词"
+                + "\n- getRecentNotes(count): 获取最近编辑的笔记"
                 + "\n- ragSummary(query): 从知识库检索文档，传入查询内容"
                 + "\n- getNoteStats(): 获取笔记统计（无需参数）"
                 + "\n- getTodayReviews(): 获取今日复习（无需参数）"
                 + "\n- createNote(title, content): 创建笔记"
+                + "\n- editNote(noteId, title, content): 编辑笔记"
+                + "\n- appendNote(noteId, appendContent): 向笔记追加内容"
+                + "\n- deleteNote(noteId): 删除笔记"
+                + "\n- mergeNotes(noteIds, newTitle): 合并多篇笔记"
+                + "\n- getRelatedNotes(noteId): 查找相关笔记"
+                + "\n- fetchUrl(url): 抓取网页内容"
+                + "\n- generateDiagram(type, description): 生成图表"
+                + "\n- scheduleReview(noteId, days): 安排复习"
                 + "\n- whatTimeIsNow(): 获取当前时间"
                 + (task.getToolHint() != null ? "\n\n必须使用工具: " + task.getToolHint() : "")
                 + "\n\n请直接调用工具执行任务，不要自己编造内容。";
@@ -360,6 +384,7 @@ public class AgentService {
                 String toolNames = aiMessage.toolExecutionRequests().stream()
                         .map(ToolExecutionRequest::name)
                         .reduce((a, b) -> a + ", " + b).orElse("");
+                log.info("LLM 请求调用工具: {}", toolNames);
 
                 sendSseEvent(emitter, "thinking", Map.of(
                         "stage", "tool_call",
@@ -388,6 +413,7 @@ public class AgentService {
             } else {
                 // LLM 不需要调工具，返回文本前做质量审查
                 String answer = aiMessage.text();
+                log.info("LLM 未调用工具，直接返回文本 (前100字): {}", answer.length() > 100 ? answer.substring(0, 100) + "..." : answer);
                 return reviewAndRetryIfNeeded(chatModel, messages, answer, emitter, query);
             }
         }
@@ -464,11 +490,35 @@ public class AgentService {
                 case "ragSummary" -> agentTools.ragSummary(args.getOrDefault("query", ""), userId);
                 case "searchNotes" -> agentTools.searchNotes(args.getOrDefault("query", ""), userId);
                 case "getNoteStats" -> agentTools.getNoteStats(userId);
+                case "getRecentNotes" -> agentTools.getRecentNotes(
+                        args.getOrDefault("count", "3"), userId);
                 case "getTodayReviews" -> agentTools.getTodayReviews(userId);
                 case "markReviewed" -> agentTools.markReviewed(args.getOrDefault("noteId", ""), userId);
                 case "createNote" -> agentTools.createNote(
                         args.getOrDefault("title", ""), args.getOrDefault("content", ""), userId);
+                case "editNote" -> agentTools.editNote(
+                        args.getOrDefault("noteId", ""),
+                        args.getOrDefault("title", ""),
+                        args.getOrDefault("content", ""),
+                        userId);
+                case "appendNote" -> agentTools.appendNote(
+                        args.getOrDefault("noteId", ""),
+                        args.getOrDefault("appendContent", ""),
+                        userId);
+                case "deleteNote" -> agentTools.deleteNote(args.getOrDefault("noteId", ""), userId);
                 case "getRelatedNotes" -> agentTools.getRelatedNotes(args.getOrDefault("noteId", ""), userId);
+                case "mergeNotes" -> agentTools.mergeNotes(
+                        args.getOrDefault("noteIds", ""),
+                        args.getOrDefault("newTitle", "合并笔记"),
+                        userId);
+                case "fetchUrl" -> agentTools.fetchUrl(args.getOrDefault("url", ""));
+                case "generateDiagram" -> agentTools.generateDiagram(
+                        args.getOrDefault("type", "flowchart"),
+                        args.getOrDefault("description", ""));
+                case "scheduleReview" -> agentTools.scheduleReview(
+                        args.getOrDefault("noteId", ""),
+                        args.getOrDefault("days", "1"),
+                        userId);
                 case "whatTimeIsNow" -> agentTools.whatTimeIsNow();
                 default -> "未知工具: " + toolName;
             };
@@ -479,22 +529,19 @@ public class AgentService {
     }
 
     /**
-     * 解析工具调用的 JSON 参数
+     * 解析工具调用的 JSON 参数（使用 Jackson，正确处理 \n \t 等转义）
      */
-    private Map<String, String> parseToolArguments(String json) {
+    static Map<String, String> parseToolArguments(String json) {
         Map<String, String> result = new HashMap<>();
         if (json == null || json.isBlank()) return result;
         try {
-            json = json.trim();
-            if (json.startsWith("{") && json.endsWith("}")) {
-                json = json.substring(1, json.length() - 1);
-                for (String pair : json.split(",")) {
-                    String[] kv = pair.split(":", 2);
-                    if (kv.length == 2) {
-                        String key = kv[0].trim().replace("\"", "");
-                        String value = kv[1].trim().replace("\"", "");
-                        result.put(key, value);
-                    }
+            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            com.fasterxml.jackson.databind.JsonNode node = mapper.readTree(json.trim());
+            if (node.isObject()) {
+                var fields = node.fields();
+                while (fields.hasNext()) {
+                    var entry = fields.next();
+                    result.put(entry.getKey(), entry.getValue().asText());
                 }
             }
         } catch (Exception e) {

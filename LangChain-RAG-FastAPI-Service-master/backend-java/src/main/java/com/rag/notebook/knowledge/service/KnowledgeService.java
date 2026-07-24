@@ -57,9 +57,13 @@ public class KnowledgeService {
         CompletableFuture.runAsync(() -> {
             int successCount = 0;
             int failedCount = 0;
+            int skippedCount = 0;
 
             try {
                 for (MultipartFile file : files) {
+                    final boolean[] wasSkipped = {false};
+                    final boolean[] wasError = {false};
+
                     processUploadedFile(userId, file, (stage, data) -> {
                         try {
                             // 构建前端期望的事件格式
@@ -67,6 +71,18 @@ public class KnowledgeService {
                             eventData.put("event_type", stage);
                             eventData.put("filename", file.getOriginalFilename());
                             eventData.put("message", data.toString());
+
+                            // 处理跳过事件（文档已存在）
+                            if ("skipping".equals(stage)) {
+                                eventData.put("event_type", "skipped");
+                                eventData.put("message", "文档已存在，跳过上传");
+                                wasSkipped[0] = true;
+                            }
+
+                            // 处理错误事件
+                            if ("error".equals(stage)) {
+                                wasError[0] = true;
+                            }
 
                             // 解析进度信息
                             String dataStr = data.toString();
@@ -90,7 +106,13 @@ public class KnowledgeService {
                         }
                     });
 
-                    successCount++;
+                    if (wasSkipped[0]) {
+                        skippedCount++;
+                    } else if (wasError[0]) {
+                        failedCount++;
+                    } else {
+                        successCount++;
+                    }
                 }
 
                 // 发送完成事件
@@ -98,6 +120,7 @@ public class KnowledgeService {
                 finishEvent.put("event_type", "finish");
                 finishEvent.put("success_count", successCount);
                 finishEvent.put("failed_count", failedCount);
+                finishEvent.put("skipped_count", skippedCount);
                 emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(finishEvent)));
                 emitter.complete();
             } catch (Exception e) {
@@ -107,6 +130,7 @@ public class KnowledgeService {
                     finishEvent.put("event_type", "finish");
                     finishEvent.put("success_count", successCount);
                     finishEvent.put("failed_count", failedCount);
+                    finishEvent.put("skipped_count", skippedCount);
                     emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(finishEvent)));
                 } catch (Exception ignored) {}
                 emitter.completeWithError(e);
@@ -183,22 +207,37 @@ public class KnowledgeService {
 
     public KnowledgeListResponse listDocuments(String userId) {
         List<Map<String, Object>> docs = vectorStoreService.getUserDocuments(userId);
-        List<KnowledgeDocument> documents = docs.stream()
-                .map(d -> {
-                    Object createdAt = d.get("createdAt");
-                    String createdAtStr = createdAt != null ? createdAt.toString() : null;
-                    return new KnowledgeDocument(
-                            (String) d.get("id"),
-                            (String) d.get("filename"),
-                            (String) d.get("originalFilename"),
-                            (String) d.get("userId"),
-                            (int) d.get("chunkCount"),
-                            (String) d.get("preview"),
-                            (String) d.get("status"),
-                            createdAtStr
-                    );
-                })
-                .toList();
+
+        List<KnowledgeDocument> documents = new ArrayList<>();
+        for (Map<String, Object> d : docs) {
+            try {
+                Object createdAt = d.get("createdAt");
+                String createdAtStr = createdAt != null ? createdAt.toString() : null;
+
+                Object chunkCountObj = d.get("chunkCount");
+                int chunkCount = 0;
+                if (chunkCountObj instanceof Integer) {
+                    chunkCount = (Integer) chunkCountObj;
+                } else if (chunkCountObj instanceof Long) {
+                    chunkCount = ((Long) chunkCountObj).intValue();
+                }
+
+                documents.add(new KnowledgeDocument(
+                        (String) d.get("id"),
+                        (String) d.get("filename"),
+                        (String) d.get("originalFilename"),
+                        (String) d.get("userId"),
+                        (String) d.get("md5"),
+                        chunkCount,
+                        (String) d.get("preview"),
+                        (String) d.get("status"),
+                        createdAtStr
+                ));
+            } catch (Exception e) {
+                log.warn("映射文档记录失败: {}, error: {}", d, e.getMessage());
+            }
+        }
+
         return new KnowledgeListResponse(documents, documents.size());
     }
 
