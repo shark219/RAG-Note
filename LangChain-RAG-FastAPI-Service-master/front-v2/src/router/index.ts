@@ -58,9 +58,7 @@ const routes: RouteRecordRaw[] = [
       },
       {
         path: 'evaluation',
-        name: 'Evaluation',
-        component: () => import('@/views/Evaluation.vue'),
-        meta: { title: '评估', icon: 'icon-bar-chart' }
+        redirect: '/system/debug',
       },
       {
         path: 'settings',
@@ -92,6 +90,12 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/system/SkillsManage.vue'),
         meta: { title: 'Skills 管理' }
       },
+      {
+        path: 'system/debug',
+        name: 'DebugEvaluation',
+        component: () => import('@/views/system/DebugEvaluation.vue'),
+        meta: { title: '开发者调试' }
+      },
     ]
   },
   {
@@ -106,7 +110,7 @@ const router = createRouter({
 })
 
 // 路由守卫
-router.beforeEach((to, from, next) => {
+router.beforeEach((to, _from, next) => {
   document.title = `${to.meta.title || 'RAG Note'} - AI 智能笔记`
 
   const token = localStorage.getItem('token')

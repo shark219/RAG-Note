@@ -175,5 +175,14 @@ export const evaluationApi = {
   getLowScores: () => api.get('/evaluation/low-scores'),
   generateTestCases: (count?: number) =>
     api.post('/evaluation/test-cases/generate', null, { params: { count: count || 10 } }),
+  getTestCases: () => api.get('/evaluation/test-cases'),
+  deleteTestCase: (id: number) => api.delete(`/evaluation/test-cases/${id}`),
+  deleteTestCases: (ids: number[]) => api.delete('/evaluation/test-cases/batch', { data: ids }),
+  dedupTestCases: () => api.post('/evaluation/test-cases/dedup'),
   runRegression: () => api.post('/evaluation/regression'),
+
+  // 消融实验
+  getAblationExperiments: () => api.get('/evaluation/ablation/experiments'),
+  runAblationAll: () => api.post('/evaluation/ablation/run-all'),
+  getAblationReport: () => api.get('/evaluation/ablation/report'),
 }

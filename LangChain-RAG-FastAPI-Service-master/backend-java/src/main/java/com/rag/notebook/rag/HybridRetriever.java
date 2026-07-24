@@ -1,5 +1,7 @@
 package com.rag.notebook.rag;
 
+import com.rag.notebook.config.ApplicationProperties;
+import com.rag.notebook.evaluation.dto.AblationConfig;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -14,6 +16,8 @@ import java.util.stream.Collectors;
  * 2. 每个查询版本分别执行：向量检索 + BM25 检索
  * 3. RRF 融合：将所有路的检索结果用 Reciprocal Rank Fusion 合并排序
  * 4. Cross-Encoder 精排：使用智谱 AI rerank API 重新打分 + 阈值过滤
+ *
+ * 支持消融实验：通过 AblationConfig 控制各组件开关
  */
 @Slf4j
 @Service
@@ -26,122 +30,173 @@ public class HybridRetriever {
     private final Bm25Service bm25Service;
     private final QueryExpander queryExpander;
     private final RerankerService rerankerService;
+    private final ApplicationProperties props;
 
     public HybridRetriever(VectorStoreService vectorStoreService,
                            Bm25Service bm25Service,
                            QueryExpander queryExpander,
-                           RerankerService rerankerService) {
+                           RerankerService rerankerService,
+                           ApplicationProperties props) {
         this.vectorStoreService = vectorStoreService;
         this.bm25Service = bm25Service;
         this.queryExpander = queryExpander;
         this.rerankerService = rerankerService;
+        this.props = props;
     }
 
+    // ==================== 公开接口（无消融配置，使用默认配置） ====================
+
+    public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK) {
+        return searchKnowledge(userId, query, topK, null);
+    }
+
+    public List<Map<String, Object>> searchNotes(String userId, String query, int topK) {
+        return searchNotes(userId, query, topK, null);
+    }
+
+    // ==================== 消融实验接口（接受 AblationConfig） ====================
+
     /**
-     * 混合检索知识库文档
+     * 混合检索知识库文档（支持消融实验）
      *
      * @param userId 用户ID
      * @param query  原始查询
      * @param topK   返回结果数
-     * @return RRF 融合 + 精排后的结果
+     * @param config 消融配置，null 表示使用完整流水线
+     * @return 检索结果
      */
-    public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK) {
-        // 1. 多 Query 扩展
-        List<String> queries = queryExpander.expand(query);
-        log.info("知识库混合检索: 原始查询='{}', 扩展为 {} 个版本", truncate(query, 30), queries.size());
+    public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK, AblationConfig config) {
+        boolean expandQuery = isEnabled(config, c -> c.isQueryExpansionEnabled(), props.getAblation().getRag().isQueryExpansionEnabled());
+        boolean useVector = isEnabled(config, c -> c.isVectorSearchEnabled(), props.getAblation().getRag().isVectorSearchEnabled());
+        boolean useBm25 = isEnabled(config, c -> c.isBm25SearchEnabled(), props.getAblation().getRag().isBm25SearchEnabled());
+        boolean useRrf = isEnabled(config, c -> c.isRrfFusionEnabled(), props.getAblation().getRag().isRrfFusionEnabled());
+        boolean useRerank = isEnabled(config, c -> c.isRerankEnabled(), props.getAblation().getRag().isRerankEnabled());
+        int effectiveTopK = config != null && config.getTopK() != null ? config.getTopK() : topK;
 
-        // 2. 收集所有路的检索结果
+        // 1. Query 扩展
+        List<String> queries = expandQuery
+                ? queryExpander.expand(query)
+                : List.of(query);
+        log.info("知识库混合检索: query='{}', expand={}, vector={}, bm25={}, rrf={}, rerank={}, queries={}",
+                truncate(query, 30), expandQuery, useVector, useBm25, useRrf, useRerank, queries.size());
+
+        // 2. 收集各路检索结果
         List<List<Map<String, Object>>> allRankings = new ArrayList<>();
 
         for (String q : queries) {
-            // 向量检索
-            List<Map<String, Object>> vectorResults = vectorStoreService.searchKnowledge(userId, q, topK * 2);
-            allRankings.add(vectorResults);
-
-            // BM25 检索
-            List<Map<String, Object>> bm25Results = bm25Service.search(userId, q, topK * 2);
-            bm25Results = bm25Results.stream()
-                    .filter(r -> "knowledge_base".equals(r.get("source")))
-                    .collect(Collectors.toList());
-            allRankings.add(bm25Results);
+            if (useVector) {
+                List<Map<String, Object>> vectorResults = vectorStoreService.searchKnowledge(userId, q, effectiveTopK * 2);
+                allRankings.add(vectorResults);
+            }
+            if (useBm25) {
+                List<Map<String, Object>> bm25Results = bm25Service.search(userId, q, effectiveTopK * 2);
+                bm25Results = bm25Results.stream()
+                        .filter(r -> "knowledge_base".equals(r.get("source")))
+                        .collect(Collectors.toList());
+                allRankings.add(bm25Results);
+            }
         }
 
-        // 3. RRF 融合
-        List<Map<String, Object>> fused = rrfFusion(allRankings, topK * 2);
+        if (allRankings.isEmpty()) {
+            log.info("知识库混合检索: 无可用检索路径，返回空结果");
+            return List.of();
+        }
 
-        // 4. Cross-Encoder 精排 + 动态 top-N
-        fused = rerankerService.rerank(query, fused);
+        // 3. 融合（RRF 或简单拼接）
+        List<Map<String, Object>> fused;
+        if (useRrf && allRankings.size() > 1) {
+            fused = rrfFusion(allRankings, effectiveTopK * 2);
+        } else {
+            fused = simpleMerge(allRankings, effectiveTopK * 2);
+        }
 
-        log.info("知识库混合检索完成: {} 个查询版本 × {}路, 精排后返回 {} 条",
+        // 4. Cross-Encoder 精排
+        if (useRerank) {
+            fused = rerankerService.rerank(query, fused);
+        } else {
+            fused = fused.stream().limit(effectiveTopK).collect(Collectors.toList());
+        }
+
+        log.info("知识库混合检索完成: {} 条查询 × {} 路, 最终返回 {} 条",
                 queries.size(), allRankings.size(), fused.size());
 
         return fused;
     }
 
     /**
-     * 混合检索笔记
+     * 混合检索笔记（支持消融实验）
      */
-    public List<Map<String, Object>> searchNotes(String userId, String query, int topK) {
-        List<String> queries = queryExpander.expand(query);
-        log.info("笔记混合检索: 原始查询='{}', 扩展为 {} 个版本", truncate(query, 30), queries.size());
+    public List<Map<String, Object>> searchNotes(String userId, String query, int topK, AblationConfig config) {
+        boolean expandQuery = isEnabled(config, c -> c.isQueryExpansionEnabled(), props.getAblation().getRag().isQueryExpansionEnabled());
+        boolean useVector = isEnabled(config, c -> c.isVectorSearchEnabled(), props.getAblation().getRag().isVectorSearchEnabled());
+        boolean useBm25 = isEnabled(config, c -> c.isBm25SearchEnabled(), props.getAblation().getRag().isBm25SearchEnabled());
+        boolean useRrf = isEnabled(config, c -> c.isRrfFusionEnabled(), props.getAblation().getRag().isRrfFusionEnabled());
+        boolean useRerank = isEnabled(config, c -> c.isRerankEnabled(), props.getAblation().getRag().isRerankEnabled());
+        int effectiveTopK = config != null && config.getTopK() != null ? config.getTopK() : topK;
+
+        List<String> queries = expandQuery
+                ? queryExpander.expand(query)
+                : List.of(query);
+        log.info("笔记混合检索: query='{}', expand={}, vector={}, bm25={}, rrf={}, rerank={}, queries={}",
+                truncate(query, 30), expandQuery, useVector, useBm25, useRrf, useRerank, queries.size());
 
         List<List<Map<String, Object>>> allRankings = new ArrayList<>();
 
         for (String q : queries) {
-            // 向量检索
-            List<Map<String, Object>> vectorResults = vectorStoreService.searchNotes(userId, q, topK * 2);
-            allRankings.add(vectorResults);
-
-            // BM25 检索
-            List<Map<String, Object>> bm25Results = bm25Service.search(userId, q, topK * 2);
-            bm25Results = bm25Results.stream()
-                    .filter(r -> "note".equals(r.get("source")))
-                    .collect(Collectors.toList());
-            allRankings.add(bm25Results);
+            if (useVector) {
+                List<Map<String, Object>> vectorResults = vectorStoreService.searchNotes(userId, q, effectiveTopK * 2);
+                allRankings.add(vectorResults);
+            }
+            if (useBm25) {
+                List<Map<String, Object>> bm25Results = bm25Service.search(userId, q, effectiveTopK * 2);
+                bm25Results = bm25Results.stream()
+                        .filter(r -> "note".equals(r.get("source")))
+                        .collect(Collectors.toList());
+                allRankings.add(bm25Results);
+            }
         }
 
-        // RRF 融合
-        List<Map<String, Object>> fused = rrfFusion(allRankings, topK * 2);
+        if (allRankings.isEmpty()) {
+            return List.of();
+        }
 
-        // Cross-Encoder 精排 + 动态 top-N
-        fused = rerankerService.rerank(query, fused);
+        List<Map<String, Object>> fused;
+        if (useRrf && allRankings.size() > 1) {
+            fused = rrfFusion(allRankings, effectiveTopK * 2);
+        } else {
+            fused = simpleMerge(allRankings, effectiveTopK * 2);
+        }
 
-        log.info("笔记混合检索完成: 精排后返回 {} 条", fused.size());
+        if (useRerank) {
+            fused = rerankerService.rerank(query, fused);
+        } else {
+            fused = fused.stream().limit(effectiveTopK).collect(Collectors.toList());
+        }
+
+        log.info("笔记混合检索完成: 最终返回 {} 条", fused.size());
 
         return fused;
     }
 
+    // ==================== 私有辅助方法 ====================
+
     /**
      * RRF (Reciprocal Rank Fusion) 融合算法
-     *
-     * 公式: score(d) = Σ 1/(k + rank_i(d))
-     * 其中 k=60 是常数，rank_i(d) 是文档 d 在第 i 路检索结果中的排名（从1开始）
-     *
-     * @param allRankings 所有路的检索结果列表
-     * @param topK        最终返回的结果数
-     * @return 融合后按 RRF 分数排序的结果
      */
     private List<Map<String, Object>> rrfFusion(List<List<Map<String, Object>>> allRankings, int topK) {
-        // RRF 分数累加器：key=文档唯一标识, value=RRF分数
         Map<String, Double> rrfScores = new HashMap<>();
-        // 文档内容缓存：key=文档唯一标识, value=文档数据
         Map<String, Map<String, Object>> docCache = new HashMap<>();
 
         for (List<Map<String, Object>> ranking : allRankings) {
             for (int rank = 0; rank < ranking.size(); rank++) {
                 Map<String, Object> doc = ranking.get(rank);
                 String docKey = getDocKey(doc);
-
-                // RRF 分数累加: 1/(k + rank)，rank 从 1 开始
                 double rrfScore = 1.0 / (RRF_K + rank + 1);
                 rrfScores.merge(docKey, rrfScore, Double::sum);
-
-                // 缓存文档内容（保留最高分的那份）
                 docCache.putIfAbsent(docKey, doc);
             }
         }
 
-        // 按 RRF 分数降序排序，取 top-K
         return rrfScores.entrySet().stream()
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
                 .limit(topK)
@@ -154,10 +209,25 @@ public class HybridRetriever {
     }
 
     /**
-     * 获取文档的唯一标识（用于 RRF 去重）
+     * 简单合并：去重 + 按原始相似度/分数排序（用于 RRF 被消融时）
      */
+    private List<Map<String, Object>> simpleMerge(List<List<Map<String, Object>>> allRankings, int topK) {
+        Map<String, Map<String, Object>> seen = new LinkedHashMap<>();
+        for (List<Map<String, Object>> ranking : allRankings) {
+            for (Map<String, Object> doc : ranking) {
+                String key = getDocKey(doc);
+                seen.putIfAbsent(key, doc);
+            }
+        }
+        return seen.values().stream()
+                .sorted((a, b) -> Double.compare(
+                        (double) b.getOrDefault("similarity", 0.0),
+                        (double) a.getOrDefault("similarity", 0.0)))
+                .limit(topK)
+                .collect(Collectors.toList());
+    }
+
     private String getDocKey(Map<String, Object> doc) {
-        // 优先用 chunk_id，其次用 docId，最后用 content 的哈希
         if (doc.containsKey("chunk_id")) return (String) doc.get("chunk_id");
         if (doc.containsKey("docId")) return (String) doc.get("docId");
         if (doc.containsKey("note_id")) return (String) doc.get("note_id");
@@ -166,5 +236,15 @@ public class HybridRetriever {
 
     private String truncate(String str, int maxLen) {
         return str != null && str.length() > maxLen ? str.substring(0, maxLen) + "..." : str;
+    }
+
+    /**
+     * 判断组件是否启用：优先使用 AblationConfig（实验模式），其次使用 application.yml 默认值
+     */
+    private boolean isEnabled(AblationConfig config, java.util.function.Function<AblationConfig, Boolean> getter, boolean defaultValue) {
+        if (config != null) {
+            return getter.apply(config);
+        }
+        return defaultValue;
     }
 }

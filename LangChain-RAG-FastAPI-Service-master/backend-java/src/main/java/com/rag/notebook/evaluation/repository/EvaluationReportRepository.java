@@ -15,6 +15,8 @@ public interface EvaluationReportRepository extends JpaRepository<EvaluationRepo
 
     Optional<EvaluationReport> findTopByTraceIdOrderByCreatedAtDesc(String traceId);
 
+    boolean existsByTraceId(String traceId);
+
     List<EvaluationReport> findByUserIdOrderByCreatedAtDesc(String userId);
 
     @Query("SELECT r FROM EvaluationReport r WHERE r.createdAt >= :start AND r.createdAt < :end ORDER BY r.createdAt DESC")

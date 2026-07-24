@@ -19,6 +19,7 @@ public class ApplicationProperties {
     private String extractedImagesDir = "data/extracted_images";
     private RateLimit rateLimit = new RateLimit();
     private Evaluation evaluation = new Evaluation();
+    private Ablation ablation = new Ablation();
 
     @Data
     public static class Jwt {
@@ -140,5 +141,34 @@ public class ApplicationProperties {
         private double contextPrecisionWeight = 0.25;
         private double contextRecallWeight = 0.2;
         private double sampleRate = 0.2;
+    }
+
+    @Data
+    public static class Ablation {
+        private RagAblation rag = new RagAblation();
+
+        @Data
+        public static class RagAblation {
+            /** 是否启用 Query 扩展 */
+            private boolean queryExpansionEnabled = true;
+            /** 是否启用向量检索（ChromaDB） */
+            private boolean vectorSearchEnabled = true;
+            /** 是否启用 BM25 关键词检索 */
+            private boolean bm25SearchEnabled = true;
+            /** 是否启用 RRF 融合 */
+            private boolean rrfFusionEnabled = true;
+            /** 是否启用 Cross-Encoder 精排 */
+            private boolean rerankEnabled = true;
+            /** 是否启用来源标注 */
+            private boolean sourceAttributionEnabled = true;
+            /** 是否启用检索质量审查 */
+            private boolean retrievalReviewEnabled = false;
+            /** Chunk 大小（消融实验可覆盖默认值） */
+            private Integer chunkSize;
+            /** Chunk 重叠量（消融实验可覆盖默认值） */
+            private Integer chunkOverlap;
+            /** Top-K 返回数量（消融实验可覆盖默认值） */
+            private Integer topK;
+        }
     }
 }
