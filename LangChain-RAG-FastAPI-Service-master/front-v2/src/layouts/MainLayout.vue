@@ -2,11 +2,15 @@
   <a-layout class="layout">
     <a-layout-sider
       :collapsed="appStore.collapsed"
-      :width="220"
-      :collapsed-width="60"
+      :width="170"
+      :collapsed-width="50"
       breakpoint="lg"
+      collapsible
+      :hide-trigger="true"
       @collapse="appStore.toggleCollapsed"
       class="sider"
+      @mouseenter="handleMouseEnter"
+      @mouseleave="handleMouseLeave"
     >
       <div class="logo">
         <icon-book />
@@ -60,12 +64,6 @@
           </a-menu-item>
         </a-sub-menu>
       </a-menu>
-      <template #trigger>
-        <div class="trigger" @click="appStore.toggleCollapsed">
-          <icon-menu-fold v-if="!appStore.collapsed" />
-          <icon-menu-unfold v-else />
-        </div>
-      </template>
     </a-layout-sider>
     <a-layout>
       <a-layout-header class="header">
@@ -99,7 +97,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAppStore } from '@/store/app'
 import { useUserStore } from '@/store/user'
@@ -110,8 +108,6 @@ import {
   IconCalendar,
   IconBarChart,
   IconSettings,
-  IconMenuFold,
-  IconMenuUnfold,
   IconMoonFill,
   IconSunFill,
   IconUser,
@@ -126,6 +122,11 @@ const appStore = useAppStore()
 const userStore = useUserStore()
 
 const openKeys = ref<string[]>([])
+
+// 强制刷新后侧边栏收起
+onMounted(() => {
+  appStore.collapsed = true
+})
 
 const menuTitleMap: Record<string, string> = {
   '/notes': '笔记',
@@ -167,6 +168,19 @@ function handleSubMenuClick(key: string) {
   }
 }
 
+let hoverTimer: ReturnType<typeof setTimeout> | null = null
+
+function handleMouseEnter() {
+  if (hoverTimer) clearTimeout(hoverTimer)
+  appStore.collapsed = false
+}
+
+function handleMouseLeave() {
+  hoverTimer = setTimeout(() => {
+    appStore.collapsed = true
+  }, 1200)
+}
+
 function handleLogout() {
   userStore.logout()
   router.push('/login')
@@ -193,19 +207,40 @@ function handleLogout() {
   font-weight: 600;
   color: var(--color-primary);
   border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+  overflow: hidden;
 }
 
-.trigger {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 48px;
-  cursor: pointer;
-  border-top: 1px solid var(--color-border);
+.sider :deep(.arco-menu-collapsed) {
+  width: 50px;
 }
 
-.trigger:hover {
-  color: var(--color-primary);
+
+/* 收起时所有菜单项居中对齐 */
+.sider :deep(.arco-menu-collapsed) :deep(.arco-menu-item) {
+  display: flex !important;
+  justify-content: center !important;
+  padding: 0 !important;
+}
+
+.sider :deep(.arco-menu-collapsed) :deep(.arco-menu-icon) {
+  margin: 0 !important;
+}
+
+/* 收起时隐藏子菜单箭头 */
+.sider :deep(.arco-menu-collapsed) :deep(.arco-menu-icon-suffix) {
+  display: none !important;
+}
+
+.sider :deep(.arco-menu-collapsed) :deep(.arco-menu-inline-header) {
+  display: flex !important;
+  justify-content: center !important;
+  padding: 0 !important;
+}
+
+/* 隐藏内置折叠按钮 */
+.sider :deep(.arco-menu-collapse-button) {
+  display: none;
 }
 
 .header {

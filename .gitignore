@@ -11,10 +11,14 @@ replay_pid*
 .mvn/wrapper/maven-wrapper.jar
 
 # ==================== Node / Vue ====================
-front/node_modules/
-front/dist/
-front/package-lock.json
-front/pnpm-lock.yaml
+LangChain-RAG-FastAPI-Service-master/front/node_modules/
+LangChain-RAG-FastAPI-Service-master/front/dist/
+LangChain-RAG-FastAPI-Service-master/front/package-lock.json
+LangChain-RAG-FastAPI-Service-master/front/pnpm-lock.yaml
+LangChain-RAG-FastAPI-Service-master/front-v2/node_modules/
+LangChain-RAG-FastAPI-Service-master/front-v2/dist/
+LangChain-RAG-FastAPI-Service-master/front-v2/package-lock.json
+.vite/
 
 # ==================== Claude Code ====================
 .claude/

@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
 export const useAppStore = defineStore('app', () => {
-  const collapsed = ref(false)
+  const collapsed = ref(true)
   const theme = ref<'light' | 'dark'>('light')
   const locale = ref('zh-CN')
 
@@ -12,7 +12,6 @@ export const useAppStore = defineStore('app', () => {
 
   function setTheme(t: 'light' | 'dark') {
     theme.value = t
-    document.documentElement.setAttribute('data-theme', t)
   }
 
   function toggleTheme() {
@@ -30,6 +29,6 @@ export const useAppStore = defineStore('app', () => {
 }, {
   persist: {
     key: 'rag-note-app',
-    pick: ['theme', 'locale', 'collapsed'],
+    pick: ['theme', 'locale'],
   }
 })

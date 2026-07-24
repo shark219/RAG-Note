@@ -89,11 +89,24 @@ async function handleRegister() {
 }
 
 .register-card {
-  width: 400px;
+  width: 100%;
+  max-width: 400px;
   padding: 40px;
   background: var(--color-bg-1);
   border-radius: 12px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+  margin: 16px;
+}
+
+@media (max-width: 480px) {
+  .register-card {
+    padding: 24px;
+    margin: 12px;
+  }
+
+  .register-header h1 {
+    font-size: 24px;
+  }
 }
 
 .register-header {

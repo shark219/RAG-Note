@@ -5,6 +5,26 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RAG Note - AI 智能笔记</title>
+    <script>
+      (function() {
+        try {
+          var stored = JSON.parse(localStorage.getItem('rag-note-app'));
+          if (stored && stored.theme === 'dark') {
+            var html = document.documentElement;
+            html.className = 'dark';
+            html.setAttribute('data-theme', 'dark');
+            var setArcoTheme = function() {
+              document.body.setAttribute('arco-theme', 'dark');
+            };
+            if (document.body) {
+              setArcoTheme();
+            } else {
+              document.addEventListener('DOMContentLoaded', setArcoTheme);
+            }
+          }
+        } catch(e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

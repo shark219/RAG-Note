@@ -44,18 +44,20 @@ export const userApi = {
 }
 
 export const noteApi = {
-  list: (params?: { page?: number; size?: number }) =>
+  list: (params?: { page?: number; pageSize?: number; category?: string }) =>
     api.get('/note/list', { params }),
   get: (id: string) => api.get(`/note/${id}`),
-  create: (data: { title: string; content: string }) =>
+  create: (data: { title: string; content: string; category?: string }) =>
     api.post('/note/create', data),
   update: (id: string, data: { title: string; content: string }) =>
     api.put(`/note/${id}`, data),
   delete: (id: string) => api.delete(`/note/${id}`),
-  search: (params: { query: string }) =>
-    api.get('/note/search', { params }),
+  search: (q: string) =>
+    api.get('/note/search', { params: { q } }),
   assist: (data: { content: string; action: string }) =>
     api.post('/note/assist/stream', data),
+  getRelated: (id: string) => api.get(`/note/${id}/related`),
+  autoTag: (id: string) => api.post(`/note/${id}/auto-tag`),
 }
 
 export const chatApi = {
@@ -102,7 +104,7 @@ export const chatApi = {
   getDefaultPrompt: () => api.get('/chat/prompts/default'),
 
   // 流式对话
-  sendStream: (data: { query: string; session_id?: string }) =>
+  sendStream: (data: { query: string; sessionId?: string; regenerate?: boolean; enableKnowledge?: boolean; enableNotes?: boolean; fileIds?: string[] }) =>
     fetch('/api/chat/agent/query/stream', {
       method: 'POST',
       headers: {
@@ -129,16 +131,49 @@ export const knowledgeApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
   },
-  clean: () => api.post('/knowledge/clean'),
+  uploadMultipleStream: (files: File[]) => {
+    const formData = new FormData()
+    files.forEach((file) => formData.append('files', file))
+    return fetch('/api/knowledge/add/multiple/stream', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${localStorage.getItem('token')}`,
+      },
+      body: formData,
+    })
+  },
+  clean: () => api.delete('/knowledge/clean'),
+  getDetail: (filename: string) =>
+    api.get('/knowledge/detail', { params: { filename } }),
+  getChunks: (filename: string) =>
+    api.get('/knowledge/chunks', { params: { filename } }),
+  deleteByFilename: (filename: string) =>
+    api.delete('/knowledge/delete/filename', { params: { filename } }),
+  retryVectorization: (docId: string) =>
+    api.post(`/knowledge/retry-vectorization/${docId}`),
+  getBatchImages: (md5: string) =>
+    api.get(`/knowledge/images/all/${md5}`),
 }
 
 export const reviewApi = {
   getToday: () => api.get('/review/today'),
   markDone: (noteId: string) => api.post(`/review/done/${noteId}`),
+  getQuestion: (noteId: string) => api.get(`/review/question/${noteId}`),
 }
 
 export const evaluationApi = {
   getStats: () => api.get('/evaluation/stats'),
-  getReports: () => api.get('/evaluation/reports'),
-  runBatch: () => api.post('/evaluation/batch'),
+  getReports: (params?: { page?: number; size?: number }) =>
+    api.get('/evaluation/reports', { params }),
+  getReport: (traceId: string) => api.get(`/evaluation/report/${traceId}`),
+  runBatch: (days?: number) => api.post('/evaluation/batch', null, { params: { days: days || 0 } }),
+  submitFeedback: (data: { traceId: string; score: number; reason?: string }) =>
+    api.post('/evaluation/feedback', data),
+  getTrend: (days?: number) => api.get('/evaluation/trend', { params: { days: days || 14 } }),
+  getDistribution: (days?: number) => api.get('/evaluation/distribution', { params: { days: days || 30 } }),
+  getDiagnosisStats: (days?: number) => api.get('/evaluation/diagnosis-stats', { params: { days: days || 30 } }),
+  getLowScores: () => api.get('/evaluation/low-scores'),
+  generateTestCases: (count?: number) =>
+    api.post('/evaluation/test-cases/generate', null, { params: { count: count || 10 } }),
+  runRegression: () => api.post('/evaluation/regression'),
 }

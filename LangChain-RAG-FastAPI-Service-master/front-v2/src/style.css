@@ -1,3 +1,4 @@
+/* ========== CSS 自定义属性 ========== */
 :root {
   --color-bg-1: #fff;
   --color-bg-2: #f7f8fa;
@@ -8,22 +9,29 @@
   --color-border: #e5e6eb;
   --color-primary: #165dff;
   --color-primary-light: #e8f3ff;
+  --color-danger: #f53f3f;
+  --color-success: #00b42a;
+  --color-warning: #ff7d00;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-2: 0 4px 10px rgba(0, 0, 0, 0.08);
   --sidebar-width: 240px;
   --header-height: 60px;
 }
 
-[data-theme="dark"] {
-  --color-bg-1: #17171a;
-  --color-bg-2: #232324;
-  --color-bg-3: #2a2a2b;
-  --color-text-1: #f0f0f0;
-  --color-text-2: #b0b0b0;
-  --color-text-3: #707070;
-  --color-border: #3a3a3b;
+/* Arco Design 通过 body[arco-theme='dark'] 处理深色模式组件样式，
+   这里只补充项目特有的自定义变量 */
+[data-theme="dark"],
+html.dark {
   --color-primary: #3c7eff;
   --color-primary-light: #1a2a4a;
+  --color-danger: #f76965;
+  --color-success: #349a3e;
+  --color-warning: #ffa445;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-2: 0 4px 10px rgba(0, 0, 0, 0.3);
 }
 
+/* ========== 全局基础样式 ========== */
 * {
   box-sizing: border-box;
 }
@@ -34,6 +42,7 @@ body {
     'Noto Color Emoji';
   background-color: var(--color-bg-2);
   color: var(--color-text-1);
+  transition: background-color 0.3s, color 0.3s;
 }
 
 .page-container {
@@ -46,5 +55,37 @@ body {
   background: var(--color-bg-1);
   border-radius: 8px;
   padding: 16px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  box-shadow: var(--shadow-1);
+}
+
+/* ========== 深色模式 — 仅保留 Arco 未覆盖的样式 ========== */
+
+/* 滚动条 */
+html.dark ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+html.dark ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+html.dark ::-webkit-scrollbar-thumb {
+  background: #4a4a4b;
+  border-radius: 3px;
+}
+
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background: #5a5a5b;
+}
+
+/* 链接 */
+html.dark a {
+  color: var(--color-primary);
+}
+
+/* 选中文本 */
+html.dark ::selection {
+  background: rgba(60, 126, 255, 0.3);
+  color: #fff;
 }
