@@ -1666,8 +1666,807 @@ Java 后端 → HTTP 请求 → Python Flask/FastAPI 服务 → RAGAS 库
 4. 零额外运维成本
 5. 测试数据集也可以用 LLM 自动生成，不需要手动创建
 # 十、利用 RAGAS 设计消融实验
-对比向量 + BM25+RRF+Cross-Encoder」检索链路优化效果
 
+> 消融实验（Ablation Study）：通过系统性移除/禁用流水线中的某个组件，对比完整流水线与消融后的性能差异，量化每个环节对最终检索与生成质量的贡献度。评估框架基于第九章的 RAGAS 四指标体系（Faithfulness、Answer Relevancy、Context Precision、Context Recall）。
 
+## 10.1 消融实验总览
 
+### 10.1.1 当前系统完整流水线
 
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          AGENT PIPELINE（完整链路）                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  User Query                                                                 │
+│    │                                                                        │
+│    ▼                                                                        │
+│  ┌──────────────────────┐                                                   │
+│  │ 1. Attachment Context│  附件上下文注入（上传文件内容拼入 query）            │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ 2. ContextManager    │  三层压缩：工具结果压缩 → 摘要压缩 → 保留最近 5 条   │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ 3. Tool Filtering    │  按用户偏好启用/禁用知识库工具 & 笔记工具            │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ 4. Supervisor Plan   │  LLM 分析查询复杂度，拆分为 0~4 个子任务             │
+│  └──────────┬───────────┘                                                   │
+│             │                                                               │
+│     ┌───────┴──────────┐                                                    │
+│     ▼                  ▼                                                    │
+│  subtasks < 2       subtasks >= 2                                           │
+│  (简单查询)          (复杂查询)                                               │
+│     │                  │                                                    │
+│     ▼                  ▼                                                    │
+│  ┌────────────┐   ┌──────────────────────┐                                  │
+│  │ AgentLoop  │   │ Multi-Agent Pipeline  │                                  │
+│  │ (ReAct)    │   │ ┌──────────────────┐ │                                  │
+│  │            │   │ │ Parallel Subtasks │ │                                  │
+│  │ Think→Act  │   │ │  (each 2-round   │ │                                  │
+│  │  →Observe  │   │ │   Function Call)  │ │                                  │
+│  │  →Reflect  │   │ └────────┬─────────┘ │                                  │
+│  │            │   │          ▼           │                                  │
+│  │ max 10轮   │   │ ┌──────────────────┐ │                                  │
+│  │            │   │ │ WriterService    │ │                                  │
+│  │            │   │ │  synthesize()    │ │                                  │
+│  │            │   │ └────────┬─────────┘ │                                  │
+│  └─────┬──────┘   └──────────┬──────────┘                                  │
+│        │                     │                                              │
+│        └──────────┬──────────┘                                              │
+│                   ▼                                                         │
+│  ┌──────────────────────────┐                                               │
+│  │ 5. QualityReviewer       │  回答质量审查：不达标则注入反馈重试一次           │
+│  │    reviewAnswer()        │                                               │
+│  └──────────┬───────────────┘                                               │
+│             ▼                                                               │
+│        Final Answer                                                         │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                           RAG PIPELINE（Tool 调用时触发）                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  User Query                                                                 │
+│    │                                                                        │
+│    ▼                                                                        │
+│  ┌──────────────────────┐                                                   │
+│  │ A. QueryExpander     │  LLM 将 1 个查询扩展为 3 个语义等价变体（temp=0.8）  │
+│  └──────────┬───────────┘                                                   │
+│             │                                                               │
+│             ▼  (对每个 query variant 并行执行)                                │
+│  ┌──────────────────────┐  ┌──────────────────────┐                         │
+│  │ B. Vector Search     │  │ C. BM25 Search        │                         │
+│  │ (ChromaDB 语义检索)   │  │ (Lucene 关键词检索)    │                         │
+│  └──────────┬───────────┘  └──────────┬───────────┘                         │
+│             │                         │                                     │
+│             └──────────┬──────────────┘                                     │
+│                        ▼                                                    │
+│  ┌──────────────────────┐                                                   │
+│  │ D. RRF Fusion        │  Reciprocal Rank Fusion (k=60) 融合多路排序结果    │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ E. Cross-Encoder     │  智谱 AI Rerank API 精排 + 动态阈值过滤             │
+│  │    Rerank             │  score>0.7 全留, 0.5~0.7 最多2条, <0.5 丢弃       │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ F. Source Attribution│  给每篇文档加 [来源：笔记/知识库《title》] 前缀       │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ G. Context Building  │  拼接 context + user prompt                        │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ H. LLM Generation    │  System Prompt（禁止编造）→ LLM 生成回答            │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ I. QualityReviewer   │  检索质量审查 + 回答审查，不达标则改写查询重试        │
+│  │    reviewRetrieval() │                                                   │
+│  └──────────┬───────────┘                                                   │
+│             ▼                                                               │
+│  ┌──────────────────────┐                                                   │
+│  │ J. Trace Recording   │  记录检索延迟、生成延迟、相似度、文档数等              │
+│  └──────────────────────┘                                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.1.2 消融实验设计原则
+
+| 原则 | 说明 |
+|------|------|
+| **单一变量** | 每次只移除/禁用一个组件，其余保持不变 |
+| **相同测试集** | 所有实验变体使用同一批测试用例，确保可比性 |
+| **统计显著性** | 每个变体至少运行 50+ 条测试用例，报告均值 ± 标准差 |
+| **冷启动复用** | 消融变体间共享检索缓存，避免重复 LLM 调用 |
+| **可复现性** | 固定 LLM temperature=0，固定随机种子，记录完整配置快照 |
+
+---
+
+## 10.2 Agent 各环节消融实验
+
+### 实验 A-1：移除 Supervisor 规划（w/o Supervisor Plan）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 跳过 `SupervisorService.plan()`，所有查询直接走 AgentLoop（ReAct 循环） |
+| **对照基线** | 完整 Agent 流水线（Supervisor 自动判断简单/复杂查询） |
+| **预期影响** | 复杂多步骤查询（如"对比笔记A和笔记B，然后创建一个总结笔记"）的处理质量下降；简单查询无影响 |
+| **关注指标** | Context Recall（复杂查询可能遗漏信息）、Answer Relevancy（回答是否覆盖所有子问题） |
+| **实施方式** | 配置开关 `agent.supervisor.enabled=false`，强制 `subTasks.size() < 2` 分支 |
+
+### 实验 A-2：移除 AgentLoop 反思机制（w/o ToolResultEvaluator）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 移除 `ToolResultEvaluator`，工具结果不再进行规则评估和反思注入 |
+| **对照基线** | 完整 AgentLoop（质量评估 + POOR 时反思消息注入） |
+| **预期影响** | 工具返回空结果或低质量结果时，LLM 缺乏自我纠正线索，可能直接编造回答或放弃 |
+| **关注指标** | Faithfulness（编造风险上升）、Answer Relevancy（无结果时可能答非所问） |
+| **实施方式** | 配置开关 `agent.reflection.enabled=false`，跳过 `evaluator.evaluate()` 和反思消息注入 |
+
+### 实验 A-3：移除上下文压缩（w/o ContextManager Compression）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | ContextManager 仅做消息格式转换，不执行三层压缩（工具结果压缩、摘要压缩、保留最近 5 条） |
+| **对照基线** | 完整三层压缩策略（32K token 预算） |
+| **预期影响** | 长对话场景下，早期关键信息可能被截断丢失；短对话无明显影响 |
+| **关注指标** | Context Recall（长对话时信息丢失）、Answer Relevancy（缺少上下文导致回答偏差） |
+| **实施方式** | 配置开关 `agent.context.compression=false`，`buildMessages()` 返回原始 `toLcMessages(history)` |
+
+### 实验 A-4：移除回答质量审查重试（w/o Answer QualityReviewer）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | Agent 生成回答后跳过 `reviewAndRetryIfNeeded()`，直接返回首次生成结果 |
+| **对照基线** | 完整流程（QualityReviewer 审查 + 不达标时带反馈重试一次） |
+| **预期影响** | 部分回答质量下降：幻觉、答非所问、信息遗漏等情况无法自动纠正 |
+| **关注指标** | Faithfulness（幻觉无法纠正）、Answer Relevancy（偏题无法纠正）、综合评分波动 |
+| **实施方式** | 配置开关 `agent.quality_review.enabled=false`，`reviewAndRetryIfNeeded()` 直接 return answer |
+
+### 实验 A-5：移除多 Agent 并行流水线（w/o Multi-Agent Pipeline）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 强制所有查询走 AgentLoop，即使 Supervisor 返回 subtasks >= 2 |
+| **对照基线** | 完整流水线（复杂查询走并行子任务 + Writer 合成） |
+| **预期影响** | 复杂查询在 ReAct 循环中可能步骤混乱、遗漏子任务；但简单查询不受影响 |
+| **关注指标** | Context Recall（多子任务场景最容易遗漏）、Answer Relevancy、Token 消耗量 |
+| **实施方式** | 配置开关 `agent.multi_agent.enabled=false`，忽略 `subTasks.size() >= 2` 判断 |
+
+### 实验 A-6：移除附件上下文（w/o Attachment Context）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 用户上传的文件附件内容不再拼入 query，仅传递原始用户问题 |
+| **对照基线** | 附件内容通过 `chatService.buildAttachmentContext()` 注入 query |
+| **预期影响** | 当用户问题依赖附件内容时（如"总结这个文件"），模型无法获取文件信息 |
+| **关注指标** | Context Recall（缺少文件内容）、Answer Relevancy（无法基于文件回答） |
+| **实施方式** | 配置开关 `agent.attachment.enabled=false`，`attachmentContext` 设为 null |
+
+### 实验 A-7：移除工具过滤（w/o Tool Filtering）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 所有 17 个工具始终可用，忽略用户的知识库/笔记工具开关 |
+| **对照基线** | 按用户偏好过滤工具（`filterTools(enableKnowledge, enableNotes)`） |
+| **预期影响** | 用户明确禁用的工具仍可被调用，可能导致隐私顾虑（如禁用笔记搜索后仍搜了笔记） |
+| **关注指标** | 工具调用分布变化、用户满意度、安全合规 |
+| **实施方式** | 配置开关 `agent.tool_filter.enabled=false`，始终传入全部 `toolSpecifications` |
+
+### 实验 A-8：消融 WriterService 合成（w/o Writer Synthesis）— 仅复杂查询
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 多子任务结果不经过 `WriterService.synthesize()` 合成，改为简单拼接 |
+| **对照基线** | WriterService 的 LLM 合成（合并多个子任务结果为一个连贯回答） |
+| **预期影响** | 回答结构松散、重复信息、缺少逻辑衔接 |
+| **关注指标** | Answer Relevancy（回答是否连贯一致）、用户可读性评分 |
+| **实施方式** | 配置开关 `agent.writer.synthesize=false`，子任务结果直接 `\n\n---\n\n` 拼接 |
+
+---
+
+## 10.3 RAG 各环节消融实验
+
+### 实验 R-1：移除 Query 扩展（w/o QueryExpander）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 关闭 `QueryExpander.expand()`，仅使用原始查询进行检索 |
+| **对照基线** | 完整多 Query 扩展（1 个原始查询 → 3 个语义变体，temperature=0.8 创意模型） |
+| **预期影响** | 语义覆盖不足：用户用非标准表述时，向量检索和 BM25 可能漏掉相关文档 |
+| **关注指标** | Context Recall（召回率下降）、Context Precision（精确度可能略升，因为噪音也减少） |
+| **实施方式** | 配置开关 `rag.query_expansion.enabled=false`，`queries` 列表只包含原始查询 |
+
+### 实验 R-2：移除向量检索（w/o Vector Search）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 仅使用 BM25 关键词检索，关闭 ChromaDB 向量语义检索 |
+| **对照基线** | 完整混合检索（向量 + BM25 → RRF 融合 → Rerank） |
+| **预期影响** | 语义匹配能力丧失：同义词、近义表述无法召回；精确关键词匹配场景影响较小 |
+| **关注指标** | Context Recall（语义查询场景大幅下降）、Context Precision（关键词场景可能持平） |
+| **实施方式** | 配置开关 `rag.vector_search.enabled=false`，`allRankings` 只收集 BM25 结果 |
+
+### 实验 R-3：移除 BM25 检索（w/o BM25 Search）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 仅使用 ChromaDB 向量语义检索，关闭 Lucene BM25 关键词检索 |
+| **对照基线** | 完整混合检索（向量 + BM25 → RRF 融合 → Rerank） |
+| **预期影响** | 精确匹配能力丧失：专有名词、代码片段、日期等精确匹配场景效果下降 |
+| **关注指标** | Context Recall（精确匹配场景下降）、Context Precision（语义噪音可能增多） |
+| **实施方式** | 配置开关 `rag.bm25_search.enabled=false`，`allRankings` 只收集向量结果 |
+
+### 实验 R-4：移除 RRF 融合（w/o RRF Fusion）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 多路检索结果不使用 RRF 融合，改为简单拼接 + 按原始分数排序 |
+| **对照基线** | RRF 融合：`score(d) = Σ 1/(60 + rank_i(d))` |
+| **预期影响** | 多路召回的排序质量下降：向量和 BM25 的原始分数不可直接比较，简单拼接导致排名失真 |
+| **关注指标** | Context Precision（排序质量下降）、nDCG（需要 Ground Truth 的排序质量） |
+| **实施方式** | 配置开关 `rag.rrf_fusion.enabled=false`，改为按各路原始分数的 min-max 归一化后合并 |
+
+### 实验 R-5：移除 Cross-Encoder 精排（w/o Reranker）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 跳过 `RerankerService.rerank()`，RRF 融合后的结果直接输出，不做动态阈值过滤 |
+| **对照基线** | 智谱 AI Rerank API 精排 + 动态 Top-N（score>0.7 全留, 0.5~0.7 最多 2 条, <0.5 丢弃） |
+| **预期影响** | 检索噪声增多：不相关文档混入 Top-K；LLM 上下文窗口被无效信息占用 |
+| **关注指标** | Context Precision（噪音增加）、Faithfulness（无关上下文可能误导 LLM） |
+| **实施方式** | 配置开关 `rag.rerank.enabled=false`，RRF 结果直接取 topK 返回 |
+
+### 实验 R-6：移除来源标注（w/o Source Attribution）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 构建 Context 时不添加 `[来源：笔记/知识库《title》]` 前缀，仅拼接纯文本内容 |
+| **对照基线** | 每篇文档带来源标注前缀 |
+| **预期影响** | LLM 无法区分信息来源，回答中的引用可能混淆笔记和知识库文档 |
+| **关注指标** | Faithfulness（来源混淆可能导致错误的引用归属）、Answer Relevancy |
+| **实施方式** | 配置开关 `rag.source_attribution.enabled=false`，`buildContext()` 去掉来源前缀 |
+
+### 实验 R-7：移除检索质量审查（w/o Retrieval QualityReviewer）
+
+| 维度 | 说明 |
+|------|------|
+| **消融内容** | 检索完成后不经过 `QualityReviewer.reviewRetrieval()` 审查，不触发查询改写重试 |
+| **对照基线** | 检索审查 + 不达标时 `rewriteQuery()` 改写重试 |
+| **预期影响** | 检索质量差时无法自动纠正；低质量文档直接喂给 LLM |
+| **关注指标** | Context Precision、Context Recall（检索失败场景下无兜底机制） |
+| **实施方式** | 配置开关 `rag.retrieval_review.enabled=false` |
+
+### 实验 R-8：不同 Chunk 粒度对比
+
+| 维度 | 说明 |
+|------|------|
+| **实验内容** | 对比 chunk_size=100/200/400/800 四种粒度下的检索效果 |
+| **固定组件** | 保持完整 RAG 流水线不变，仅改变 `DocumentProcessor` 的 chunk 参数 |
+| **预期影响** | 小 chunk 精确度高但召回不足；大 chunk 召回好但精确度下降，且超出 LLM 上下文窗口 |
+| **关注指标** | Context Precision vs Context Recall 的 trade-off 曲线 |
+| **实施方式** | 配置参数 `rag.chunk.size` 和 `rag.chunk.overlap`，不同实验组使用不同 chunk 分片策略 |
+
+### 实验 R-9：不同 Top-K 对比
+
+| 维度 | 说明 |
+|------|------|
+| **实验内容** | 对比 topK=3/5/10/20 四种设置下的检索与生成效果 |
+| **固定组件** | 保持完整 RAG 流水线不变 |
+| **预期影响** | 小 TopK 精确但可能遗漏信息；大 TopK 覆盖全面但 LLM 上下文可能过载 |
+| **关注指标** | Context Recall（随 TopK 增大而提升）、Faithfulness（上下文过长可能降低忠实度） |
+| **实施方式** | 配置参数 `chroma.k` |
+
+---
+
+## 10.4 联合消融实验
+
+联合消融用于探索组件间的交互效应（Interaction Effect）。当两个组件同时存在时产生"1+1>2"的效果，单独消融无法体现。
+
+### 实验 C-1：向量 + BM25 联合消融
+
+| 变体 | Vector | BM25 | 说明 |
+|------|--------|------|------|
+| 完整 | ✅ | ✅ | 当前完整链路 |
+| 消融 A | ✅ | ❌ | 仅向量（= 实验 R-3） |
+| 消融 B | ❌ | ✅ | 仅 BM25（= 实验 R-2） |
+| 消融 C | ❌ | ❌ | 全部移除（回退到 MySQL LIKE 模糊搜索） |
+
+**分析目标**：量化向量检索和 BM25 检索的交互增益。交互增益 = 完整效果 - (仅向量效果 + 仅 BM25 效果) / 2。
+
+### 实验 C-2：Query 扩展 + RRF 融合联合消融
+
+| 变体 | QueryExpander | RRF Fusion | 说明 |
+|------|---------------|------------|------|
+| 完整 | ✅ | ✅ | 多 Query + 多路 + RRF |
+| 消融 A | ❌ | ✅ | 单 Query + 多路 + RRF |
+| 消融 B | ✅ | ❌ | 多 Query + 多路 + 简单合并 |
+| 消融 C | ❌ | ❌ | 单 Query + 单路（仅 Vector） |
+
+**分析目标**：Query 扩展的价值依赖于 RRF 融合吗？当只有单路检索时，Query 扩展是否仍然有效？
+
+### 实验 C-3：RRF + Cross-Encoder 联合消融
+
+| 变体 | RRF Fusion | Reranker | 说明 |
+|------|------------|----------|------|
+| 完整 | ✅ | ✅ | 当前完整链路 |
+| 消融 A | ✅ | ❌ | RRF 融合后直接输出 |
+| 消融 B | ❌ | ✅ | 多路拼接后直接 Rerank（跳 RRF） |
+| 消融 C | ❌ | ❌ | 多路拼接后直接取 Top-K |
+
+**分析目标**：RRF 和 Cross-Encoder 在排序能力上是互补还是冗余？Rerank API 能否替代 RRF 的融合功能？
+
+### 实验 C-4：Agent 反思 + RAG 检索审查联合消融
+
+| 变体 | Agent Reflection | RAG Retrieval Review | 说明 |
+|------|-----------------|---------------------|------|
+| 完整 | ✅ | ✅ | 两层质量控制 |
+| 消融 A | ❌ | ✅ | 仅 RAG 层检错 |
+| 消融 B | ✅ | ❌ | 仅 Agent 层反思 |
+| 消融 C | ❌ | ❌ | 无质量控制 |
+
+**分析目标**：两层质量控制是互补（覆盖不同错误类型）还是冗余？去除任何一层是否会导致某类错误漏检？
+
+### 实验 C-5：Context 压缩 + Top-K 联合消融
+
+| 变体 | Context Compression | Top-K | 说明 |
+|------|--------------------|-------|------|
+| 完整 | ✅ | 10 | 当前设置 |
+| 消融 A | ❌ | 10 | 无压缩 + 标准 TopK |
+| 消融 B | ✅ | 3 | 有压缩 + 小 TopK |
+| 消融 C | ❌ | 3 | 无压缩 + 小 TopK |
+| 消融 D | ✅ | 20 | 有压缩 + 大 TopK |
+
+**分析目标**：上下文压缩能否弥补大 TopK 带来的 Token 压力？在什么样的 TopK 下压缩策略的收益最大？
+
+---
+
+## 10.5 评测指标体系
+
+### 10.5.1 核心 RAGAS 指标（LLM-as-a-Judge）
+
+沿用第九章实现的四指标评估体系：
+
+| 指标 | 公式/方法 | 衡量目标 | 权重 |
+|------|----------|---------|------|
+| **Faithfulness** | SUPPORTED声明数 / 总声明数 | 回答是否忠实于检索文档，有无幻觉 | 0.35 |
+| **Answer Relevancy** | 反向生成3个问题与原始问题的平均语义相似度 | 回答是否切题 | 0.25 |
+| **Context Precision** | 位置加权精确度：Σ(Precision@k × rel(k)) / 相关文档数 | 检索到的文档是否相关 | 0.25 |
+| **Context Recall** | 标准答案句子被上下文支持的比例（需 Ground Truth） | 检索是否覆盖了答案所需信息 | 0.15 |
+
+### 10.5.2 辅助工程指标
+
+| 指标 | 说明 | 采集方式 |
+|------|------|---------|
+| **检索延迟 (ms)** | 从查询到完成检索的时间 | `RagTrace.retrievalLatencyMs` |
+| **生成延迟 (ms)** | LLM 生成回答的时间 | `RagTrace.generationLatencyMs` |
+| **总延迟 (ms)** | 端到端耗时 | `RagTrace.totalLatencyMs` |
+| **Token 消耗** | Agent 流程总 Token 使用量 | `TokenCounter.estimateEntityTokens()` |
+| **检索文档数** | 最终返回给 LLM 的文档数量 | `RagTrace.retrievedDocCount` |
+| **工具调用轮次** | AgentLoop 中 ReAct 循环的最大轮数 | `AgentState.iterationCount` |
+| **重试次数** | QualityReviewer 触发重试的频率 | 日志统计 |
+| **平均相似度** | 检索结果的平均余弦相似度 | `RagTrace.avgSimilarity` |
+
+### 10.5.3 综合评分公式
+
+```
+LLM Score = Faithfulness × 0.35 + AnswerRelevancy × 0.25 + ContextPrecision × 0.25 + ContextRecall × 0.15
+
+Rule Score = 100 - latency_penalty - empty_penalty - short_answer_penalty - low_similarity_penalty
+
+Total Score = HarmonicMean(LLM Score, Rule Score / 100) × 100
+```
+
+---
+
+## 10.6 测试数据集构建
+
+### 10.6.1 数据来源
+
+| 来源 | 数量 | 用途 | 优先级 |
+|------|------|------|--------|
+| **真实用户 Trace** | 采样 200 条线上 RagTrace | 真实分布测试 | 高 |
+| **LLM 自动生成** | 基于知识库文档 + 笔记内容生成 300 条 | 覆盖边界场景 | 高 |
+| **人工标注 Ground Truth** | 从上述 500 条中精选 100 条 | Context Recall 评估 | 中 |
+
+### 10.6.2 LLM 自动生成测试用例
+
+利用已有的 `TestCaseGenerator` 从知识库和笔记中自动生成：
+
+```
+输入：知识库文档 / 用户笔记
+处理：
+  1. 提取关键知识点（LLM 提取）
+  2. 为每个知识点生成 3 种难度的问题：
+     - 简单：事实型（如"xxx 的概念是什么？"）
+     - 中等：理解型（如"xxx 和 yyy 的区别是什么？"）
+     - 困难：推理型（如"基于 xxx，分析 yyy 的原因"）
+  3. 为每个问题生成标准参考答案（Ground Truth）
+输出：(question, ground_truth, difficulty, source_doc_id) 存入 test_cases 表
+```
+
+### 10.6.3 测试用例分层
+
+| 难度 | 比例 | 特征 |
+|------|------|------|
+| 简单（L1） | 30% | 事实查询，单个文档即可回答 |
+| 中等（L2） | 40% | 需要跨文档整合，或涉及语义理解 |
+| 困难（L3） | 30% | 多步骤推理，需要综合多个知识源 |
+
+### 10.6.4 测试数据集管理
+
+新建表 `ablation_test_cases`：
+
+```sql
+CREATE TABLE ablation_test_cases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    test_group VARCHAR(50) NOT NULL COMMENT '测试分组: agent / rag / joint',
+    question TEXT NOT NULL,
+    ground_truth TEXT COMMENT '标准答案（Context Recall 需要）',
+    difficulty VARCHAR(10) NOT NULL COMMENT 'L1/L2/L3',
+    query_type VARCHAR(30) COMMENT 'simple/multi_step/comparison/creation',
+    source_type VARCHAR(30) COMMENT 'knowledge_base/note/mixed',
+    source_doc_ids TEXT COMMENT 'JSON数组，关联的知识库文档/笔记ID',
+    tags VARCHAR(200) COMMENT '逗号分隔标签',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+## 10.7 实验执行流程
+
+### 10.7.1 单次消融实验流程
+
+```
+1. 选择消融目标（如 R-1: w/o QueryExpander）
+2. 设置配置开关（如 rag.query_expansion.enabled=false）
+3. 加载测试用例集（N >= 50）
+4. 逐条执行：
+   a. 通过 RagService 或 AgentService 处理 query
+   b. 记录 RagTrace（检索结果 + 生成回答 + 延迟）
+   c. 调用 EvaluationService.evaluate(trace) 计算四指标
+5. 汇总统计：均值、标准差、中位数、P95
+6. 恢复配置开关
+7. 与完整链路基线对比，生成消融报告
+```
+
+### 10.7.2 消融实验执行器
+
+新增 `AblationExperimentService`：
+
+```java
+@Service
+public class AblationExperimentService {
+
+    // 实验配置
+    public record AblationConfig(
+        String experimentId,      // 实验编号: "A-1", "R-3", "C-2"
+        String experimentName,    // 实验名称
+        String category,          // agent / rag / joint
+        Map<String, Boolean> featureFlags  // 组件开关
+    ) {}
+
+    // 实验结果
+    public record AblationResult(
+        String experimentId,
+        int sampleCount,
+        double avgFaithfulness, double stdFaithfulness,
+        double avgRelevancy, double stdRelevancy,
+        double avgPrecision, double stdPrecision,
+        double avgRecall, double stdRecall,
+        double avgTotalScore, double stdTotalScore,
+        double avgLatencyMs,
+        double avgTokenUsed,
+        Map<String, Double> metricDeltas  // 与基线对比的变化量
+    ) {}
+
+    /**
+     * 运行单次消融实验
+     */
+    public AblationResult runExperiment(AblationConfig config, List<TestCase> testCases);
+
+    /**
+     * 运行所有消融实验（批处理模式）
+     */
+    public List<AblationResult> runAllExperiments(List<TestCase> testCases);
+
+    /**
+     * 生成对比报告：按指标排序，输出各组件贡献度排名
+     */
+    public String generateComparisonReport(List<AblationResult> results);
+}
+```
+
+### 10.7.3 配置管理
+
+在 `application.yml` 中新增消融实验开关：
+
+```yaml
+ablation:
+  # Agent 组件开关
+  agent:
+    supervisor:
+      enabled: true       # false = 实验 A-1
+    reflection:
+      enabled: true       # false = 实验 A-2
+    context:
+      compression: true   # false = 实验 A-3
+    quality_review:
+      enabled: true       # false = 实验 A-4
+    multi_agent:
+      enabled: true       # false = 实验 A-5
+    attachment:
+      enabled: true       # false = 实验 A-6
+    tool_filter:
+      enabled: true       # false = 实验 A-7
+    writer:
+      synthesize: true    # false = 实验 A-8
+
+  # RAG 组件开关
+  rag:
+    query_expansion:
+      enabled: true       # false = 实验 R-1
+    vector_search:
+      enabled: true       # false = 实验 R-2
+    bm25_search:
+      enabled: true       # false = 实验 R-3
+    rrf_fusion:
+      enabled: true       # false = 实验 R-4
+    rerank:
+      enabled: true       # false = 实验 R-5
+    source_attribution:
+      enabled: true       # false = 实验 R-6
+    retrieval_review:
+      enabled: true       # false = 实验 R-7
+```
+
+---
+
+## 10.8 预期结果与分析框架
+
+### 10.8.1 各组件贡献度排名（假设）
+
+```
+预期贡献度排序（从高到低）：
+
+RAG 层：
+  1. Cross-Encoder Rerank         ★★★★★  去噪能力，直接影响 Precision
+  2. Query Expander               ★★★★☆  语义覆盖，直接影响 Recall
+  3. Vector Search                ★★★★   语义匹配核心
+  4. BM25 Search                  ★★★    关键词精确匹配补充
+  5. RRF Fusion                   ★★★    多路融合排序
+  6. Source Attribution           ★★     引用准确性
+  7. Retrieval QualityReviewer    ★★     兜底纠错（低频但关键）
+
+Agent 层：
+  1. ContextManager Compression   ★★★★★  长对话场景核心
+  2. AgentLoop Reflection         ★★★★   自我纠错能力
+  3. Answer QualityReviewer       ★★★    回答质量兜底
+  4. Multi-Agent Pipeline         ★★★    复杂查询分治
+  5. Supervisor Plan              ★★     路由决策
+  6. Attachment Context           ★★     文件处理场景专用
+  7. Tool Filtering               ★      用户偏好控制
+```
+
+### 10.8.2 分析维度
+
+| 分析维度 | 方法 | 输出 |
+|---------|------|------|
+| **单组件贡献度** | 完整得分 - 消融得分 | 每个组件的 delta 值 |
+| **交互增益** | 完整得分 - (消融A得分 + 消融B得分) / 2 | 联合消融 C-1~C-5 |
+| **难度分层分析** | 按 L1/L2/L3 分组统计 | 不同组件在不同难度下的表现 |
+| **查询类型分析** | 按 simple/multi_step/comparison 分组 | Agent 组件在不同查询类型下的价值 |
+| **成本-收益分析** | delta / latency_overhead | 每增加 1ms 延迟换来多少质量提升 |
+| **Pareto 最优前沿** | 延迟 vs 质量的散点图 | 找出性价比最高的组件组合 |
+
+### 10.8.3 实验报告模板
+
+```
+============================================================
+              RAG-Note 消融实验报告
+  实验日期：YYYY-MM-DD
+  测试用例数：N
+  基线综合得分：XX.X (Faithfulness: X.XX, Relevancy: X.XX,
+                         Precision: X.XX, Recall: X.XX)
+============================================================
+
+【Agent 消融实验】
+实验编号  消融组件                  综合得分  Δ得分  延迟(ms)  关键发现
+--------------------------------------------------------------------------
+A-1      w/o Supervisor Plan       XX.X    -X.X   XXX      ...
+A-2      w/o Reflection            XX.X    -X.X   XXX      ...
+...
+
+【RAG 消融实验】
+实验编号  消融组件                  综合得分  Δ得分  延迟(ms)  关键发现
+--------------------------------------------------------------------------
+R-1      w/o Query Expander       XX.X    -X.X   XXX      ...
+R-2      w/o Vector Search        XX.X    -X.X   XXX      ...
+...
+
+【联合消融实验】
+实验编号  消融组合                 综合得分  Δ得分  交互增益  关键发现
+--------------------------------------------------------------------------
+C-1      Vector × BM25            XX.X    -X.X   +X.XX    ...
+...
+
+【结论与建议】
+1. 贡献度最高的组件：XXX（Δ = +X.XX）
+2. 性价比最高的组件：XXX（质量提升 X.X，延迟增加仅 Xms）
+3. 可考虑裁剪的组件：XXX（Δ ≈ 0，延迟增加 Xms）
+4. 建议保留的组件组合：[...]
+============================================================
+```
+
+---
+
+## 10.9 代码实现清单
+
+为支持消融实验，需要在现有代码基础上新增/改造以下内容：
+
+| 文件 | 改动类型 | 说明 |
+|------|---------|------|
+| `config/AblationProperties.java` | 新增 | 消融实验配置属性类，映射 application.yml 中的 ablation 配置节点 |
+| `evaluation/service/AblationExperimentService.java` | 新增 | 消融实验执行器：批量运行实验、对比基线、生成报告 |
+| `evaluation/entity/AblationResult.java` | 新增 | 消融实验结果实体（可存入 ablation_results 表） |
+| `AgentService.java` | 改造 | 在各环节插入配置开关判断（如 `if (!ablationProps.getAgent().isSupervisor())`） |
+| `AgentLoop.java` | 改造 | 在 ToolResultEvaluator 调用处插入开关 |
+| `ContextManager.java` | 改造 | 在压缩逻辑入口插入开关 |
+| `RagService.java` | 改造 | 在检索流程各步骤插入开关 |
+| `HybridRetriever.java` | 改造 | 在 QueryExpander / Vector / BM25 / RRF / Rerank 各环节插入开关 |
+| `DocumentProcessor.java` | 改造 | chunk_size 和 overlap 参数化，支持实验配置 |
+| `application.yml` | 改造 | 新增 ablation 配置节点 |
+| `evaluation/controller/AblationController.java` | 新增 | REST API：启动实验、查询进度、获取报告 |
+| `sql/ablation_tables.sql` | 新增 | 建表 DDL：ablation_test_cases、ablation_results |
+
+---
+
+## 10.10 实验执行计划
+
+| 阶段 | 内容 | 预计时间 |
+|------|------|---------|
+| **Phase 1** | 实现配置开关 + AblationExperimentService + 建表 | 2-3 天 |
+| **Phase 2** | 构建测试数据集（LLM 生成 + 线上 Trace 采样） | 1-2 天 |
+| **Phase 3** | 执行 RAG 消融实验 R-1 ~ R-9 | 1 天（批量自动化） |
+| **Phase 4** | 执行 Agent 消融实验 A-1 ~ A-8 | 1 天（批量自动化） |
+| **Phase 5** | 执行联合消融实验 C-1 ~ C-5 | 0.5 天 |
+| **Phase 6** | 生成分析报告 + 确定最优组件组合 | 0.5 天 |
+
+---
+
+## 10.11 RAG 消融实验实现记录
+
+> Phase 1 已完成：配置开关 + AblationExperimentService + 建表 + HybridRetriever/RagService 改造
+
+### 10.11.1 实现与设计文档的对应关系
+
+| 设计文档 (10.3) | 实现状态 | 实现文件 |
+|------|---------|------|
+| R-1: w/o QueryExpander | 已实现 | `HybridRetriever.searchKnowledge(config)` 中 `queryExpansionEnabled=false` |
+| R-2: w/o Vector Search | 已实现 | `HybridRetriever` 中 `vectorSearchEnabled=false` |
+| R-3: w/o BM25 Search | 已实现 | `HybridRetriever` 中 `bm25SearchEnabled=false` |
+| R-4: w/o RRF Fusion | 已实现 | `HybridRetriever` 中 `rrfFusionEnabled=false`，降级为简单合并+去重 |
+| R-5: w/o Reranker | 已实现 | `HybridRetriever` 中 `rerankEnabled=false`，直接取 topK |
+| R-6: w/o Source Attribution | 已实现 | `RagService.buildContextPlain()` 去掉 `[来源：...]` 前缀 |
+| R-7: w/o QualityReviewer | 配置开关已就绪 | `retrievalReviewEnabled` 字段已定义（当前管道中 QualityReviewer 未被调用） |
+| R-8: Chunk Size 对比 | 配置参数已就绪 | `AblationConfig.chunkSize/chunkOverlap` 字段已定义 |
+| R-9: Top-K 对比 | 已实现 | `AblationConfig.topK` 参数经由 `HybridRetriever` 和 `RagService` 传递 |
+
+### 10.11.2 新增/修改文件清单
+
+**新增文件：**
+
+| 文件 | 说明 |
+|------|------|
+| `evaluation/dto/AblationConfig.java` | 消融实验配置 DTO，包含 Builder 模式、预设实验工厂方法（R-1~R-9） |
+| `evaluation/entity/AblationResult.java` | 消融实验结果实体，映射 `ablation_results` 表，含 RAGAS 四指标+delta+自动关键发现 |
+| `evaluation/repository/AblationResultRepository.java` | JPA Repository，支持按 experimentId/userId 查询 |
+| `evaluation/service/AblationExperimentService.java` | 核心服务：运行单次实验、批量运行 R-1~R-7、生成报告+文字总结 |
+| `evaluation/controller/AblationController.java` | REST API：`POST /api/evaluation/ablation/run-all`、`GET /api/evaluation/ablation/report`、`GET /api/evaluation/ablation/experiments` |
+| `sql/ablation_tables.sql` | 参考 DDL（Hibernate `ddl-auto=update` 自动建表） |
+
+**修改文件：**
+
+| 文件 | 改动内容 |
+|------|---------|
+| `config/ApplicationProperties.java` | 新增 `Ablation` 内部类 + `RagAblation` 子类，映射 `app.ablation.rag.*` 配置 |
+| `rag/HybridRetriever.java` | 新增 `searchKnowledge(userId,query,topK,config)` 和 `searchNotes(userId,query,topK,config)` 重载；新增 `simpleMerge()` 作为 RRF 降级方案；每个组件插入开关判断 |
+| `rag/RagService.java` | 新增 `getDocumentsAndSummary(userId,query,config)` 和 `retrieveDocuments(userId,query,config)` 重载；新增 `buildContextPlain()` 用于 w/o Source Attribution 实验 |
+| `application.yml` | 新增 `app.ablation.rag.*` 配置节点 |
+
+### 10.11.3 关键架构决策
+
+**1. 消融配置如何流经系统**
+
+```
+AblationController
+    └─> AblationExperimentService.runExperiment(config, testCases, userId)
+            └─> RagService.getDocumentsAndSummary(userId, query, config)
+                    ├─> retrieveDocuments(userId, query, config)
+                    │       └─> HybridRetriever.searchKnowledge(userId, query, topK, config)
+                    │               ├─ queryExpansionEnabled? → QueryExpander.expand()
+                    │               ├─ vectorSearchEnabled?   → VectorStoreService.searchKnowledge()
+                    │               ├─ bm25SearchEnabled?     → Bm25Service.search()
+                    │               ├─ rrfFusionEnabled?      → rrfFusion() / simpleMerge()
+                    │               └─ rerankEnabled?         → RerankerService.rerank() / topK limit
+                    └─> buildContext / buildContextPlain (sourceAttributionEnabled)
+```
+
+**2. 配置优先级**
+
+`AblationConfig`（实验模式传入）> `application.yml` 的 `app.ablation.rag.*`（全局默认）
+
+当 `AblationConfig` 为 null 时（正常用户请求），使用 `application.yml` 的默认值（默认全部启用 = 完整流水线），对生产无影响。
+
+**3. RRF 被消融时的降级策略**
+
+当 `rrfFusionEnabled=false` 且多路结果存在时，使用 `simpleMerge()`：
+- 按 docKey 去重（保留首次出现的顺序）
+- 按原始 `similarity` 分数降序排列
+- 取 topK
+
+**4. Reranker 被消融时的降级策略**
+
+当 `rerankEnabled=false` 时，RRF/合并结果直接截取 topK 返回，不做精排和动态阈值过滤。
+
+**5. 异步执行**
+
+`runAllRagAblationExperiments()` 标注 `@Async`，避免长时间阻塞 HTTP 请求。前端通过轮询 `/api/evaluation/ablation/report` 获取进程。
+
+### 10.11.4 API 使用指南
+
+```bash
+# 查看所有实验配置
+GET /api/evaluation/ablation/experiments
+
+# 启动全部 RAG 消融实验（异步）
+POST /api/evaluation/ablation/run-all
+
+# 获取最新实验报告
+GET /api/evaluation/ablation/report
+```
+
+报告响应示例：
+
+```json
+{
+  "baseline": {
+    "experimentId": "BASELINE",
+    "compositeScore": 0.782,
+    "faithfulness": 0.85,
+    "answerRelevancy": 0.76,
+    "contextPrecision": 0.72,
+    "contextRecall": 0.68
+  },
+  "experiments": [
+    {
+      "experimentId": "R-5",
+      "experimentName": "w/o Reranker",
+      "compositeScore": 0.721,
+      "deltaScore": -0.061,
+      "keyFindings": "显著负面影响，该组件对 RAG 质量至关重要。检索精确度偏低，召回文档中噪音较多。"
+    }
+  ],
+  "summary": "共完成 7 组 RAG 消融实验。对综合得分影响最大的组件是「w/o Reranker」（Δ=-0.061），..."
+}
+```
+
+### 10.11.5 待完成事项
+
+| 事项 | 优先级 | 说明 |
+|------|--------|------|
+| Agent 消融实验 (A-1~A-8) | 中 | 需在 AgentService/AgentLoop 中插入配置开关 |
+| 联合消融实验 (C-1~C-5) | 低 | 依赖 RAG + Agent 消融均完成后 |
+| R-8 Chunk 粒度对比 | 低 | 需要重建索引（修改 chunk 参数后需重新写入向量+BM25），耗时较长 |
+| 前端消融实验报告页面 | 中 | Evaluation.vue 中添加消融报告 Tab/区域 |
+| 测试数据集扩充 | 中 | 利用 TestCaseGenerator 从知识库自动生成更多测试用例 |

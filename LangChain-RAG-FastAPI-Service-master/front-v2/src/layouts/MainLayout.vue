@@ -39,10 +39,6 @@
           <template #icon><icon-calendar /></template>
           每日复习
         </a-menu-item>
-        <a-menu-item key="/evaluation">
-          <template #icon><icon-bar-chart /></template>
-          评估
-        </a-menu-item>
         <a-sub-menu key="system">
           <template #icon><icon-settings /></template>
           <template #title>系统配置</template>
@@ -61,6 +57,10 @@
           <a-menu-item key="/system/skills">
             <template #icon><icon-trophy /></template>
             Skills 管理
+          </a-menu-item>
+          <a-menu-item key="/system/debug">
+            <template #icon><icon-bug /></template>
+            开发者调试
           </a-menu-item>
         </a-sub-menu>
       </a-menu>
@@ -106,7 +106,6 @@ import {
   IconFile,
   IconRobot,
   IconCalendar,
-  IconBarChart,
   IconSettings,
   IconMoonFill,
   IconSunFill,
@@ -114,6 +113,7 @@ import {
   IconCommon,
   IconCommand,
   IconTrophy,
+  IconBug,
 } from '@arco-design/web-vue/es/icon'
 
 const router = useRouter()
@@ -133,11 +133,11 @@ const menuTitleMap: Record<string, string> = {
   '/chat': 'AI 助手',
   '/knowledge': '知识库',
   '/review': '每日复习',
-  '/evaluation': '评估',
   '/system/llm': 'LLM 配置',
   '/system/prompt': '提示词管理',
   '/system/mcp': 'MCP 工具',
   '/system/skills': 'Skills 管理',
+  '/system/debug': '开发者调试',
   '/settings': '个人设置',
 }
 

@@ -16,6 +16,8 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -27,6 +29,10 @@ public class EvaluationService {
     private final RagTraceRepository traceRepository;
     private final EvaluationReportRepository reportRepository;
     private final ApplicationProperties props;
+    private final Executor taskExecutor;
+
+    // 单个 LLM 评估调用的超时时间（秒）
+    private static final long EVAL_TIMEOUT_SECONDS = 120;
 
     // 正则模式
     private static final Pattern SCORE_PATTERN = Pattern.compile("SCORE:\\s*([0-9.]+)");
@@ -43,11 +49,13 @@ public class EvaluationService {
     public EvaluationService(ModelFactory modelFactory,
                              RagTraceRepository traceRepository,
                              EvaluationReportRepository reportRepository,
-                             ApplicationProperties props) {
+                             ApplicationProperties props,
+                             @org.springframework.beans.factory.annotation.Qualifier("taskExecutor") Executor taskExecutor) {
         this.modelFactory = modelFactory;
         this.traceRepository = traceRepository;
         this.reportRepository = reportRepository;
         this.props = props;
+        this.taskExecutor = taskExecutor;
     }
 
     /**
@@ -62,16 +70,16 @@ public class EvaluationService {
         boolean hasGroundTruth = trace.getGroundTruth() != null && !trace.getGroundTruth().isBlank();
         boolean hasDocs = trace.getRetrievedDocs() != null && !trace.getRetrievedDocs().isEmpty();
 
-        // 并行执行 LLM 评估（3-4 个调用）
+        // 并行执行 LLM 评估（3-4 个调用），使用专用线程池避免 ForkJoinPool 阻塞
         CompletableFuture<Double> faithfulnessFuture = hasDocs
-                ? CompletableFuture.supplyAsync(() -> evaluateFaithfulness(trace))
+                ? CompletableFuture.supplyAsync(() -> evaluateFaithfulness(trace), taskExecutor)
                 : CompletableFuture.completedFuture(0.0);
-        CompletableFuture<Double> relevancyFuture = CompletableFuture.supplyAsync(() -> evaluateAnswerRelevancy(trace));
+        CompletableFuture<Double> relevancyFuture = CompletableFuture.supplyAsync(() -> evaluateAnswerRelevancy(trace), taskExecutor);
         CompletableFuture<Double> precisionFuture = hasDocs
-                ? CompletableFuture.supplyAsync(() -> evaluateContextPrecision(trace))
+                ? CompletableFuture.supplyAsync(() -> evaluateContextPrecision(trace), taskExecutor)
                 : CompletableFuture.completedFuture(0.0);
         CompletableFuture<Double> recallFuture = hasGroundTruth
-                ? CompletableFuture.supplyAsync(() -> evaluateContextRecall(trace))
+                ? CompletableFuture.supplyAsync(() -> evaluateContextRecall(trace), taskExecutor)
                 : CompletableFuture.completedFuture(-1.0);
 
         // 等待所有评估完成
@@ -600,7 +608,11 @@ public class EvaluationService {
      */
     private double joinSafe(CompletableFuture<Double> future, double defaultValue) {
         try {
-            return future.get();
+            return future.get(EVAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            log.warn("LLM 评估超时 ({}s)，使用默认值 {}", EVAL_TIMEOUT_SECONDS, defaultValue);
+            future.cancel(true);
+            return defaultValue;
         } catch (Exception e) {
             log.warn("异步评估失败: {}", e.getMessage());
             return defaultValue;
@@ -608,11 +620,16 @@ public class EvaluationService {
     }
 
     /**
-     * 批量评估
+     * 批量评估（跳过已有报告的 trace，避免重复评估）
      */
     public int batchEvaluate(List<RagTrace> traces) {
         int count = 0;
+        int skipped = 0;
         for (RagTrace trace : traces) {
+            if (reportRepository.existsByTraceId(trace.getTraceId())) {
+                skipped++;
+                continue;
+            }
             try {
                 EvaluationReport report = evaluate(trace);
                 reportRepository.save(report);
@@ -620,6 +637,9 @@ public class EvaluationService {
             } catch (Exception e) {
                 log.warn("Failed to evaluate trace {}: {}", trace.getTraceId(), e.getMessage());
             }
+        }
+        if (skipped > 0) {
+            log.info("批量评估: 跳过 {} 条已有报告, 新评估 {} 条", skipped, count);
         }
         return count;
     }

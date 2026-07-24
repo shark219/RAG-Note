@@ -11,6 +11,7 @@ import com.rag.notebook.evaluation.repository.TestCaseRepository;
 import com.rag.notebook.evaluation.service.EvaluationService;
 import com.rag.notebook.evaluation.service.RegressionTestService;
 import com.rag.notebook.evaluation.service.TestCaseGenerator;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
@@ -18,6 +19,9 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
+import org.springframework.transaction.annotation.Transactional;
+
+@Slf4j
 @RestController
 @RequestMapping("/evaluation")
 public class EvaluationController {
@@ -222,7 +226,7 @@ public class EvaluationController {
         ));
     }
 
-    // ========== Phase 2: 测试用例生成 ==========
+    // ========== Phase 2: 测试用例管理 ==========
 
     @PostMapping("/test-cases/generate")
     public ApiResponse<Map<String, Object>> generateTestCases(
@@ -239,6 +243,66 @@ public class EvaluationController {
     @GetMapping("/test-cases")
     public ApiResponse<List<TestCase>> getTestCases(@UserId String userId) {
         return ApiResponse.success(testCaseRepository.findByUserIdOrderByCreatedAtDesc(userId));
+    }
+
+    @DeleteMapping("/test-cases/batch")
+    @Transactional
+    public ApiResponse<Map<String, Object>> deleteTestCases(@UserId String userId, @RequestBody List<Long> ids) {
+        // 验证所有权
+        List<TestCase> owned = testCaseRepository.findAllById(ids).stream()
+                .filter(tc -> tc.getUserId().equals(userId))
+                .toList();
+        if (owned.isEmpty()) {
+            return ApiResponse.error(400, "没有可删除的测试用例");
+        }
+        List<Long> ownedIds = owned.stream().map(TestCase::getId).toList();
+        int deleted = testCaseRepository.deleteByIds(ownedIds);
+        return ApiResponse.success("批量删除完成", Map.of("deleted", deleted));
+    }
+
+    @DeleteMapping("/test-cases/{id}")
+    public ApiResponse<Object> deleteTestCase(@UserId String userId, @PathVariable Long id) {
+        return testCaseRepository.findById(id).map(tc -> {
+            if (!tc.getUserId().equals(userId)) {
+                return ApiResponse.<Object>error(403, "无权删除他人的测试用例");
+            }
+            testCaseRepository.deleteById(id);
+            return ApiResponse.<Object>success("删除成功");
+        }).orElse(ApiResponse.<Object>error(404, "测试用例不存在"));
+    }
+
+    @PostMapping("/test-cases/dedup")
+    @Transactional
+    public ApiResponse<Map<String, Object>> dedupTestCases(@UserId String userId) {
+        List<TestCase> duplicates = testCaseRepository.findDuplicatesByUserId(userId);
+        if (duplicates.isEmpty()) {
+            return ApiResponse.success("没有发现重复的测试用例", Map.of("removed", 0, "total", testCaseRepository.findByUserIdOrderByCreatedAtDesc(userId).size()));
+        }
+
+        // 按 question 分组，每组保留最早创建的一条，删除其余
+        Map<String, List<TestCase>> grouped = duplicates.stream()
+                .collect(Collectors.groupingBy(TestCase::getQuestion));
+
+        Set<Long> toDelete = new HashSet<>();
+        for (List<TestCase> group : grouped.values()) {
+            // 按创建时间排序，保留最早的一条
+            List<TestCase> sorted = group.stream()
+                    .sorted(Comparator.comparing(TestCase::getCreatedAt))
+                    .toList();
+            // 从第 2 条开始删除
+            for (int i = 1; i < sorted.size(); i++) {
+                toDelete.add(sorted.get(i).getId());
+            }
+        }
+
+        if (toDelete.isEmpty()) {
+            return ApiResponse.success("没有发现需要清理的重复用例", Map.of("removed", 0, "total", testCaseRepository.findByUserIdOrderByCreatedAtDesc(userId).size()));
+        }
+
+        int removed = testCaseRepository.deleteByIds(new ArrayList<>(toDelete));
+        long remaining = testCaseRepository.findByUserIdOrderByCreatedAtDesc(userId).size();
+        log.info("测试用例去重: 删除 {} 条重复记录, 剩余 {} 条", removed, remaining);
+        return ApiResponse.success("去重完成", Map.of("removed", removed, "total", remaining));
     }
 
     // ========== Phase 2: 回归测试 ==========

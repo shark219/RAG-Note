@@ -2,6 +2,7 @@ package com.rag.notebook.rag;
 
 import com.rag.notebook.agent.ModelFactory;
 import com.rag.notebook.config.ApplicationProperties;
+import com.rag.notebook.evaluation.dto.AblationConfig;
 import com.rag.notebook.evaluation.entity.RagTrace;
 import com.rag.notebook.evaluation.repository.RagTraceRepository;
 import dev.langchain4j.data.message.AiMessage;
@@ -46,21 +47,36 @@ public class RagService {
         this.traceRepository = traceRepository;
     }
 
-    /**
-     * 混合检索：仅检索知识库（向量检索 + BM25 + RRF融合 + Rerank）
-     * 笔记检索由 searchNotes 工具负责
-     */
-    public List<Map<String, Object>> retrieveDocuments(String userId, String query) {
-        // 混合检索知识库
-        List<Map<String, Object>> knowledgeResults = hybridRetriever.searchKnowledge(
-                userId, query, props.getChroma().getK());
-        knowledgeResults.forEach(r -> r.put("source_type", "knowledge_base"));
+    // ==================== 公开接口（无消融配置） ====================
 
+    public List<Map<String, Object>> retrieveDocuments(String userId, String query) {
+        return retrieveDocuments(userId, query, null);
+    }
+
+    public Map<String, Object> getDocumentsAndSummary(String userId, String query) {
+        return getDocumentsAndSummary(userId, query, null);
+    }
+
+    // ==================== 消融实验接口 ====================
+
+    /**
+     * 混合检索：仅检索知识库（支持消融实验）
+     */
+    public List<Map<String, Object>> retrieveDocuments(String userId, String query, AblationConfig config) {
+        int topK = config != null && config.getTopK() != null ? config.getTopK() : props.getChroma().getK();
+        List<Map<String, Object>> knowledgeResults = hybridRetriever.searchKnowledge(userId, query, topK, config);
+        knowledgeResults.forEach(r -> r.put("source_type", "knowledge_base"));
         return knowledgeResults;
     }
 
-    // 核心方法：传入用户ID和查询词，返回相关的文档列表和最终的AI总结
-    public Map<String, Object> getDocumentsAndSummary(String userId, String query) {
+    /**
+     * 核心方法：传入用户ID和查询词，返回相关的文档列表和最终的AI总结（支持消融实验）
+     */
+    public Map<String, Object> getDocumentsAndSummary(String userId, String query, AblationConfig config) {
+        boolean useSourceAttr = config != null
+                ? config.isSourceAttributionEnabled()
+                : props.getAblation().getRag().isSourceAttributionEnabled();
+
         // Trace 记录开始
         RagTrace trace = new RagTrace();
         trace.setTraceId(UUID.randomUUID().toString().replace("-", ""));
@@ -70,7 +86,7 @@ public class RagService {
 
         // 1. 检索阶段
         long retrievalStart = System.currentTimeMillis();
-        List<Map<String, Object>> documents = retrieveDocuments(userId, query);
+        List<Map<String, Object>> documents = retrieveDocuments(userId, query, config);
         trace.setRetrievalLatencyMs(System.currentTimeMillis() - retrievalStart);
         trace.setRetrievedDocCount(documents.size());
 
@@ -92,9 +108,9 @@ public class RagService {
             return Map.of("documents", List.of(), "summary", "未找到相关文档。");
         }
 
-        // 2. 构建参考资料（带来源标注）
+        // 2. 构建参考资料（根据消融配置决定是否添加来源标注）
         long generationStart = System.currentTimeMillis();
-        String context = buildContext(documents);
+        String context = useSourceAttr ? buildContext(documents) : buildContextPlain(documents);
 
         // 3. 构建用户提示词
         String userPrompt = "参考资料：\n" + context + "\n\n用户问题：" + query;
@@ -125,6 +141,15 @@ public class RagService {
                             : "[来源：知识库《" + title + "》]";
                     return tag + "\n" + content;
                 })
+                .collect(Collectors.joining("\n\n"));
+    }
+
+    /**
+     * 构建参考资料（不带来源标注，用于消融实验 R-6）
+     */
+    private String buildContextPlain(List<Map<String, Object>> documents) {
+        return documents.stream()
+                .map(doc -> (String) doc.getOrDefault("content", ""))
                 .collect(Collectors.joining("\n\n"));
     }
 
