@@ -1,14 +1,18 @@
 package com.rag.notebook.agent;
 
-import com.rag.notebook.knowledge.service.KnowledgeService;
 import com.rag.notebook.note.dto.NoteCreate;
 import com.rag.notebook.note.dto.NoteUpdate;
 import com.rag.notebook.note.service.NoteService;
 import com.rag.notebook.rag.RagService;
 import com.rag.notebook.review.service.ReviewService;
+import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
 import dev.langchain4j.agent.tool.ToolMemoryId;
-import dev.langchain4j.agent.tool.P;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.output.Response;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
@@ -20,7 +24,6 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 @Component
 public class AgentTools {
@@ -28,6 +31,7 @@ public class AgentTools {
     private final RagService ragService;
     private final NoteService noteService;
     private final ReviewService reviewService;
+    private final ModelFactory modelFactory;
 
     // 存储最新的 traceId，供 AgentService 读取
     private String latestTraceId;
@@ -35,10 +39,12 @@ public class AgentTools {
     // 结构化结果缓存：AgentLoop 执行工具后从这里读取 ToolResult
     private final ThreadLocal<ToolResult> lastResult = new ThreadLocal<>();
 
-    public AgentTools(RagService ragService, NoteService noteService, ReviewService reviewService) {
+    public AgentTools(RagService ragService, NoteService noteService, ReviewService reviewService,
+                      ModelFactory modelFactory) {
         this.ragService = ragService;
         this.noteService = noteService;
         this.reviewService = reviewService;
+        this.modelFactory = modelFactory;
     }
 
     public String getLatestTraceId() {
@@ -425,7 +431,7 @@ public class AgentTools {
                 "请直接输出Mermaid代码，用 ```mermaid 代码块包裹。";
     }
 
-    @Tool("根据指定笔记内容生成思维导图（Markdown格式）。前置条件：需要有效的 noteId。触发场景：用户说'生成思维导图'、'画个脑图'、'整理成思维导图'、'帮我梳理xxx笔记的结构'时调用此工具。如果用户说\"笔记里\"、\"这篇笔记\"但没有提供 noteId，先用 searchNotes 或从上下文获取 noteId")
+    @Tool("根据指定笔记内容生成思维导图（Mermaid格式）。前置条件：需要有效的 noteId。触发场景：用户说'生成思维导图'、'画个脑图'、'整理成思维导图'、'帮我梳理xxx笔记的结构'时调用此工具。如果用户说\"笔记里\"、\"这篇笔记\"但没有提供 noteId，先用 searchNotes 或从上下文获取 noteId")
     public String generateMindMap(
             @P("笔记ID，通过 searchNotes 获取或从对话上下文中获取") String noteId,
             @ToolMemoryId String userId) {
@@ -434,17 +440,48 @@ public class AgentTools {
             String title = note.title();
             String content = note.content() != null ? note.content() : "";
 
-            String display = "已获取笔记《" + title + "》的完整内容：\n\n"
-                    + content + "\n\n"
-                    + "---\n"
-                    + "任务：将以上笔记内容整理为 Markdown 格式的思维导图，直接输出给用户。\n"
-                    + "1. 用 # ## ### 表示层级\n"
-                    + "2. 用 - 列表表示分支\n"
-                    + "3. 提取核心概念作为节点\n"
-                    + "4. 不要编造不存在的内容\n"
-                    + "5. 不要再次调用工具，直接输出思维导图";
-            setResult(ToolResult.success(display));
-            return display;
+            if (content.length() > 15000) {
+                content = content.substring(0, 15000) + "\n\n... (内容过长已截断)";
+            }
+
+            String prompt = """
+                    你是一位思维导图专家。请根据以下笔记内容生成一份知识型 Mermaid mindmap。
+
+                    笔记标题：%s
+
+                    笔记内容：
+                    %s
+
+                    核心原则：这不是目录大纲！思维导图的每个节点应该包含知识点、见解或关键信息，
+                    而不是只写标题。读者看思维导图应该能学到东西，不是看到一堆分类标签。
+
+                    具体要求：
+                    1. 根节点 = 笔记的核心主题（一句话概括）
+                    2. 一级分支 = 主要知识模块
+                    3. 二三级节点 = 具体的概念、原理、要点、例子，要有信息量
+                    4. 节点文字可以是短语或短句，但必须包含实质内容
+                       - 差: "线程状态"         好: "线程6种状态:NEW→RUNNABLE→BLOCKED→WAITING→TIMED_WAITING→TERMINATED"
+                       - 差: "线程池"           好: "线程池核心参数:corePoolSize、maxPoolSize、keepAliveTime、工作队列"
+                       - 差: "王维"             好: "王维·山水田园·诗中有画画中有诗"
+                    5. 层级不超过4层，避免嵌套过深
+                    6. 不要编造原文没有的内容
+                    7. 使用 ```mermaid\\nmindmap\\n...\\n``` 代码块输出
+                    8. 只输出代码块，不要解释""".formatted(title, content);
+
+            ChatLanguageModel llm = modelFactory.createCreativeModel();
+            Response<AiMessage> response = llm.generate(
+                    SystemMessage.from("你是一个思维导图生成器，严格按用户要求输出Mermaid代码。"),
+                    UserMessage.from(prompt));
+            String result = response.content().text();
+
+            // 如果 LLM 没输出代码块，手动包裹
+            if (result != null && !result.contains("```mermaid")) {
+                result = "```mermaid\nmindmap\n" + result + "\n```";
+            }
+
+            String finalResult = result != null ? result.trim() : "";
+            setResult(ToolResult.success("已根据《" + title + "》生成思维导图"));
+            return finalResult;
         } catch (Exception e) {
             setResult(ToolResult.error("生成思维导图失败: " + e.getMessage(), "NOTE_NOT_FOUND", true));
             return "生成思维导图失败: " + e.getMessage();

@@ -92,7 +92,7 @@ public class SupervisorService {
                 task.setToolHint(node.has("tool") ? node.get("tool").asText() : null);
                 task.setMustUseTool(node.has("mustUseTool") && node.get("mustUseTool").asBoolean());
 
-                // 解析目标追踪字段（新格式：goal + successCriteria）
+                // 解析目标追踪字段
                 task.setGoal(node.has("goal") ? node.get("goal").asText() : null);
                 if (node.has("successCriteria") && node.get("successCriteria").isArray()) {
                     java.util.List<String> criteria = new ArrayList<>();
@@ -101,13 +101,27 @@ public class SupervisorService {
                     }
                     task.setSuccessCriteria(criteria);
                 }
-                // 向后兼容：旧格式 requiredArtifacts → successCriteria
+                // 向后兼容
                 if (task.getSuccessCriteria() == null && node.has("requiredArtifacts") && node.get("requiredArtifacts").isArray()) {
                     java.util.List<String> criteria = new ArrayList<>();
                     for (JsonNode c : node.get("requiredArtifacts")) {
                         criteria.add(c.asText());
                     }
                     task.setSuccessCriteria(criteria);
+                }
+
+                // 解析依赖关系
+                if (node.has("dependsOn") && node.get("dependsOn").isArray()) {
+                    java.util.List<String> deps = new ArrayList<>();
+                    for (JsonNode d : node.get("dependsOn")) {
+                        deps.add(String.valueOf(d.asInt()));
+                    }
+                    task.setDependsOn(deps);
+                }
+
+                // 解析执行模式
+                if (node.has("executionMode")) {
+                    task.setExecutionMode(node.get("executionMode").asText());
                 }
 
                 subTasks.add(task);

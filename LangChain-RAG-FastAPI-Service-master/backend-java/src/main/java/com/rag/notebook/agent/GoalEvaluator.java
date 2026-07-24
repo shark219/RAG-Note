@@ -19,8 +19,8 @@ import java.util.*;
 @Component
 public class GoalEvaluator {
 
-    /** 产物类工具：成功即产出 artifact */
-    private static final Map<String, String> ARTIFACT_TOOL_MAP = Map.ofEntries(
+    /** 工具 → artifact 类型映射（用于 successCriteria 匹配） */
+    private static final Map<String, String> TOOL_CRITERION_MAP = Map.ofEntries(
             Map.entry("generateMindMap", "mindmap"),
             Map.entry("generateDiagram", "diagram"),
             Map.entry("createNote", "note_created"),
@@ -29,7 +29,15 @@ public class GoalEvaluator {
             Map.entry("deleteNote", "note_deleted"),
             Map.entry("mergeNotes", "notes_merged"),
             Map.entry("markReviewed", "review_marked"),
-            Map.entry("scheduleReview", "review_scheduled")
+            Map.entry("scheduleReview", "review_scheduled"),
+            Map.entry("getNote", "note_content"),
+            Map.entry("searchNotes", "search_results"),
+            Map.entry("ragSummary", "kb_summary")
+    );
+
+    /** 产生可见产物的工具（思维导图、图表等 → 前端渲染） */
+    private static final Set<String> VISIBLE_ARTIFACT_TOOLS = Set.of(
+            "generateMindMap", "generateDiagram"
     );
 
     /** 写操作工具：成功即任务完成 */
@@ -49,46 +57,42 @@ public class GoalEvaluator {
      */
     public GoalEvaluation evaluateAfterToolSuccess(AgentState state, String toolName, String rawResult) {
 
-        // 1. 构建 Observation 并注入状态
+        // 1. 构建 Observation
         Observation obs = buildObservation(toolName, rawResult);
         state.addObservation(obs);
 
-        // 2. 如果工具产出了 artifact，注册它
-        String artifactType = ARTIFACT_TOOL_MAP.get(toolName);
-        if (artifactType != null) {
-            Artifact artifact = buildArtifact(toolName, artifactType, rawResult);
+        // 2. 注册成功步骤（匹配 successCriteria）
+        String criterion = TOOL_CRITERION_MAP.get(toolName);
+        if (criterion != null) {
+            state.markStepCompleted(criterion);
+        }
+
+        // 3. 产生可见产物（思维导图、图表 → 前端渲染）
+        if (VISIBLE_ARTIFACT_TOOLS.contains(toolName)) {
+            Artifact artifact = buildArtifact(toolName, criterion, rawResult);
             state.addArtifact(artifact);
         }
 
-        // 3. 写操作成功 → 直接达成
+        // 4. 写操作成功 → 注册确认
         if (WRITE_TOOLS.contains(toolName)) {
             state.markWriteConfirmation(toolName + " 执行成功");
-            state.setTaskStatus(TaskStatus.GOAL_ACHIEVED);
-            log.info("GoalEvaluator: 写操作 {} 成功 → 目标达成", toolName);
-            return GoalEvaluation.achieved(state, "写操作已完成: " + toolName);
         }
 
-        // 4. 产物类工具成功 → 直接达成
-        if (artifactType != null && !WRITE_TOOLS.contains(toolName)) {
-            state.setTaskStatus(TaskStatus.GOAL_ACHIEVED);
-            log.info("GoalEvaluator: 产物 {} 已生成 → 目标达成", artifactType);
-            return GoalEvaluation.achieved(state, "产物已生成: " + artifactType);
-        }
-
-        // 5. 有明确 successCriteria → 逐条检查
+        // 5. 有明确 successCriteria → 逐条检查，全部满足才达成
         if (state.hasGoal() && !state.getSuccessCriteria().isEmpty()) {
             EvaluationResult result = checkSuccessCriteria(state);
             if (result.allMet) {
                 state.setTaskStatus(TaskStatus.GOAL_ACHIEVED);
-                log.info("GoalEvaluator: 所有 successCriteria 已满足 → 目标达成");
-                return GoalEvaluation.achieved(state, "所有成功标准已满足");
+                log.info("GoalEvaluator: 所有 successCriteria 已满足 ({}/{}) → 目标达成",
+                        result.met, result.total);
+                return GoalEvaluation.achieved(state, "所有成功标准已满足: " + String.join(", ", result.metList));
             }
             log.info("GoalEvaluator: 进度 {}/{}，还缺 {}",
                     result.met, result.total, result.missing);
             return GoalEvaluation.inProgress(state, result);
         }
 
-        // 6. 无明确目标/标准 → 检索类工具，继续让 LLM 决策
+        // 6. 有目标但无标准，或自由对话 → 继续
         return GoalEvaluation.undetermined(state);
     }
 
@@ -108,14 +112,18 @@ public class GoalEvaluator {
             return GoalEvaluation.allowed(state);
         }
 
-        // 写操作已确认 → 放行
-        if (state.hasWriteConfirmation()) {
-            state.setTaskStatus(TaskStatus.GOAL_ACHIEVED);
-            return GoalEvaluation.allowed(state);
+        // 有 successCriteria → 必须全部满足才放行
+        if (state.hasGoal() && !state.getSuccessCriteria().isEmpty()) {
+            EvaluationResult result = checkSuccessCriteria(state);
+            if (result.allMet) {
+                state.setTaskStatus(TaskStatus.GOAL_ACHIEVED);
+                return GoalEvaluation.allowed(state);
+            }
+            return GoalEvaluation.blocked(state, buildCriteriaNotMetPrompt(state, result));
         }
 
-        // 有产物（非写操作）→ 放行
-        if (!state.getArtifacts().isEmpty()) {
+        // 写操作已确认且无 successCriteria → 放行
+        if (state.hasWriteConfirmation()) {
             state.setTaskStatus(TaskStatus.GOAL_ACHIEVED);
             return GoalEvaluation.allowed(state);
         }
@@ -123,14 +131,6 @@ public class GoalEvaluator {
         // 有目标但无任何工具调用 → 拦截
         if (state.hasGoal() && !state.hasSuccessfulToolCall()) {
             return GoalEvaluation.blocked(state, buildMustCallToolPrompt(state));
-        }
-
-        // 有 successCriteria 但未全部满足 → 拦截
-        if (state.hasGoal() && !state.getSuccessCriteria().isEmpty()) {
-            EvaluationResult result = checkSuccessCriteria(state);
-            if (!result.allMet) {
-                return GoalEvaluation.blocked(state, buildCriteriaNotMetPrompt(state, result));
-            }
         }
 
         // 有工具调用但全是 POOR → 拦截
@@ -216,6 +216,11 @@ public class GoalEvaluator {
         String label = extractLabel(toolName, rawResult);
         Map<String, Object> meta = new HashMap<>();
         meta.put("tool", toolName);
+        // 存储产物内容（前端需要渲染），截断避免过大
+        if (rawResult != null && !rawResult.isBlank()) {
+            int maxLen = 50000;
+            meta.put("content", rawResult.length() > maxLen ? rawResult.substring(0, maxLen) + "\n...(truncated)" : rawResult);
+        }
         return new Artifact(artifactType, UUID.randomUUID().toString().substring(0, 8), label, meta);
     }
 

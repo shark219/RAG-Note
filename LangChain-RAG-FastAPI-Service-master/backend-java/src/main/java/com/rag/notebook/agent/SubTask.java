@@ -4,11 +4,15 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Supervisor 拆分的子任务。
  *
- * 设计转变：不再指定"必须调什么工具"，而是给"目标 + 成功标准"。
- * Agent 自主选择工具来达成目标。
+ * 执行模式：
+ *   SEQUENTIAL — 子任务间有依赖，必须交给同一个 Agent 按顺序执行
+ *   PARALLEL   — 子任务相互独立，可交给多个 Agent 并行执行
  */
 @Data
 @NoArgsConstructor
@@ -28,7 +32,15 @@ public class SubTask {
     private String goal;
 
     /** 成功标准——这些条件全部满足即目标达成（如 ["mindmap"]） */
-    private java.util.List<String> successCriteria;
+    private List<String> successCriteria;
+
+    // ========== 依赖与执行模式 ==========
+
+    /** 依赖的子任务 ID 列表。空列表或无依赖表示可以独立执行 */
+    private List<String> dependsOn = new ArrayList<>();
+
+    /** 执行模式：SEQUENTIAL（顺序）/ PARALLEL（并行）。默认 PARALLEL */
+    private String executionMode = "PARALLEL";
 
     // ========== 以下字段保留但降级为可选参考 ==========
 
@@ -38,8 +50,4 @@ public class SubTask {
     /** 已废弃——改用 successCriteria 判断 */
     @Deprecated
     private boolean mustUseTool;
-
-    /** 已废弃 */
-    @Deprecated
-    private String requiredEvidenceLevel;
 }

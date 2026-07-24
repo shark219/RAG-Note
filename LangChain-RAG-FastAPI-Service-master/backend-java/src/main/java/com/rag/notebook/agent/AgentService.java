@@ -111,9 +111,9 @@ public class AgentService {
     }
 
     public SseEmitter streamAgentResponse(String query, String sessionId, String userId,
-                                            boolean regenerate,
-                                            boolean enableKnowledge, boolean enableNotes,
-                                            List<String> fileIds) {
+                                          boolean regenerate,
+                                          boolean enableKnowledge, boolean enableNotes,
+                                          List<String> fileIds) {
         // 多 Agent 流水线可能耗时较长，超时设为 5 分钟
         SseEmitter emitter = new SseEmitter(300000L);
 
@@ -146,56 +146,39 @@ public class AgentService {
                         ? attachmentContext + "用户问题：" + query
                         : query;
 
-                // Supervisor 规划：判断是否需要多 Agent 流水线（只传用户原始问题）
+                // Supervisor 规划 + 依赖分析
                 List<SubTask> subTasks = supervisorService.plan(query);
 
                 String response;
-                if (subTasks.size() < 2) {
-                    // 简单查询或单子任务：使用 Agent Loop（LLM 自主决策）
-                    String systemPrompt = loadSystemPrompt();
+                AgentState finalAgentState = null;
+                String systemPrompt = loadSystemPrompt();
 
-                    // 从 Supervisor 提取目标信息（不再指定工具，只给目标）
-                    String goal = null;
-                    java.util.List<String> successCriteria = null;
-
-                    if (!subTasks.isEmpty()) {
-                        SubTask task = subTasks.get(0);
-                        goal = task.getGoal();
-                        successCriteria = task.getSuccessCriteria();
-
-                        // 目标注入系统提示（不指定工具，让 Agent 自主选择）
-                        if (goal != null && !goal.isBlank()) {
-                            systemPrompt += "\n\n[当前任务目标] " + goal;
-                            if (successCriteria != null && !successCriteria.isEmpty()) {
-                                systemPrompt += "\n[成功标准] " + String.join("、", successCriteria);
-                            }
-                            systemPrompt += "\n请自主选择合适的工具来完成此目标。";
-                        }
-
-                        log.info("Supervisor 目标: goal={}, successCriteria={}", goal, successCriteria);
-                    }
-
-                    // 上下文解析
+                if (subTasks.isEmpty()) {
                     String resolvedQuery = convCtxManager.resolveReferences(queryWithContext, sessionId);
 
                     AgentLoopResult loopResult = agentLoop.run(systemPrompt, resolvedQuery,
                             historyMessages, userId, sessionId, activeTools, emitter,
-                            goal, successCriteria);
-
-                    sendSseEvent(emitter, "thinking", Map.of(
-                            "stage", "composing",
-                            "content", "正在组织回答"
-                    ));
-
-                    // 从 AgentState 提取干净证据，交给 Composer 生成自然回答
-                    EvidencePack evidencePack = EvidencePack.from(loopResult.state());
-                    response = responseComposer.compose(evidencePack, loopResult.outcome());
-
-                    log.info("Composer 完成: outcome={}, 证据笔记 {} 篇, 回答 {} 字",
-                            loopResult.outcome(), evidencePack.notes().size(), response.length());
+                            null, null);
+                    finalAgentState = loopResult.state();
+                    response = composeAndReview(loopResult, query, emitter);
                 } else {
-                    // 复杂查询：走多 Agent 流水线
-                    response = executePipeline(subTasks, query, userId, emitter);
+                    String mode = subTasks.get(0).getExecutionMode();
+
+                    if ("SEQUENTIAL".equals(mode)) {
+                        log.info("执行模式: SEQUENTIAL, {} 个子任务", subTasks.size());
+                        PipeResult pr = runSequentialPipeline(systemPrompt, queryWithContext,
+                                historyMessages, userId, sessionId, activeTools, emitter,
+                                subTasks);
+                        response = pr.response();
+                        finalAgentState = pr.state();
+                    } else {
+                        log.info("执行模式: PARALLEL, {} 个子任务", subTasks.size());
+                        PipeResult pr = runParallelPipeline(systemPrompt, queryWithContext,
+                                historyMessages, userId, sessionId, activeTools, emitter,
+                                subTasks);
+                        response = pr.response();
+                        finalAgentState = pr.state();
+                    }
                 }
 
                 // 保存 AI 回复
@@ -232,6 +215,26 @@ public class AgentService {
                 doneData.put("trace_id", finalTraceId);
                 doneData.put("token_used", usedTokens);
                 doneData.put("token_max", maxTokens);
+
+                // 产物数据（思维导图、图表等）
+                if (finalAgentState != null) {
+                    List<Artifact> artifacts = finalAgentState.getArtifacts();
+                    if (artifacts != null && !artifacts.isEmpty()) {
+                        List<Map<String, Object>> artifactList = new ArrayList<>();
+                        for (Artifact a : artifacts) {
+                            Map<String, Object> am = new HashMap<>();
+                            am.put("type", a.type());
+                            am.put("id", a.id());
+                            am.put("label", a.label());
+                            if (a.metadata() != null) {
+                                am.putAll(a.metadata());
+                            }
+                            artifactList.add(am);
+                        }
+                        doneData.put("artifacts", artifactList);
+                    }
+                }
+
                 sendSseEvent(emitter, "done", doneData);
 
                 // 如果没有 RAG trace，保存一个基础 trace（用于用户反馈）
@@ -276,301 +279,202 @@ public class AgentService {
         return emitter;
     }
 
+    // ========== 统一管道 ==========
+
+    /** 管道执行结果：回答 + Agent 状态（含产物数据） */
+    private record PipeResult(String response, AgentState state) {}
+
     /**
-     * 多 Agent 流水线：并行执行子任务 → Writer 合成
+     * 顺序执行管道：单 Agent 按目标链依次完成
      */
-    private String executePipeline(List<SubTask> subTasks, String query,
-                                   String userId, SseEmitter emitter) throws IOException {
+    private PipeResult runSequentialPipeline(String systemPrompt, String query,
+                                          List<dev.langchain4j.data.message.ChatMessage> historyMessages,
+                                          String userId, String sessionId,
+                                          List<ToolSpecification> activeTools,
+                                          SseEmitter emitter,
+                                          List<SubTask> subTasks) throws IOException {
+        // 合并所有目标为一个目标链
+        StringBuilder goalBlock = new StringBuilder();
+        goalBlock.append("\n\n[目标序列] 你需要按顺序完成以下目标：\n");
+        java.util.List<String> allCriteria = new java.util.ArrayList<>();
+        for (int i = 0; i < subTasks.size(); i++) {
+            SubTask t = subTasks.get(i);
+            goalBlock.append((i + 1)).append(". ").append(t.getGoal());
+            if (t.getSuccessCriteria() != null && !t.getSuccessCriteria().isEmpty()) {
+                goalBlock.append(" [标准: ").append(String.join(", ", t.getSuccessCriteria())).append("]");
+                allCriteria.addAll(t.getSuccessCriteria());
+            }
+            goalBlock.append("\n");
+        }
+        goalBlock.append("\n完成一个目标后自动推进到下一个。全部完成后回答用户。");
+
+        String fullPrompt = systemPrompt + goalBlock;
+        String mergedGoal = subTasks.stream()
+                .map(SubTask::getGoal)
+                .reduce((a, b) -> a + "；然后" + b).orElse("");
+
+        String resolvedQuery = convCtxManager.resolveReferences(query, sessionId);
+
         sendSseEvent(emitter, "thinking", Map.of(
                 "stage", "planning",
-                "content", "已拆分为 " + subTasks.size() + " 个子任务，正在并行执行"
+                "content", "顺序执行 " + subTasks.size() + " 个目标"
         ));
 
-        // 1. 并行执行各子任务
-        Map<String, String> results = new LinkedHashMap<>();
+        AgentLoopResult loopResult = agentLoop.run(fullPrompt, resolvedQuery,
+                historyMessages, userId, sessionId, activeTools, emitter,
+                mergedGoal, allCriteria);
+
+        String answer = composeAndReview(loopResult, query, emitter);
+        return new PipeResult(answer, loopResult.state());
+    }
+
+    /**
+     * 并行执行管道：多 Agent 并行处理独立子任务
+     */
+    private PipeResult runParallelPipeline(String systemPrompt, String query,
+                                        List<dev.langchain4j.data.message.ChatMessage> historyMessages,
+                                        String userId, String sessionId,
+                                        List<ToolSpecification> activeTools,
+                                        SseEmitter emitter,
+                                        List<SubTask> subTasks) throws IOException {
+
+        sendSseEvent(emitter, "thinking", Map.of(
+                "stage", "planning",
+                "content", "并行执行 " + subTasks.size() + " 个子任务"
+        ));
+
+        // 并行启动各子 Agent
+        record SubResult(String taskId, String label, String content, AgentState state) {}
+        List<SubResult> results = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         for (SubTask task : subTasks) {
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+            futures.add(CompletableFuture.runAsync(() -> {
                 try {
-                    sendSseEvent(emitter, "thinking", Map.of(
-                            "stage", "researching",
-                            "content", "[" + task.getId() + "] " + task.getLabel() + " 执行中"
-                    ));
+                    String taskPrompt = systemPrompt
+                            + "\n\n[当前任务目标] " + task.getGoal()
+                            + (task.getSuccessCriteria() != null && !task.getSuccessCriteria().isEmpty()
+                               ? "\n[成功标准] " + String.join("、", task.getSuccessCriteria()) : "")
+                            + "\n请专注于完成此目标，完成后直接输出结果。";
 
-                    String result = executeSubTask(task, userId);
-                    synchronized (results) {
-                        results.put(task.getId(), result);
-                    }
+                    AgentLoopResult r = agentLoop.run(taskPrompt, query,
+                            historyMessages, userId, sessionId, activeTools, emitter,
+                            task.getGoal(), task.getSuccessCriteria());
 
-                    log.info("子任务 [{}] {} 完成, {} 字", task.getId(), task.getLabel(), result.length());
+                    // Composer 生成子任务的回答片段
+                    String content = responseComposer.compose(EvidencePack.from(r.state()), r.outcome());
+
+                    results.add(new SubResult(task.getId(), task.getLabel(), content, r.state()));
+                    log.info("并行子任务 [{}] {} 完成, {} 字", task.getId(), task.getLabel(),
+                            content.length());
                 } catch (Exception e) {
-                    log.warn("子任务 [{}] 失败: {}", task.getId(), e.getMessage());
-                    synchronized (results) {
-                        results.put(task.getId(), "执行失败: " + e.getMessage());
-                    }
+                    log.warn("并行子任务 [{}] 失败: {}", task.getId(), e.getMessage());
+                    results.add(new SubResult(task.getId(), task.getLabel(),
+                            "执行失败: " + e.getMessage(), null));
                 }
-            }, taskExecutor);
-            futures.add(future);
+            }, taskExecutor));
         }
 
-        // 等待所有子任务完成
+        // 等待全部完成
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
-        // 2. Writer 合成
+        // 合并 AgentState（产物、证据等）
+        AgentState mergedState = new AgentState(query);
+        for (SubResult sr : results) {
+            if (sr.state() != null) {
+                mergeState(mergedState, sr.state());
+            }
+        }
+
         sendSseEvent(emitter, "thinking", Map.of(
-                "stage", "writing",
+                "stage", "composing",
                 "content", "正在整合 " + results.size() + " 个子任务结果"
         ));
 
-        String finalAnswer = writerService.synthesize(query, subTasks, results);
-
-        // 3. 质量审查
-        List<Map<String, Object>> reviewDocs = results.values().stream()
-                .map(r -> Map.<String, Object>of("content", r.length() > 500 ? r.substring(0, 500) : r))
-                .toList();
-
-        if (!reviewDocs.isEmpty()) {
-            QualityReviewer.ReviewResult review = qualityReviewer.reviewAnswer(query, reviewDocs, finalAnswer);
-            if (!review.approved()) {
-                log.info("Pipeline 回答审查未通过: {}, 重新合成", review.reason());
-                // 带反馈重新合成
-                finalAnswer = writerService.synthesize(
-                        query + "\n\n注意：" + review.feedback(), subTasks, results);
-            }
-        }
-
-        log.info("Pipeline 完成: {} 个子任务, 最终回答 {} 字", subTasks.size(), finalAnswer.length());
-        return finalAnswer;
+        // Writer 合成最终回答
+        String answer = synthesizeResults(query, subTasks, results);
+        log.info("并行管道完成: {} 个子任务, 最终回答 {} 字", subTasks.size(), answer.length());
+        return new PipeResult(answer, mergedState);
     }
 
     /**
-     * 执行单个子任务：构造临时 Agent 循环
+     * Composer + 质量审查
      */
-    private String executeSubTask(SubTask task, String userId) {
-        ChatLanguageModel chatModel = modelFactory.createPreciseModel();
-
-        // 构造子任务的系统提示，明确告诉 LLM 用什么工具
-        String systemPrompt = "你是一个笔记助手，正在执行一个子任务。\n\n"
-                + "任务描述：" + task.getDescription() + "\n"
-                + "\n可用工具说明："
-                + "\n- listNotes(count, category): 列出笔记目录，获取笔记标题和ID"
-                + "\n- getNote(noteId): 读取一篇笔记的完整内容"
-                + "\n- searchNotes(query): 按关键词搜索笔记内容"
-                + "\n- getRecentNotes(count): 获取最近编辑的笔记"
-                + "\n- ragSummary(query): 从知识库检索文档，传入查询内容"
-                + "\n- getNoteStats(): 获取笔记统计（无需参数）"
-                + "\n- getTodayReviews(): 获取今日复习（无需参数）"
-                + "\n- createNote(title, content): 创建笔记"
-                + "\n- editNote(noteId, title, content): 编辑笔记"
-                + "\n- appendNote(noteId, appendContent): 向笔记追加内容"
-                + "\n- deleteNote(noteId): 删除笔记"
-                + "\n- mergeNotes(noteIds, newTitle): 合并多篇笔记"
-                + "\n- getRelatedNotes(noteId): 查找相关笔记"
-                + "\n- fetchUrl(url): 抓取网页内容"
-                + "\n- generateDiagram(type, description): 生成图表"
-                + "\n- scheduleReview(noteId, days): 安排复习"
-                + "\n- whatTimeIsNow(): 获取当前时间"
-                + (task.getToolHint() != null ? "\n\n必须使用工具: " + task.getToolHint() : "")
-                + "\n\n请直接调用工具执行任务，不要自己编造内容。";
-
-        List<dev.langchain4j.data.message.ChatMessage> messages = new ArrayList<>();
-        messages.add(SystemMessage.from(systemPrompt));
-        messages.add(UserMessage.from(task.getDescription()));
-
-        // 最多 2 轮工具调用（子任务应该更轻量）
-        for (int i = 0; i < 2; i++) {
-            Response<AiMessage> response = chatModel.generate(messages, toolSpecifications);
-            AiMessage aiMessage = response.content();
-
-            if (aiMessage.hasToolExecutionRequests()) {
-                messages.add(aiMessage);
-                for (ToolExecutionRequest toolRequest : aiMessage.toolExecutionRequests()) {
-                    String toolResult = executeToolWithUserId(toolRequest.name(), toolRequest.arguments(), userId);
-                    messages.add(ToolExecutionResultMessage.from(toolRequest, toolResult));
-                }
-            } else {
-                return aiMessage.text();
-            }
-        }
-
-        // 达到最大轮次，强制生成
-        Response<AiMessage> finalResponse = chatModel.generate(messages);
-        return finalResponse.content().text();
-    }
-
-    /**
-     * LangChain4j function calling 循环
-     */
-    private String processWithFunctionCalling(
-            List<dev.langchain4j.data.message.ChatMessage> messages,
-            String userId, SseEmitter emitter, String sessionId, String query,
-            List<ToolSpecification> activeTools) throws IOException {
-
-        ChatLanguageModel chatModel = modelFactory.createPreciseModel();
-
-        // Agent 循环：最多 3 轮工具调用
-        for (int i = 0; i < 3; i++) {
-            // 发送消息 + 工具定义给 LLM
-            Response<AiMessage> chatResponse = chatModel.generate(messages, activeTools);
-            AiMessage aiMessage = chatResponse.content();
-
-            // LLM 要求调用工具
-            if (aiMessage.hasToolExecutionRequests()) {
-                String toolNames = aiMessage.toolExecutionRequests().stream()
-                        .map(ToolExecutionRequest::name)
-                        .reduce((a, b) -> a + ", " + b).orElse("");
-                log.info("LLM 请求调用工具: {}", toolNames);
-
-                sendSseEvent(emitter, "thinking", Map.of(
-                        "stage", "tool_call",
-                        "content", "正在调用工具: " + toolNames
-                ));
-
-                // 把 AI 的工具调用消息加入历史
-                messages.add(aiMessage);
-
-                // 执行每个工具调用
-                for (ToolExecutionRequest toolRequest : aiMessage.toolExecutionRequests()) {
-                    String toolName = toolRequest.name();
-                    String toolArgs = toolRequest.arguments();
-                    log.info("Executing tool: {} with args: {}", toolName, toolArgs);
-
-                    // 注入 userId 执行工具
-                    String toolResult = executeToolWithUserId(toolName, toolArgs, userId);
-
-                    // 工具结果加入消息列表
-                    messages.add(ToolExecutionResultMessage.from(toolRequest, toolResult));
-
-                    log.info("Tool '{}' result: {}", toolName,
-                            toolResult.length() > 100 ? toolResult.substring(0, 100) + "..." : toolResult);
-                }
-                // 继续循环，让 LLM 基于工具结果生成回复
-            } else {
-                // LLM 不需要调工具，返回文本前做质量审查
-                String answer = aiMessage.text();
-                log.info("LLM 未调用工具，直接返回文本 (前100字): {}", answer.length() > 100 ? answer.substring(0, 100) + "..." : answer);
-                return reviewAndRetryIfNeeded(chatModel, messages, answer, emitter, query);
-            }
-        }
-
-        // 达到最大轮次，最终调用一次（不带工具定义）
-        Response<AiMessage> finalResponse = chatModel.generate(messages);
-        String answer = finalResponse.content().text();
-        return reviewAndRetryIfNeeded(chatModel, messages, answer, emitter, query);
-    }
-
-    /**
-     * 回答质量审查：不达标时追加反馈重试一次
-     */
-    private String reviewAndRetryIfNeeded(ChatLanguageModel chatModel,
-                                          List<dev.langchain4j.data.message.ChatMessage> messages,
-                                          String answer, SseEmitter emitter,
-                                          String query) throws IOException {
-        // 提取工具结果作为参考文档
-        List<Map<String, Object>> toolDocs = messages.stream()
-                .filter(m -> m instanceof ToolExecutionResultMessage)
-                .map(m -> {
-                    String content = ((ToolExecutionResultMessage) m).text();
-                    return Map.<String, Object>of("content", content.length() > 1500 ? content.substring(0, 1500) : content);
-                })
-                .toList();
-
-        if (toolDocs.isEmpty()) {
-            return answer;
-        }
-
-        QualityReviewer.ReviewResult review = qualityReviewer.reviewAnswer(query, toolDocs, answer);
-        if (review.approved()) {
-            return answer;
-        }
-
-        log.info("Agent 回答审查未通过: {}, 尝试重试", review.reason());
+    private String composeAndReview(AgentLoopResult loopResult, String query,
+                                     SseEmitter emitter) throws IOException {
         sendSseEvent(emitter, "thinking", Map.of(
-                "stage", "review",
-                "content", "回答质量不足，正在优化: " + review.reason()
+                "stage", "composing",
+                "content", "正在组织回答"
         ));
 
-        // 追加反馈消息，让 LLM 重新生成
-        messages.add(AiMessage.from(answer));
-        messages.add(UserMessage.from(
-                "你的回答质量不够好，请根据以下反馈重新回答：\n" + review.feedback()
-                        + "\n\n请直接给出改进后的回答，不要加任何前缀语，不要调用工具。"
-        ));
+        EvidencePack pack = EvidencePack.from(loopResult.state());
+        String answer = responseComposer.compose(pack, loopResult.outcome());
 
-        try {
-            // 重试时使用平衡模型，提升回答质量
-            ChatLanguageModel balancedModel = modelFactory.createBalancedModel();
-            Response<AiMessage> retryResponse = balancedModel.generate(messages);
-            String retryAnswer = retryResponse.content().text();
-            if (retryAnswer != null && !retryAnswer.isBlank()) {
-                // 去掉 LLM 习惯性添加的前缀语
-                retryAnswer = retryAnswer.replaceAll("^(了解您的反馈[，,].*?[：:]\n?)", "").trim();
-                log.info("Agent 回答重试成功");
-                return retryAnswer;
-            }
-        } catch (Exception e) {
-            log.warn("Agent 回答重试失败: {}", e.getMessage());
+        log.info("Composer 完成: outcome={}, 证据笔记 {} 篇, 产物 {} 个, 回答 {} 字",
+                loopResult.outcome(), pack.notes().size(),
+                pack.artifacts() != null ? pack.artifacts().size() : 0, answer.length());
+
+        // 质量审查
+        var review = qualityReviewer.reviewAnswer(query,
+                pack.notes().stream()
+                        .map(n -> Map.<String, Object>of("content", n.content() != null
+                                ? n.content().substring(0, Math.min(500, n.content().length())) : ""))
+                        .collect(java.util.stream.Collectors.toList()),
+                answer);
+
+        if (!review.approved()) {
+            log.info("质量审查未通过: {}, 重新生成", review.reason());
+            answer = responseComposer.compose(pack, loopResult.outcome());
         }
 
         return answer;
     }
 
     /**
-     * 解析工具参数并注入 userId 执行
+     * 合并多个 AgentState 到一个
      */
-    private String executeToolWithUserId(String toolName, String arguments, String userId) {
-        try {
-            Map<String, String> args = parseToolArguments(arguments);
-            return switch (toolName) {
-                case "listNotes" -> agentTools.listNotes(
-                        args.getOrDefault("count", "20"),
-                        args.getOrDefault("category", ""),
-                        userId);
-                case "getNote" -> agentTools.getNote(
-                        args.getOrDefault("noteId", ""),
-                        userId);
-                case "ragSummary" -> agentTools.ragSummary(args.getOrDefault("query", ""), userId);
-                case "searchNotes" -> agentTools.searchNotes(args.getOrDefault("query", ""), userId);
-                case "getNoteStats" -> agentTools.getNoteStats(userId);
-                case "getRecentNotes" -> agentTools.getRecentNotes(
-                        args.getOrDefault("count", "3"), userId);
-                case "getTodayReviews" -> agentTools.getTodayReviews(userId);
-                case "markReviewed" -> agentTools.markReviewed(args.getOrDefault("noteId", ""), userId);
-                case "createNote" -> agentTools.createNote(
-                        args.getOrDefault("title", ""), args.getOrDefault("content", ""), userId);
-                case "editNote" -> agentTools.editNote(
-                        args.getOrDefault("noteId", ""),
-                        args.getOrDefault("title", ""),
-                        args.getOrDefault("content", ""),
-                        userId);
-                case "appendNote" -> agentTools.appendNote(
-                        args.getOrDefault("noteId", ""),
-                        args.getOrDefault("appendContent", ""),
-                        userId);
-                case "deleteNote" -> agentTools.deleteNote(args.getOrDefault("noteId", ""), userId);
-                case "getRelatedNotes" -> agentTools.getRelatedNotes(args.getOrDefault("noteId", ""), userId);
-                case "mergeNotes" -> agentTools.mergeNotes(
-                        args.getOrDefault("noteIds", ""),
-                        args.getOrDefault("newTitle", "合并笔记"),
-                        userId);
-                case "fetchUrl" -> agentTools.fetchUrl(args.getOrDefault("url", ""));
-                case "generateDiagram" -> agentTools.generateDiagram(
-                        args.getOrDefault("type", "flowchart"),
-                        args.getOrDefault("description", ""));
-                case "scheduleReview" -> agentTools.scheduleReview(
-                        args.getOrDefault("noteId", ""),
-                        args.getOrDefault("days", "1"),
-                        userId);
-                case "generateMindMap" -> agentTools.generateMindMap(
-                        args.getOrDefault("noteId", ""), userId);
-                case "whatTimeIsNow" -> agentTools.whatTimeIsNow();
-                default -> "未知工具: " + toolName;
-            };
-        } catch (Exception e) {
-            log.error("Tool '{}' execution failed: {}", toolName, e.getMessage());
-            return "工具执行失败: " + e.getMessage();
+    private void mergeState(AgentState target, AgentState source) {
+        for (var fact : source.getWorkingMemory()) {
+            target.addKnownFact(fact);
         }
+        for (var artifact : source.getArtifacts()) {
+            target.addArtifact(artifact);
+        }
+        if (source.hasWriteConfirmation()) {
+            target.markWriteConfirmation(source.getWriteConfirmation());
+        }
+    }
+
+    /**
+     * 用 WriterService 合成多个并行子任务的结果
+     */
+    private String synthesizeResults(String query, List<SubTask> subTasks,
+                                      List<?> results) {
+        Map<String, String> resultMap = new LinkedHashMap<>();
+        for (Object obj : results) {
+            try {
+                var method = obj.getClass().getMethod("taskId");
+                var contentMethod = obj.getClass().getMethod("content");
+                resultMap.put((String) method.invoke(obj), (String) contentMethod.invoke(obj));
+            } catch (Exception ignored) {}
+        }
+
+        String answer = writerService.synthesize(query, subTasks, resultMap);
+
+        // 质量审查
+        List<Map<String, Object>> reviewDocs = resultMap.values().stream()
+                .map(r -> Map.<String, Object>of("content", r.length() > 500 ? r.substring(0, 500) : r))
+                .toList();
+
+        if (!reviewDocs.isEmpty()) {
+            var review = qualityReviewer.reviewAnswer(query, reviewDocs, answer);
+            if (!review.approved()) {
+                log.info("并行管道审查未通过: {}, 重新合成", review.reason());
+                answer = writerService.synthesize(
+                        query + "\n\n注意：" + review.feedback(), subTasks, resultMap);
+            }
+        }
+        return answer;
     }
 
     /**

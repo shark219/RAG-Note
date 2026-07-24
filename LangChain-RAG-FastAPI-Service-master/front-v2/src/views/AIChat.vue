@@ -137,6 +137,23 @@
               </div>
               <!-- 回复正文 -->
               <div v-if="msg.content" class="message-text" v-html="renderMarkdown(msg.content)" />
+              <!-- 产物渲染（思维导图、图表等） -->
+              <div v-if="msg.artifacts && msg.artifacts.length > 0" class="artifact-section">
+                <div v-for="art in msg.artifacts" :key="art.id" class="artifact-card">
+                  <div class="artifact-header">
+                    <span class="artifact-icon">{{ artifactIcon(art.type) }}</span>
+                    <span class="artifact-label">{{ art.label || art.type }}</span>
+                    <a-button type="text" size="mini" @click="toggleArtifactCollapse(art.id)">
+                      {{ collapsedArtifacts[art.id] ? '展开' : '收起' }}
+                    </a-button>
+                  </div>
+                  <div v-show="!collapsedArtifacts[art.id]" class="artifact-body">
+                    <div v-if="art.type === 'mindmap' || art.type === 'diagram'" class="artifact-markdown"
+                         v-html="renderMarkdown(art.content || '')" />
+                    <div v-else class="artifact-raw">{{ art.content }}</div>
+                  </div>
+                </div>
+              </div>
               <!-- 用户反馈按钮 -->
               <div v-if="msg.role === 'ai' && msg.content && msg.traceId && !msg.feedback" class="feedback-bar">
                 <span class="feedback-btn" @click="submitFeedback(msg, 5)">👍</span>
@@ -336,6 +353,18 @@ import {
 } from '@arco-design/web-vue/es/icon'
 import { chatApi, evaluationApi } from '@/api'
 import { marked } from 'marked'
+import { markedHighlight } from 'marked-highlight'
+import hljs from 'highlight.js'
+
+marked.use(markedHighlight({
+  langPrefix: 'hljs language-',
+  highlight(code: string, lang: string) {
+    if (lang && hljs.getLanguage(lang)) {
+      return hljs.highlight(code, { language: lang }).value
+    }
+    return code
+  },
+}))
 
 const messagesRef = ref<HTMLElement>()
 const inputMessage = ref('')
@@ -348,6 +377,20 @@ const showToolApproval = ref(false)
 let stopFlag = false
 const tokenUsed = ref(0)
 const tokenMax = ref(32000)
+
+// 产物展开/收起状态
+const collapsedArtifacts = ref<Record<string, boolean>>({})
+function toggleArtifactCollapse(id: string) {
+  collapsedArtifacts.value[id] = !collapsedArtifacts.value[id]
+}
+function artifactIcon(type: string) {
+  const icons: Record<string, string> = {
+    mindmap: '🧠',
+    diagram: '📊',
+    note: '📝',
+  }
+  return icons[type] || '📦'
+}
 
 const config = reactive({
   knowledgeEnabled: true,
@@ -765,10 +808,14 @@ async function sendMessage(text: string, options?: { skipUserMessage?: boolean; 
               // 更新 token 用量
               if (data.token_used !== undefined) tokenUsed.value = data.token_used
               if (data.token_max !== undefined) tokenMax.value = data.token_max
-              // 保存 traceId 到消息
+              // 保存 traceId 和产物到消息
               const msg = lastMsg()
-              if (msg?.role === 'ai' && traceId) {
-                msg.traceId = traceId
+              if (msg?.role === 'ai') {
+                if (traceId) msg.traceId = traceId
+                // 产物数据（思维导图、图表等）
+                if (data.artifacts && Array.isArray(data.artifacts) && data.artifacts.length > 0) {
+                  msg.artifacts = data.artifacts
+                }
               }
               break
             }
@@ -799,11 +846,25 @@ async function sendMessage(text: string, options?: { skipUserMessage?: boolean; 
 
     if (autoCollapseTimer) clearTimeout(autoCollapseTimer)
 
-    // 流式完成后刷新会话列表和消息ID
-    setTimeout(() => {
-      fetchSessions()
+    // 流式完成后刷新会话列表和消息ID（保留产物数据避免被服务端覆盖）
+    const savedArtifacts: Record<number, any[]> = {}
+    messages.value.forEach((m: any, i: number) => {
+      if (m.role === 'ai' && m.artifacts?.length > 0) {
+        savedArtifacts[i] = [...m.artifacts]
+      }
+    })
+    setTimeout(async () => {
+      await fetchSessions()
       fetchTokenUsage()
-      fetchMessages()
+      await fetchMessages()
+      // 恢复产物数据
+      Object.entries(savedArtifacts).forEach(([idx, arts]) => {
+        const i = Number(idx)
+        if (i < messages.value.length) {
+          const m = messages.value[i] as any
+          if (m.role === 'ai') m.artifacts = arts
+        }
+      })
     }, 500)
   } catch (e: any) {
     console.error('发送失败', e)
@@ -1481,6 +1542,75 @@ function formatTime(dateStr: string) {
   font-size: 11px;
   color: var(--color-text-3);
   margin-top: 6px;
+}
+
+/* 产物渲染（思维导图、图表等） */
+.artifact-section {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.artifact-card {
+  border: 1px solid var(--color-border-2);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--color-bg-1);
+}
+
+.artifact-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--color-fill-2);
+  border-bottom: 1px solid var(--color-border-2);
+}
+
+.artifact-icon {
+  font-size: 16px;
+}
+
+.artifact-label {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-1);
+}
+
+.artifact-body {
+  padding: 12px;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.artifact-markdown {
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.artifact-markdown :deep(h1),
+.artifact-markdown :deep(h2),
+.artifact-markdown :deep(h3) {
+  margin-top: 10px;
+  margin-bottom: 6px;
+}
+
+.artifact-markdown :deep(ul),
+.artifact-markdown :deep(ol) {
+  padding-left: 20px;
+  margin: 4px 0;
+}
+
+.artifact-markdown :deep(li) {
+  margin: 2px 0;
+}
+
+.artifact-raw {
+  font-size: 12px;
+  white-space: pre-wrap;
+  color: var(--color-text-2);
 }
 
 /* 思考动画 */
