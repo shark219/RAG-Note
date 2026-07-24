@@ -154,45 +154,33 @@ public class AgentService {
                     // 简单查询或单子任务：使用 Agent Loop（LLM 自主决策）
                     String systemPrompt = loadSystemPrompt();
 
-                    // 如果 Supervisor 给出了工具提示，注入到系统提示中
-                    String forceToolHint = null;
-                    String forceToolDesc = null;
-                    String goalDescription = null;
-                    java.util.List<String> requiredArtifacts = null;
-                    String stopCondition = null;
+                    // 从 Supervisor 提取目标信息（不再指定工具，只给目标）
+                    String goal = null;
+                    java.util.List<String> successCriteria = null;
 
-                    if (!subTasks.isEmpty() && subTasks.get(0).getToolHint() != null) {
+                    if (!subTasks.isEmpty()) {
                         SubTask task = subTasks.get(0);
-                        forceToolHint = task.getToolHint();
-                        forceToolDesc = task.getDescription();
-                        boolean mustUse = task.isMustUseTool();
+                        goal = task.getGoal();
+                        successCriteria = task.getSuccessCriteria();
 
-                        if (mustUse) {
-                            systemPrompt += "\n\n[必须执行] 任务要求调用 " + forceToolHint + " 工具（关键词：" + forceToolDesc + "）。"
-                                    + "你必须先调用此工具获取数据，不允许跳过直接回答。"
-                                    + "如果用户问的是笔记，用 searchNotes 而不是 ragSummary。";
-                        } else {
-                            systemPrompt += "\n\n[参考] 上级建议的工具：" + forceToolHint + "（关键词：" + forceToolDesc + "）。"
-                                    + "你必须根据用户实际意图选择正确的工具。"
-                                    + "如果用户问的是笔记，用 searchNotes 而不是 ragSummary。";
+                        // 目标注入系统提示（不指定工具，让 Agent 自主选择）
+                        if (goal != null && !goal.isBlank()) {
+                            systemPrompt += "\n\n[当前任务目标] " + goal;
+                            if (successCriteria != null && !successCriteria.isEmpty()) {
+                                systemPrompt += "\n[成功标准] " + String.join("、", successCriteria);
+                            }
+                            systemPrompt += "\n请自主选择合适的工具来完成此目标。";
                         }
 
-                        // 提取目标追踪字段
-                        goalDescription = task.getGoal();
-                        requiredArtifacts = task.getRequiredArtifacts();
-                        stopCondition = task.getStopCondition();
-
-                        log.info("注入 Supervisor 工具提示: tool={}, desc={}, mustUse={}, goal={}, artifacts={}",
-                                forceToolHint, forceToolDesc, mustUse, goalDescription, requiredArtifacts);
+                        log.info("Supervisor 目标: goal={}, successCriteria={}", goal, successCriteria);
                     }
 
-                    // 上下文解析：将"这篇笔记"、"给它xxx"等代词引用解析为实际 noteId
+                    // 上下文解析
                     String resolvedQuery = convCtxManager.resolveReferences(queryWithContext, sessionId);
 
                     AgentLoopResult loopResult = agentLoop.run(systemPrompt, resolvedQuery,
                             historyMessages, userId, sessionId, activeTools, emitter,
-                            forceToolHint, forceToolDesc,
-                            goalDescription, requiredArtifacts, stopCondition);
+                            goal, successCriteria);
 
                     sendSseEvent(emitter, "thinking", Map.of(
                             "stage", "composing",

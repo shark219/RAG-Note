@@ -11,7 +11,10 @@ import java.util.regex.Pattern;
  * 从 AgentState 中提取的干净证据包。
  *
  * 关键设计：与 Agent 内部消息历史隔离。
- * Composer 只看到 userQuery + 结构化证据，看不到 System Prompt、Reflection、Observation 等内部上下文。
+ * Composer 只看到 userQuery + 结构化证据 + 产物，看不到 System Prompt、Reflection 等内部上下文。
+ *
+ * 新增 artifacts 字段：产物类工具（generateMindMap、generateDiagram）的结果，
+ * 让 Composer 能正确识别"产物已生成"，而不是误判为"没有证据"。
  */
 public record EvidencePack(
         String userQuery,
@@ -19,12 +22,13 @@ public record EvidencePack(
         String knowledgeBaseSummary,
         String noteStats,
         String todayReviews,
-        String writeConfirmation
+        String writeConfirmation,
+        String goal,
+        List<Artifact> artifacts
 ) {
 
     /**
-     * 从 AgentState 的工具调用历史中提取结构化证据。
-     * 去重策略：同一 noteId 只保留深度最高的证据（CONTENT > SEARCH > LIST）。
+     * 从 AgentState 提取结构化证据。
      */
     public static EvidencePack from(AgentState state) {
         List<NoteEvidence> notes = extractNoteEvidences(state);
@@ -32,17 +36,24 @@ public record EvidencePack(
         String stats = extractNoteStats(state);
         String reviews = extractTodayReviews(state);
         String writeConf = state.getWriteConfirmation();
+        String goal = state.getGoal();
+        List<Artifact> artifacts = state.getArtifacts();
 
-        return new EvidencePack(state.getOriginalQuery(), notes, kbSummary, stats, reviews, writeConf);
+        return new EvidencePack(state.getOriginalQuery(), notes, kbSummary, stats, reviews, writeConf, goal, artifacts);
     }
 
     /**
-     * 是否有任何有效证据
+     * 是否有任何有效证据（包括产物）
      */
     public boolean isEmpty() {
         return notes.isEmpty() && knowledgeBaseSummary == null
                 && noteStats == null && todayReviews == null
-                && writeConfirmation == null;
+                && writeConfirmation == null && artifacts.isEmpty();
+    }
+
+    /** 是否包含产物（思维导图、图表等） */
+    public boolean hasArtifacts() {
+        return artifacts != null && !artifacts.isEmpty();
     }
 
     // === 笔记证据提取 ===

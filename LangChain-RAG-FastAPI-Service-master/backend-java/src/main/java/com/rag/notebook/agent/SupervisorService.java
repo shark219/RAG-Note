@@ -92,16 +92,23 @@ public class SupervisorService {
                 task.setToolHint(node.has("tool") ? node.get("tool").asText() : null);
                 task.setMustUseTool(node.has("mustUseTool") && node.get("mustUseTool").asBoolean());
 
-                // 解析新增的目标追踪字段
+                // 解析目标追踪字段（新格式：goal + successCriteria）
                 task.setGoal(node.has("goal") ? node.get("goal").asText() : null);
-                if (node.has("requiredArtifacts") && node.get("requiredArtifacts").isArray()) {
-                    java.util.List<String> artifacts = new ArrayList<>();
-                    for (JsonNode artifactNode : node.get("requiredArtifacts")) {
-                        artifacts.add(artifactNode.asText());
+                if (node.has("successCriteria") && node.get("successCriteria").isArray()) {
+                    java.util.List<String> criteria = new ArrayList<>();
+                    for (JsonNode c : node.get("successCriteria")) {
+                        criteria.add(c.asText());
                     }
-                    task.setRequiredArtifacts(artifacts);
+                    task.setSuccessCriteria(criteria);
                 }
-                task.setStopCondition(node.has("stopCondition") ? node.get("stopCondition").asText() : null);
+                // 向后兼容：旧格式 requiredArtifacts → successCriteria
+                if (task.getSuccessCriteria() == null && node.has("requiredArtifacts") && node.get("requiredArtifacts").isArray()) {
+                    java.util.List<String> criteria = new ArrayList<>();
+                    for (JsonNode c : node.get("requiredArtifacts")) {
+                        criteria.add(c.asText());
+                    }
+                    task.setSuccessCriteria(criteria);
+                }
 
                 subTasks.add(task);
             }
