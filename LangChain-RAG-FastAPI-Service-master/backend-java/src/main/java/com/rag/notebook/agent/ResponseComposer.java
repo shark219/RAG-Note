@@ -61,6 +61,10 @@ public class ResponseComposer {
         StringBuilder sb = new StringBuilder();
         sb.append("用户问题：").append(pack.userQuery()).append("\n\n");
 
+        if (asksForNoteId(pack.userQuery())) {
+            sb.append("用户明确询问笔记ID。回答中可以给出匹配笔记的 noteId，但不要编造没有出现在证据里的ID。\n\n");
+        }
+
         // 目标（如果有）
         if (pack.goal() != null && !pack.goal().isBlank()) {
             sb.append("任务目标：").append(pack.goal()).append("\n\n");
@@ -107,6 +111,15 @@ public class ResponseComposer {
             for (EvidencePack.NoteEvidence note : pack.notes()) {
                 sb.append("---\n");
                 sb.append("标题：").append(note.title() != null ? note.title() : "无标题").append("\n");
+                if (note.noteId() != null && !note.noteId().isBlank()) {
+                    sb.append("笔记ID：").append(note.noteId()).append("\n");
+                }
+                if (note.category() != null && !note.category().isBlank()) {
+                    sb.append("分类：").append(note.category()).append("\n");
+                }
+                if (note.tags() != null && !note.tags().isBlank()) {
+                    sb.append("标签：").append(note.tags()).append("\n");
+                }
                 if (note.content() != null && !note.content().isBlank()) {
                     String label = switch (note.depth()) {
                         case CONTENT_EVIDENCE -> "完整内容";
@@ -161,6 +174,13 @@ public class ResponseComposer {
             if (note.content() != null) sb.append(note.content()).append("\n\n");
         }
         return sb.toString().trim();
+    }
+
+    private boolean asksForNoteId(String query) {
+        if (query == null || query.isBlank()) return false;
+        String q = query.toLowerCase();
+        return q.contains("id") || q.contains("笔记id") || q.contains("笔记 ID")
+                || q.contains("编号") || q.contains("noteid") || q.contains("note id");
     }
 
     private String loadComposePrompt() {

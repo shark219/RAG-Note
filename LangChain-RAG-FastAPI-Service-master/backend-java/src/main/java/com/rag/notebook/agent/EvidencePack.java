@@ -71,6 +71,10 @@ public record EvidencePack(
                 }
                 case "searchNotes" -> raw.addAll(parseSearchNotesResult(r.result()));
                 case "listNotes" -> raw.addAll(parseListNotesResult(r.result()));
+                case "createNote", "editNote", "appendNote" -> {
+                    NoteEvidence e = parseWriteNoteResult(r.toolName(), r.args(), r.result());
+                    if (e != null) raw.add(e);
+                }
             }
         }
 
@@ -166,11 +170,12 @@ public record EvidencePack(
             String noteId = extractFirst(part, "\\[ID: ([^\\]]+)\\]");
             String category = extractFirst(part, "\\[([^\\]]+)\\]\\s*(?:标签|$)");
             if (category != null && category.startsWith("ID:")) category = null;
+            String tags = extractFirst(part, "标签:([^\\n]+)");
             String contentPreview = extractFirst(part, "内容:\\s*(.+)");
 
             if (title != null) {
                 list.add(new NoteEvidence(noteId, title.trim(), contentPreview,
-                        category, null, AgentState.EvidenceLevel.SEARCH_EVIDENCE));
+                        category, tags, AgentState.EvidenceLevel.SEARCH_EVIDENCE));
             }
         }
         return list;
@@ -198,6 +203,37 @@ public record EvidencePack(
             }
         }
         return list;
+    }
+
+    /**
+     * 写操作成功后，工具返回通常只有"创建成功/编辑成功"。
+     * 真正的正文在工具参数里；把它提取为证据，供 Composer 和 QualityReviewer 使用。
+     */
+    private static NoteEvidence parseWriteNoteResult(String toolName, String argsJson, String result) {
+        try {
+            java.util.Map<String, String> args = parseArgs(argsJson);
+            String noteId = extractFirst(result, "(?:ID|笔记ID):\\s*([^，,\\s]+)");
+            String title = firstNonBlank(args.get("title"), extractFirst(result, "标题:\\s*(.+)$"));
+            String content = switch (toolName) {
+                case "createNote", "editNote" -> args.get("content");
+                case "appendNote" -> args.get("appendContent");
+                default -> null;
+            };
+
+            if (isBlank(title) && isBlank(content)) {
+                return null;
+            }
+
+            String evidenceContent = content;
+            if ("appendNote".equals(toolName) && !isBlank(content)) {
+                evidenceContent = "[本次追加内容]\n" + content;
+            }
+
+            return new NoteEvidence(noteId, title, evidenceContent, null, null,
+                    AgentState.EvidenceLevel.CONTENT_EVIDENCE);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     // === 其他证据类型 ===
@@ -232,8 +268,33 @@ public record EvidencePack(
     // === 工具方法 ===
 
     private static String extractFirst(String text, String regex) {
+        if (text == null) return null;
         Matcher m = Pattern.compile(regex, Pattern.MULTILINE).matcher(text);
         return m.find() ? m.group(1) : null;
+    }
+
+    private static java.util.Map<String, String> parseArgs(String json) throws Exception {
+        java.util.Map<String, String> result = new java.util.HashMap<>();
+        if (json == null || json.isBlank()) return result;
+
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        com.fasterxml.jackson.databind.JsonNode node = mapper.readTree(json.trim());
+        if (node.isObject()) {
+            var fields = node.fields();
+            while (fields.hasNext()) {
+                var entry = fields.next();
+                result.put(entry.getKey(), entry.getValue().asText());
+            }
+        }
+        return result;
+    }
+
+    private static String firstNonBlank(String first, String second) {
+        return !isBlank(first) ? first : second;
+    }
+
+    private static boolean isBlank(String text) {
+        return text == null || text.isBlank();
     }
 
     // === NoteEvidence 记录 ===

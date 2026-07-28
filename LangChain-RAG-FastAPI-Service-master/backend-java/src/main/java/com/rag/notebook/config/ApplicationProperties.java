@@ -34,6 +34,7 @@ public class ApplicationProperties {
         private Zhipu zhipu = new Zhipu();
         private Ollama ollama = new Ollama();
         private Aliyun aliyun = new Aliyun();
+        private DeepSeek deepseek = new DeepSeek();
 
         @Data
         public static class Zhipu {
@@ -53,6 +54,13 @@ public class ApplicationProperties {
             private String apiKey = "";
             private String baseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1";
             private String model = "qwen3-max";
+        }
+
+        @Data
+        public static class DeepSeek {
+            private String apiKey = "";
+            private String baseUrl = "https://api.deepseek.com/v1";
+            private String model = "deepseek-chat";
         }
     }
 

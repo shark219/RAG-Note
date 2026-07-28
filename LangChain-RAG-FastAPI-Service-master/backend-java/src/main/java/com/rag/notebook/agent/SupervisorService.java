@@ -89,7 +89,11 @@ public class SupervisorService {
                 task.setId("R-" + (i + 1));
                 task.setLabel(node.has("label") ? node.get("label").asText() : "子任务" + (i + 1));
                 task.setDescription(node.has("description") ? node.get("description").asText() : "");
-                task.setToolHint(node.has("tool") ? node.get("tool").asText() : null);
+                if (node.has("toolHint")) {
+                    task.setToolHint(node.get("toolHint").asText());
+                } else if (node.has("tool")) {
+                    task.setToolHint(node.get("tool").asText());
+                }
                 task.setMustUseTool(node.has("mustUseTool") && node.get("mustUseTool").asBoolean());
 
                 // 解析目标追踪字段
