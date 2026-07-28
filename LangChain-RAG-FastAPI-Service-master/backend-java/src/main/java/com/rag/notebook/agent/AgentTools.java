@@ -227,22 +227,25 @@ public class AgentTools {
         }
     }
 
-    @Tool("获取用户今天需要复习的笔记列表。触发场景：用户提到'复习'、'回顾'、'今天复习'、'复习计划'时调用此工具")
+    @Tool("获取用户今天需要复习的笔记列表。触发场景：用户提到’复习’、’复习时间’、’回顾’、’今天复习’、’复习计划’时调用此工具")
     public String getTodayReviews(@ToolMemoryId String userId) {
         try {
             Map<String, Object> result = reviewService.getTodayReviews(userId);
             @SuppressWarnings("unchecked")
-            List<Map<String, Object>> reviews = (List<Map<String, Object>>) result.get("reviews");
-            if (reviews == null || reviews.isEmpty()) {
+            List<?> reviewsRaw = (List<?>) result.get("reviews");
+            if (reviewsRaw == null || reviewsRaw.isEmpty()) {
+                setResult(ToolResult.empty("今天没有需要复习的笔记。"));
                 return "今天没有需要复习的笔记。";
             }
-            StringBuilder sb = new StringBuilder("今天需要复习 ").append(reviews.size()).append(" 条笔记：\n");
-            for (int i = 0; i < reviews.size(); i++) {
-                Map<String, Object> r = reviews.get(i);
-                sb.append(i + 1).append(". ").append(r.get("title")).append("\n");
+            StringBuilder sb = new StringBuilder("今天需要复习 ").append(reviewsRaw.size()).append(" 条笔记：\n");
+            for (int i = 0; i < reviewsRaw.size(); i++) {
+                sb.append(i + 1).append(". ").append(reviewsRaw.get(i).toString()).append("\n");
             }
-            return sb.toString();
+            String display = sb.toString();
+            setResult(ToolResult.success(display));
+            return display;
         } catch (Exception e) {
+            setResult(ToolResult.error("获取复习列表失败: " + e.getMessage(), "EXCEPTION", true));
             return "获取复习列表失败: " + e.getMessage();
         }
     }

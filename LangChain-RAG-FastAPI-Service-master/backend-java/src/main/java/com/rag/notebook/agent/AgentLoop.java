@@ -91,8 +91,12 @@ public class AgentLoop {
                 String stateView = buildStateViewForReflection(state);
                 messages.add(UserMessage.from(stateView));
                 state.markProgress();
-                log.info("注入环境状态视图（连续{}轮无进展）", state.getConsecutiveNoProgress() + 1);
+                log.info("注入环境状态视图（连续{}轮无进展）:\n{}",
+                        state.getConsecutiveNoProgress() + 1, stateView);
             }
+
+            // 每轮开始时发送思考状态，包含轮次和进度信息
+            sendRoundThinking(emitter, i + 1, state);
 
             ChatLanguageModel llm = modelFactory.createPreciseModel();
             Response<AiMessage> response = llm.generate(messages, activeTools);
@@ -102,13 +106,24 @@ public class AgentLoop {
                 messages.add(aiMessage);
                 boolean anyProgress = false;
 
+                // 打印 LLM 本轮决策
+                List<String> toolNames = aiMessage.toolExecutionRequests().stream()
+                        .map(ToolExecutionRequest::name).toList();
+                log.info("LLM 决定调用工具: {} (第{}轮)", toolNames, i + 1);
+
+                int totalTools = aiMessage.toolExecutionRequests().size();
+                int toolIndex = 0;
                 for (ToolExecutionRequest req : aiMessage.toolExecutionRequests()) {
+                    toolIndex++;
                     String toolName = req.name();
                     String toolArgs = req.arguments();
 
                     sendSseEvent(emitter, "thinking", Map.of(
                             "stage", "tool_call",
-                            "content", "正在调用工具: " + toolName
+                            "round", i + 1,
+                            "content", "正在调用工具: " + toolName,
+                            "tool_index", toolIndex,
+                            "tool_total", totalTools
                     ));
 
                     // 防重复规则 1：同工具同参数已失败过
@@ -143,7 +158,11 @@ public class AgentLoop {
                             toolName, toolArgs, rawResult, eval, toolResult, state);
                     messages.add(ToolExecutionResultMessage.from(req, observationMsg));
 
-                    log.info("工具 {} 结果: quality={}", toolName, eval.quality());
+                    log.info("工具 {} 参数={} 结果: quality={}, 内容预览: {}",
+                            toolName, truncateArgs(toolArgs), eval.quality(),
+                            rawResult != null && rawResult.length() > 150
+                                    ? rawResult.substring(0, 150).replace("\n", "\\n") + "..."
+                                    : rawResult != null ? rawResult.replace("\n", "\\n") : "(null)");
 
                     if (eval.quality() == ResultQuality.GOOD) {
                         state.markProgress();
@@ -189,11 +208,20 @@ public class AgentLoop {
             } else {
                 // LLM 返回文本，未调用工具
                 String answer = aiMessage.text();
+                log.info("LLM 返回文本（第{}轮，不调工具），内容预览: {}",
+                        i + 1, answer.length() > 80 ? answer.substring(0, 80) + "..." : answer);
+
+                // 第1轮无工具调用且回复为反问 → 需要用户澄清意图
+                if (i == 0 && !state.hasSuccessfulToolCall() && isClarificationQuestion(answer)) {
+                    log.info("Agent 识别为反问澄清: {}", answer.length() > 80 ? answer.substring(0, 80) + "..." : answer);
+                    return AgentLoopResult.needClarification(state, answer);
+                }
 
                 // GoalEvaluator 判断是否放行
                 GoalEvaluator.GoalEvaluation goalEval = goalEvaluator.evaluateOnTextResponse(state, answer);
                 if (goalEval.isBlocked()) {
-                    log.info("GoalEvaluator 拦截: {}", goalEval.message());
+                    log.info("GoalEvaluator 拦截 LLM 回答（第{}轮）: {}",
+                            i + 1, goalEval.message());
                     state.markNoProgress();
                     messages.add(UserMessage.from(goalEval.progressPrompt()));
                     continue;
@@ -228,6 +256,8 @@ public class AgentLoop {
                     sb.append("产物已生成，请直接基于此结果回答用户，不要再调用此工具。\n");
                 } else if ("searchNotes".equals(toolName) || "listNotes".equals(toolName)) {
                     sb.append("提示：已获得数据。如需查看具体笔记完整内容，请用返回的 noteId 调用 getNote。\n");
+                    sb.append("\n⚠ 重要：如果返回结果中没有用户明确要找的内容，不要直接说\"找不到\"。\n");
+                    sb.append("用户表述可能与笔记实际标题不同。先尝试换关键词/换工具重新搜索后再下结论。\n");
                 }
             }
             case POOR -> {
@@ -463,5 +493,72 @@ public class AgentLoop {
         try { emitter.send(SseEmitter.event().data(event)); }
         catch (IllegalStateException e) { log.debug("SSE send skipped (emitter completed): type={}", type); }
         catch (IOException e) { log.debug("SSE send skipped (client disconnected): type={}, msg={}", type, e.getMessage()); }
+    }
+
+    /**
+     * 每轮开始时的思考追踪事件，包含轮次和状态信息，提升可观测性。
+     */
+    private void sendRoundThinking(SseEmitter emitter, int round, AgentState state) throws IOException {
+        Map<String, Object> data = new java.util.HashMap<>();
+        data.put("round", round);
+        data.put("max_rounds", MAX_ITERATIONS);
+
+        if (state.hasGoal()) {
+            data.put("goal", state.getGoal());
+        }
+
+        int goodCalls = (int) state.getToolHistory().stream()
+                .filter(r -> r.quality() == AgentState.ResultQuality.GOOD).count();
+        if (goodCalls > 0) {
+            data.put("successful_tools", goodCalls);
+        }
+
+        if (!state.getWorkingMemory().isEmpty()) {
+            List<String> recentFacts = state.getWorkingMemory()
+                    .subList(Math.max(0, state.getWorkingMemory().size() - 3), state.getWorkingMemory().size());
+            data.put("recent_facts", recentFacts);
+        }
+
+        data.put("tools_called", (int) state.getToolHistory().stream()
+                .map(AgentState.ToolCallRecord::toolName).distinct().count());
+
+        sendSseEvent(emitter, "thinking", data);
+    }
+
+    /**
+     * 判断 LLM 回复是否为反问澄清（替代独立的 ClarifierService）。
+     *
+     * 启发式规则：
+     * 1. 包含问号
+     * 2. 包含反问引导词（你能、你想、请说明、具体等）
+     * 3. 回复较短（< 200 字，反问通常简短）
+     * 4. 不包含 Markdown 标题（最终回答通常有结构）
+     */
+    private boolean isClarificationQuestion(String text) {
+        if (text == null || text.isBlank()) return false;
+
+        String trimmed = text.trim();
+
+        // 规则1: 必须包含问号
+        if (!trimmed.contains("？") && !trimmed.contains("?")) return false;
+
+        // 规则2: 反问通常较短
+        if (trimmed.length() > 200) return false;
+
+        // 规则3: 最终回答通常有 ## 标题结构，反问没有
+        if (trimmed.contains("##") || trimmed.contains("**")) return false;
+
+        // 规则4: 检查反问引导词
+        String[] clarificationPatterns = {
+                "你能", "你想", "请说明", "具体", "哪方面", "哪个",
+                "什么样", "怎么", "可以告诉", "请提供", "能否",
+                "what", "which", "could you", "can you"
+        };
+        String lower = trimmed.toLowerCase();
+        for (String pattern : clarificationPatterns) {
+            if (lower.contains(pattern.toLowerCase())) return true;
+        }
+
+        return false;
     }
 }

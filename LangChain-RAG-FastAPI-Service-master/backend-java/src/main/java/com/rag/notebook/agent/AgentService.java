@@ -146,8 +146,17 @@ public class AgentService {
                         ? attachmentContext + "用户问题：" + query
                         : query;
 
-                // Supervisor 规划 + 依赖分析
-                List<SubTask> subTasks = supervisorService.plan(query);
+                // 只有复合任务才进入 Supervisor。单一意图直接交给 AgentLoop，减少一次 LLM 规划调用。
+                List<SubTask> subTasks = shouldUseSupervisor(query)
+                        ? supervisorService.plan(query)
+                        : Collections.emptyList();
+                if (subTasks.size() == 1) {
+                    log.info("Supervisor 返回单一子任务，降级为单 Agent 执行: {}", subTasks.get(0).getGoal());
+                    subTasks = Collections.emptyList();
+                }
+                if (subTasks.isEmpty()) {
+                    log.info("跳过或降级 Supervisor：使用单 Agent 执行");
+                }
 
                 String response;
                 AgentState finalAgentState = null;
@@ -158,9 +167,15 @@ public class AgentService {
 
                     AgentLoopResult loopResult = agentLoop.run(systemPrompt, resolvedQuery,
                             historyMessages, userId, sessionId, activeTools, emitter,
-                            null, null);
+                            buildSingleGoal(query), null);
                     finalAgentState = loopResult.state();
-                    response = composeAndReview(loopResult, query, emitter);
+
+                    // 反问澄清：直接输出反问，跳过 Compose/Review
+                    if (loopResult.outcome() == AgentLoopResult.Outcome.NEED_CLARIFICATION) {
+                        response = loopResult.clarificationQuestion();
+                    } else {
+                        response = composeAndReview(loopResult, query, emitter);
+                    }
                 } else {
                     String mode = subTasks.get(0).getExecutionMode();
 
@@ -285,7 +300,7 @@ public class AgentService {
     private record PipeResult(String response, AgentState state) {}
 
     /**
-     * 顺序执行管道：单 Agent 按目标链依次完成
+     * 顺序执行管道：按子任务逐个运行 AgentLoop，并把上一步结果注入下一步。
      */
     private PipeResult runSequentialPipeline(String systemPrompt, String query,
                                           List<dev.langchain4j.data.message.ChatMessage> historyMessages,
@@ -293,26 +308,6 @@ public class AgentService {
                                           List<ToolSpecification> activeTools,
                                           SseEmitter emitter,
                                           List<SubTask> subTasks) throws IOException {
-        // 合并所有目标为一个目标链
-        StringBuilder goalBlock = new StringBuilder();
-        goalBlock.append("\n\n[目标序列] 你需要按顺序完成以下目标：\n");
-        java.util.List<String> allCriteria = new java.util.ArrayList<>();
-        for (int i = 0; i < subTasks.size(); i++) {
-            SubTask t = subTasks.get(i);
-            goalBlock.append((i + 1)).append(". ").append(t.getGoal());
-            if (t.getSuccessCriteria() != null && !t.getSuccessCriteria().isEmpty()) {
-                goalBlock.append(" [标准: ").append(String.join(", ", t.getSuccessCriteria())).append("]");
-                allCriteria.addAll(t.getSuccessCriteria());
-            }
-            goalBlock.append("\n");
-        }
-        goalBlock.append("\n完成一个目标后自动推进到下一个。全部完成后回答用户。");
-
-        String fullPrompt = systemPrompt + goalBlock;
-        String mergedGoal = subTasks.stream()
-                .map(SubTask::getGoal)
-                .reduce((a, b) -> a + "；然后" + b).orElse("");
-
         String resolvedQuery = convCtxManager.resolveReferences(query, sessionId);
 
         sendSseEvent(emitter, "thinking", Map.of(
@@ -320,12 +315,48 @@ public class AgentService {
                 "content", "顺序执行 " + subTasks.size() + " 个目标"
         ));
 
-        AgentLoopResult loopResult = agentLoop.run(fullPrompt, resolvedQuery,
-                historyMessages, userId, sessionId, activeTools, emitter,
-                mergedGoal, allCriteria);
+        record SubResult(String taskId, String label, String content, AgentState state) {}
+        List<SubResult> results = new ArrayList<>();
+        AgentState mergedState = new AgentState(query);
+        StringBuilder completedContext = new StringBuilder();
 
-        String answer = composeAndReview(loopResult, query, emitter);
-        return new PipeResult(answer, loopResult.state());
+        for (int i = 0; i < subTasks.size(); i++) {
+            SubTask task = subTasks.get(i);
+            sendSseEvent(emitter, "thinking", Map.of(
+                    "stage", "planning",
+                    "content", "顺序执行第 " + (i + 1) + "/" + subTasks.size() + " 个目标: " + task.getLabel()
+            ));
+
+            String taskPrompt = buildSequentialTaskPrompt(systemPrompt, task, i, subTasks.size());
+            String taskQuery = buildSequentialTaskQuery(resolvedQuery, completedContext, task);
+
+            AgentLoopResult loopResult = agentLoop.run(taskPrompt, taskQuery,
+                    historyMessages, userId, sessionId, activeTools, emitter,
+                    task.getGoal(), task.getSuccessCriteria());
+
+            mergeState(mergedState, loopResult.state());
+
+            if (loopResult.outcome() == AgentLoopResult.Outcome.NEED_CLARIFICATION) {
+                return new PipeResult(loopResult.clarificationQuestion(), mergedState);
+            }
+
+            String content = responseComposer.compose(EvidencePack.from(loopResult.state()), loopResult.outcome());
+            results.add(new SubResult(task.getId(), task.getLabel(), content, loopResult.state()));
+
+            completedContext.append("- ")
+                    .append(task.getLabel() != null ? task.getLabel() : task.getId())
+                    .append(": ")
+                    .append(content)
+                    .append("\n");
+        }
+
+        sendSseEvent(emitter, "thinking", Map.of(
+                "stage", "composing",
+                "content", "正在整合 " + results.size() + " 个顺序目标结果"
+        ));
+
+        String answer = synthesizeResults(query, subTasks, results);
+        return new PipeResult(answer, mergedState);
     }
 
     /**
@@ -353,13 +384,11 @@ public class AgentService {
                 try {
                     String taskPrompt = systemPrompt
                             + "\n\n[当前任务目标] " + task.getGoal()
-                            + (task.getSuccessCriteria() != null && !task.getSuccessCriteria().isEmpty()
-                               ? "\n[成功标准] " + String.join("、", task.getSuccessCriteria()) : "")
                             + "\n请专注于完成此目标，完成后直接输出结果。";
 
                     AgentLoopResult r = agentLoop.run(taskPrompt, query,
                             historyMessages, userId, sessionId, activeTools, emitter,
-                            task.getGoal(), task.getSuccessCriteria());
+                            task.getGoal(), null);
 
                     // Composer 生成子任务的回答片段
                     String content = responseComposer.compose(EvidencePack.from(r.state()), r.outcome());
@@ -414,13 +443,21 @@ public class AgentService {
                 loopResult.outcome(), pack.notes().size(),
                 pack.artifacts() != null ? pack.artifacts().size() : 0, answer.length());
 
-        // 质量审查
-        var review = qualityReviewer.reviewAnswer(query,
-                pack.notes().stream()
-                        .map(n -> Map.<String, Object>of("content", n.content() != null
-                                ? n.content().substring(0, Math.min(500, n.content().length())) : ""))
-                        .collect(java.util.stream.Collectors.toList()),
-                answer);
+        // 质量审查：传入所有可用证据（笔记内容 + 操作结果 + 知识库摘要）
+        List<Map<String, Object>> reviewDocs = new ArrayList<>();
+        for (var note : pack.notes()) {
+            if (note.content() != null) {
+                reviewDocs.add(Map.<String, Object>of(
+                        "content", note.content().substring(0, Math.min(500, note.content().length()))));
+            }
+        }
+        if (pack.writeConfirmation() != null) {
+            reviewDocs.add(Map.<String, Object>of("content", "[操作结果] " + pack.writeConfirmation()));
+        }
+        if (pack.knowledgeBaseSummary() != null) {
+            reviewDocs.add(Map.<String, Object>of("content", "[知识库] " + pack.knowledgeBaseSummary()));
+        }
+        var review = qualityReviewer.reviewAnswer(query, reviewDocs, answer);
 
         if (!review.approved()) {
             log.info("质量审查未通过: {}, 重新生成", review.reason());
@@ -434,15 +471,86 @@ public class AgentService {
      * 合并多个 AgentState 到一个
      */
     private void mergeState(AgentState target, AgentState source) {
+        target.getToolHistory().addAll(source.getToolHistory());
+        for (var observation : source.getObservations()) {
+            target.addObservation(observation);
+        }
         for (var fact : source.getWorkingMemory()) {
             target.addKnownFact(fact);
         }
         for (var artifact : source.getArtifacts()) {
             target.addArtifact(artifact);
         }
+        target.upgradeEvidence(source.getHighestEvidence());
         if (source.hasWriteConfirmation()) {
             target.markWriteConfirmation(source.getWriteConfirmation());
         }
+    }
+
+    /**
+     * 轻量路由：只有明显复合任务才交给 Supervisor 拆分。
+     * 单一笔记任务（搜索、读取、列表、今日复习等）让 AgentLoop 自己完成，减少延迟和规划漂移。
+     */
+    private boolean shouldUseSupervisor(String query) {
+        if (query == null || query.isBlank()) return false;
+
+        String q = query.trim().toLowerCase(Locale.ROOT);
+
+        // "搜索并读取/查找并打开"是单一信息获取链路，AgentLoop 一次循环更稳。
+        String[] singleFlowPatterns = {
+                "搜索并读取", "查找并读取", "找到并读取", "找一下并读取",
+                "搜索并打开", "查找并打开", "找到并打开",
+                "搜索并看看", "查找并看看", "找到并看看"
+        };
+        for (String pattern : singleFlowPatterns) {
+            if (q.contains(pattern)) return false;
+        }
+
+        String[] sequenceMarkers = {"然后", "接着", "之后", "随后", "最后", "顺便", "再给", "再帮", "再生成"};
+        for (String marker : sequenceMarkers) {
+            if (q.contains(marker)) return true;
+        }
+
+        String[] parallelMarkers = {"同时", "以及", "并且"};
+        for (String marker : parallelMarkers) {
+            if (q.contains(marker)) return true;
+        }
+
+        return java.util.regex.Pattern.compile("并(总结|整理|创建|生成|写|追加|合并|对比|比较|制定|安排|删除|编辑|分析)")
+                .matcher(q)
+                .find();
+    }
+
+    private String buildSingleGoal(String query) {
+        if (query == null || query.isBlank()) {
+            return "回答用户当前问题";
+        }
+        return "完成用户请求：" + query.trim();
+    }
+
+    private String buildSequentialTaskPrompt(String systemPrompt, SubTask task, int index, int total) {
+        StringBuilder sb = new StringBuilder(systemPrompt);
+        sb.append("\n\n[顺序任务执行]\n");
+        sb.append("当前是第 ").append(index + 1).append("/").append(total).append(" 个子任务。\n");
+        sb.append("当前目标：").append(task.getGoal()).append("\n");
+        if (task.getToolHint() != null && !task.getToolHint().isBlank()) {
+            sb.append("建议工具：").append(task.getToolHint()).append("（仅作参考，必要时可换工具）\n");
+        }
+        sb.append("只完成当前目标，不要提前执行后续目标。当前目标完成后直接输出当前结果。");
+        return sb.toString();
+    }
+
+    private String buildSequentialTaskQuery(String originalQuery, StringBuilder completedContext, SubTask task) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("用户原始请求：").append(originalQuery).append("\n\n");
+        if (completedContext.length() > 0) {
+            sb.append("[已完成的上一步结果]\n").append(completedContext).append("\n");
+        }
+        if (task.getDescription() != null && !task.getDescription().isBlank()) {
+            sb.append("当前子任务上下文：").append(task.getDescription()).append("\n");
+        }
+        sb.append("当前子任务目标：").append(task.getGoal());
+        return sb.toString();
     }
 
     /**

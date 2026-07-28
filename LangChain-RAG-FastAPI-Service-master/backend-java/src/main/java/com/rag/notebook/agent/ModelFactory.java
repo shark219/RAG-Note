@@ -60,6 +60,14 @@ public class ModelFactory {
                     .temperature(temperature)
                     .timeout(timeout)
                     .build();
+        } else if ("DEEPSEEK".equalsIgnoreCase(type)) {
+            return OpenAiChatModel.builder()
+                    .apiKey(props.getLlm().getDeepseek().getApiKey())
+                    .baseUrl(props.getLlm().getDeepseek().getBaseUrl())
+                    .modelName(props.getLlm().getDeepseek().getModel())
+                    .temperature(temperature)
+                    .timeout(timeout)
+                    .build();
         } else if ("OLLAMA".equalsIgnoreCase(type)) {
             return OllamaChatModel.builder()
                     .baseUrl(props.getLlm().getOllama().getBaseUrl())
@@ -108,6 +116,14 @@ public class ModelFactory {
                     .apiKey(props.getLlm().getZhipu().getApiKey())
                     .baseUrl(props.getLlm().getZhipu().getBaseUrl())
                     .modelName(props.getLlm().getZhipu().getModel())
+                    .temperature(0.0)
+                    .timeout(Duration.ofSeconds(120))
+                    .build();
+        } else if ("DEEPSEEK".equalsIgnoreCase(type)) {
+            return OpenAiChatModel.builder()
+                    .apiKey(props.getLlm().getDeepseek().getApiKey())
+                    .baseUrl(props.getLlm().getDeepseek().getBaseUrl())
+                    .modelName(props.getLlm().getDeepseek().getModel())
                     .temperature(0.0)
                     .timeout(Duration.ofSeconds(120))
                     .build();

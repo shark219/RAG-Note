@@ -1,7 +1,6 @@
 package com.rag.notebook.chat.controller;
 
 import com.rag.notebook.agent.AgentService;
-import com.rag.notebook.agent.ClarifierService;
 import com.rag.notebook.chat.dto.*;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.common.auth.UserId;
@@ -20,12 +19,10 @@ public class ChatController {
 
     private final ChatService chatService;
     private final AgentService agentService;
-    private final ClarifierService clarifierService;
 
-    public ChatController(ChatService chatService, AgentService agentService, ClarifierService clarifierService) {
+    public ChatController(ChatService chatService, AgentService agentService) {
         this.chatService = chatService;
         this.agentService = agentService;
-        this.clarifierService = clarifierService;
     }
 
     // ========== 会话管理 ==========
@@ -142,15 +139,6 @@ public class ChatController {
         return agentService.streamAgentResponse(request.getQuery(), sessionId, userId,
                 request.isRegenerate(), request.isEnableKnowledge(), request.isEnableNotes(),
                 request.getFileIds());
-    }
-
-    /**
-     * 问题澄清
-     */
-    @PostMapping("/clarify")
-    public ApiResponse<ClarifyResult> clarify(@Valid @RequestBody QueryRequest request) {
-        ClarifyResult result = clarifierService.clarify(request.getQuery());
-        return ApiResponse.success(result);
     }
 
     /**
