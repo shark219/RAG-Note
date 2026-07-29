@@ -83,8 +83,14 @@ public class RagService {
             List<Map<String, Object>> kbResults = hybridRetriever.searchKnowledge(userId, query, topK, config);
             kbResults.forEach(r -> r.put("source_type", "knowledge_base"));
             if (selectedKnowledgeDocs != null && !selectedKnowledgeDocs.isEmpty()) {
+                Set<String> selectedSet = new HashSet<>(selectedKnowledgeDocs);
                 kbResults = kbResults.stream()
-                        .filter(r -> selectedKnowledgeDocs.contains(r.get("filename")))
+                        .filter(r -> {
+                            Object docId = r.get("doc_id");
+                            if (docId != null) return selectedSet.contains(docId);
+                            // 旧数据没有 doc_id（在加入 doc_id 前已存储），保留不做过滤
+                            return true;
+                        })
                         .collect(Collectors.toList());
             }
             allResults.addAll(kbResults);
@@ -94,8 +100,9 @@ public class RagService {
             List<Map<String, Object>> noteResults = hybridRetriever.searchNotes(userId, query, topK, config);
             noteResults.forEach(r -> r.put("source_type", "note"));
             if (selectedNotes != null && !selectedNotes.isEmpty()) {
+                Set<String> selectedNoteSet = new HashSet<>(selectedNotes);
                 noteResults = noteResults.stream()
-                        .filter(r -> selectedNotes.contains(r.get("note_id")))
+                        .filter(r -> selectedNoteSet.contains(r.get("note_id")))
                         .collect(Collectors.toList());
             }
             allResults.addAll(noteResults);

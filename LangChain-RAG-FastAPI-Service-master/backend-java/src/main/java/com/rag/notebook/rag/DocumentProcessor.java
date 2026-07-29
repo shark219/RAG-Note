@@ -3,6 +3,7 @@ package com.rag.notebook.rag;
 import com.rag.notebook.config.ApplicationProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.tika.Tika;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 import java.io.*;
@@ -10,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
 
 @Slf4j
@@ -19,27 +21,27 @@ public class DocumentProcessor {
     private final ApplicationProperties props;
     private final VectorStoreService vectorStoreService;
     private final Md5Store md5Store;
+    private final DocumentTaskExecutor documentTaskExecutor;
     private final Tika tika = new Tika();
 
-    public DocumentProcessor(ApplicationProperties props, VectorStoreService vectorStoreService, Md5Store md5Store) {
+    public DocumentProcessor(ApplicationProperties props, VectorStoreService vectorStoreService,
+                             Md5Store md5Store, DocumentTaskExecutor documentTaskExecutor) {
         this.props = props;
         this.vectorStoreService = vectorStoreService;
         this.md5Store = md5Store;
+        this.documentTaskExecutor = documentTaskExecutor;
     }
 
-    public void processFile(File file, String originalFilename, String userId,
-                            BiConsumer<String, Object> progressCallback) {
+    public CompletableFuture<Void> processFile(File file, String originalFilename, String userId,
+                                                BiConsumer<String, Object> progressCallback) {
         try {
             progressCallback.accept("loading", originalFilename);
 
             String md5 = computeMd5(file);
-            // 只有 MD5 记录存在 且 向量数据也存在时才跳过
-            // 防止重启后向量数据丢失但 MD5 记录还在导致无法重新上传
             if (md5Store.exists(md5, userId) && vectorStoreService.hasKnowledgeDocument(userId, md5)) {
                 progressCallback.accept("skipping", originalFilename);
-                return;
+                return CompletableFuture.completedFuture(null);
             }
-            // MD5 记录存在但向量数据丢失，清理旧的 MD5 记录
             if (md5Store.exists(md5, userId)) {
                 md5Store.deleteByMd5(md5, userId);
                 log.info("MD5 记录存在但向量数据丢失，清理后重新处理: {}", originalFilename);
@@ -47,7 +49,6 @@ public class DocumentProcessor {
 
             progressCallback.accept("splitting", originalFilename);
             String content = tika.parseToString(file);
-            // 在每个切片前加文件名前缀，提升关键词检索命中率
             String filePrefix = "[文件: " + originalFilename + "]\n";
             List<String> rawChunks = splitText(content, props.getChroma().getChunkSize(),
                     props.getChroma().getChunkOverlap());
@@ -64,15 +65,34 @@ public class DocumentProcessor {
                     "source", "knowledge_base",
                     "created_at", System.currentTimeMillis()
             );
-            vectorStoreService.addKnowledgeDocument(userId, originalFilename, md5, chunks, metadata, progressCallback);
 
+            // 1. MySQL + BM25 保存（同步，快速，事务短）
+            String docId = vectorStoreService.addKnowledgeDocument(userId, originalFilename, md5, chunks, metadata, progressCallback);
+            if (docId == null) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            // 2. 保存MD5记录（同步，快速）
             md5Store.save(md5, originalFilename, originalFilename, userId);
 
-            progressCallback.accept("completed", originalFilename);
-            log.info("Processed file: {} ({} chunks)", originalFilename, chunks.size());
+            // 3. 异步 ChromaDB 写入（documentExecutor线程池，不占用事务连接）
+            //    完成后自动回调"completed"/"error"事件
+            return documentTaskExecutor.writeToChromaAsync(userId, originalFilename, md5, docId, chunks, progressCallback);
+
+        } catch (DataIntegrityViolationException e) {
+            if (e.getMessage() != null && e.getMessage().contains("uk_user_md5")) {
+                log.info("文档已在并发处理中上传，跳过: {}", originalFilename);
+                progressCallback.accept("skipping", originalFilename);
+                return CompletableFuture.completedFuture(null);
+            } else {
+                progressCallback.accept("error", originalFilename + ": " + e.getMessage());
+                log.error("Failed to process file {}: {}", originalFilename, e.getMessage(), e);
+                return CompletableFuture.failedFuture(e);
+            }
         } catch (Exception e) {
             progressCallback.accept("error", originalFilename + ": " + e.getMessage());
             log.error("Failed to process file {}: {}", originalFilename, e.getMessage(), e);
+            return CompletableFuture.failedFuture(e);
         }
     }
 

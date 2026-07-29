@@ -54,19 +54,21 @@
             <a-switch v-model="config.knowledgeEnabled" size="small" />
             <a-select
               v-model="config.selectedKnowledgeDocs"
-              placeholder="选择文档"
+              placeholder="文档"
               multiple
               :filterable="true"
               :allow-clear="true"
+              :max-tag-count="1"
+              :max-tag-text-length="8"
               size="small"
-              style="width: 180px; margin-left: 4px;"
+              style="width: 120px;"
               :disabled="!config.knowledgeEnabled"
             >
               <a-option
                 v-for="doc in knowledgeDocs"
-                :key="doc.filename"
-                :value="doc.filename"
-                :label="doc.originalFilename"
+                :key="doc.id"
+                :value="doc.id"
+                :label="doc.originalFilename || doc.filename"
               />
             </a-select>
           </div>
@@ -76,12 +78,14 @@
             <a-switch v-model="config.notesEnabled" size="small" />
             <a-select
               v-model="config.selectedNotes"
-              placeholder="选择笔记"
+              placeholder="笔记"
               multiple
               :filterable="true"
               :allow-clear="true"
+              :max-tag-count="1"
+              :max-tag-text-length="8"
               size="small"
-              style="width: 180px; margin-left: 4px;"
+              style="width: 120px;"
               :disabled="!config.notesEnabled"
             >
               <a-option
@@ -427,7 +431,7 @@ function artifactIcon(type: string) {
 }
 
 // 知识库文档和笔记列表（供多选下拉使用）
-const knowledgeDocs = ref<{ filename: string; originalFilename: string }[]>([])
+const knowledgeDocs = ref<{ id: string; filename: string; originalFilename: string }[]>([])
 const notesList = ref<{ id: string; title: string }[]>([])
 
 const config = reactive({
@@ -577,6 +581,7 @@ async function loadKnowledgeDocs() {
     const res: any = await knowledgeApi.list()
     const data = res?.data || res
     knowledgeDocs.value = data?.documents?.map((d: any) => ({
+      id: d.id,
       filename: d.filename,
       originalFilename: d.originalFilename || d.filename,
     })) || []
@@ -859,14 +864,14 @@ async function sendMessage(text: string, options?: { skipUserMessage?: boolean; 
                 }, 1500)
               }
 
-              // 打字机效果：逐字符追加
+              // 打字机效果：批量追加（每批最多30字符，4ms间隔）
               const displayed = msg.content || ''
               const remaining = aiResponse.substring(displayed.length)
-              for (const char of remaining) {
-                if (stopFlag) break
-                msg.content += char
+              const batchSize = 30
+              for (let i = 0; i < remaining.length && !stopFlag; i += batchSize) {
+                msg.content += remaining.substring(i, i + batchSize)
                 scrollToBottom()
-                await new Promise(r => setTimeout(r, 8))
+                await new Promise(r => setTimeout(r, 4))
               }
               break
             }
@@ -1839,5 +1844,35 @@ function formatTime(dateStr: string) {
   .input-area {
     padding: 12px;
   }
+}
+
+/* 多选下拉框：隐藏单个 tag 的关闭按钮，只保留 allow-clear 的清除全部 */
+:deep(.arco-select-multiple .arco-tag-close-btn) {
+  display: none;
+}
+:deep(.arco-select-view-multiple .arco-select-tag) {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+</style>
+
+<style>
+/* 全局样式：多选下拉固定宽度，不随选中项伸缩 */
+.ai-chat .arco-select-view-multiple {
+  width: 120px !important;
+  min-width: 120px !important;
+  max-width: 120px !important;
+}
+.ai-chat .arco-select-view-multiple .arco-select-tag {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 4px;
+}
+.ai-chat .arco-select-multiple .arco-tag-close-btn {
+  display: none !important;
 }
 </style>

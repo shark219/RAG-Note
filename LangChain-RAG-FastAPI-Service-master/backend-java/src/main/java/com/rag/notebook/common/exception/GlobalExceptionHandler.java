@@ -2,6 +2,7 @@ package com.rag.notebook.common.exception;
 
 import com.rag.notebook.common.result.ApiResponse;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
@@ -120,9 +121,17 @@ public class GlobalExceptionHandler {
     // 拦截所有前面没能处理的异常（比如传说中的 NullPointerException 空指针）
     @ExceptionHandler(Exception.class)
     @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR) // HTTP 状态码 500
-    public ApiResponse<Void> handleGeneral(Exception ex, HttpServletRequest request) {
+    public ApiResponse<Void> handleGeneral(Exception ex, HttpServletRequest request, HttpServletResponse response) {
         // 这是真正不可预知的系统 Bug，必须打 error 级别日志，并且把具体的请求路径和完整堆栈（ex）记录下来，方便程序员第二天看日志修 Bug
         log.error("Unhandled exception on {}: {}", request.getRequestURI(), ex.getMessage(), ex);
+
+        // SSE请求的响应Content-Type为text/event-stream，无法序列化ApiResponse
+        // 此时直接返回空，避免二次异常
+        if (response.getContentType() != null && response.getContentType().contains("text/event-stream")) {
+            log.warn("SSE端点异常，跳过ApiResponse返回: {}", ex.getMessage());
+            return null;
+        }
+
         // 对外（前端和用户）永远只显示一句温柔的“服务器内部错误”，绝不把带有代码行数的红色报错发给外面看（防黑客分析代码结构）
         return ApiResponse.error(500, "服务器内部错误");
     }

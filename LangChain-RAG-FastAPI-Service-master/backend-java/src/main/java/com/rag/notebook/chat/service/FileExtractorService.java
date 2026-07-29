@@ -1,7 +1,6 @@
 package com.rag.notebook.chat.service;
 
 import lombok.extern.slf4j.Slf4j;
-import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
@@ -96,7 +95,7 @@ public class FileExtractorService {
     }
 
     private String extractPdf(File file) throws IOException {
-        try (PDDocument document = Loader.loadPDF(file)) {
+        try (PDDocument document = PDDocument.load(file)) {
             PDFTextStripper stripper = new PDFTextStripper();
             return stripper.getText(document);
         }
