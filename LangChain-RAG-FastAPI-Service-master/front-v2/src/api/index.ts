@@ -104,7 +104,7 @@ export const chatApi = {
   getDefaultPrompt: () => api.get('/chat/prompts/default'),
 
   // 流式对话
-  sendStream: (data: { query: string; sessionId?: string; regenerate?: boolean; enableKnowledge?: boolean; enableNotes?: boolean; fileIds?: string[] }) =>
+  sendStream: (data: { query: string; sessionId?: string; regenerate?: boolean; enableKnowledge?: boolean; enableNotes?: boolean; selectedKnowledgeDocs?: string[]; selectedNotes?: string[]; fileIds?: string[] }) =>
     fetch('/api/chat/agent/query/stream', {
       method: 'POST',
       headers: {

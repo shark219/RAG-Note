@@ -138,6 +138,7 @@ public class ChatController {
         }
         return agentService.streamAgentResponse(request.getQuery(), sessionId, userId,
                 request.isRegenerate(), request.isEnableKnowledge(), request.isEnableNotes(),
+                request.getSelectedKnowledgeDocs(), request.getSelectedNotes(),
                 request.getFileIds());
     }
 

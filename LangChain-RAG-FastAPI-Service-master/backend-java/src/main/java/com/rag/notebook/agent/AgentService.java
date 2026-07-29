@@ -99,6 +99,8 @@ public class AgentService {
         return toolSpecifications.stream()
                 .filter(tool -> {
                     String name = tool.name();
+                    // ragSummary 在知识库或笔记任一开启时可用
+                    if ("ragSummary".equals(name)) return enableKnowledge || enableNotes;
                     if (KNOWLEDGE_TOOLS.contains(name)) return enableKnowledge;
                     if (NOTE_TOOLS.contains(name)) return enableNotes;
                     return true; // 通用工具（如 whatTimeIsNow）始终可用
@@ -107,12 +109,21 @@ public class AgentService {
     }
 
     public SseEmitter streamAgentResponse(String query, String sessionId, String userId) {
-        return streamAgentResponse(query, sessionId, userId, false, true, true, null);
+        return streamAgentResponse(query, sessionId, userId, false, true, true, null, null, null);
     }
 
     public SseEmitter streamAgentResponse(String query, String sessionId, String userId,
                                           boolean regenerate,
                                           boolean enableKnowledge, boolean enableNotes,
+                                          List<String> fileIds) {
+        return streamAgentResponse(query, sessionId, userId, regenerate,
+                enableKnowledge, enableNotes, null, null, fileIds);
+    }
+
+    public SseEmitter streamAgentResponse(String query, String sessionId, String userId,
+                                          boolean regenerate,
+                                          boolean enableKnowledge, boolean enableNotes,
+                                          List<String> selectedKnowledgeDocs, List<String> selectedNotes,
                                           List<String> fileIds) {
         // 多 Agent 流水线可能耗时较长，超时设为 5 分钟
         SseEmitter emitter = new SseEmitter(300000L);
@@ -123,6 +134,10 @@ public class AgentService {
         CompletableFuture.runAsync(() -> {
             SecurityContextHolder.setContext(securityContext);
             long startTime = System.currentTimeMillis();
+
+            // 设置 agent 工具的检索范围配置
+            agentTools.setSearchFilters(enableKnowledge, enableNotes,
+                    selectedKnowledgeDocs, selectedNotes);
             try {
                 // 先保存用户消息（重新生成时跳过，因为用户消息已存在）
                 if (!regenerate) {
@@ -285,6 +300,7 @@ public class AgentService {
                     } catch (IllegalStateException ignored) {}
                 }
             } finally {
+                agentTools.clearSearchFilters();
                 SecurityContextHolder.clearContext();
             }
         }, taskExecutor);
