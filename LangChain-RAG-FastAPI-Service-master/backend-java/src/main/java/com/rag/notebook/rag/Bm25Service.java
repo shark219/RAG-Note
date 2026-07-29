@@ -55,9 +55,9 @@ public class Bm25Service {
     }
 
     /**
-     * 添加文档到用户的 BM25 索引
+     * 添加文档到用户的 BM25 索引（synchronized 防止并发锁冲突）
      */
-    public void addDocument(String userId, String docId, String content,
+    public synchronized void addDocument(String userId, String docId, String content,
                             Map<String, Object> metadata) {
         try {
             Directory indexDir = getOrCreateIndex(userId);

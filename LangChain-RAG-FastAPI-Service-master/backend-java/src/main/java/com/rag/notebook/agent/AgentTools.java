@@ -39,6 +39,12 @@ public class AgentTools {
     // 结构化结果缓存：AgentLoop 执行工具后从这里读取 ToolResult
     private final ThreadLocal<ToolResult> lastResult = new ThreadLocal<>();
 
+    // 当前请求的检索范围配置（由 AgentService 在启动 agent 前设置）
+    private final ThreadLocal<Boolean> searchKnowledge = new ThreadLocal<>();
+    private final ThreadLocal<Boolean> searchNotes = new ThreadLocal<>();
+    private final ThreadLocal<List<String>> selectedKnowledgeDocs = new ThreadLocal<>();
+    private final ThreadLocal<List<String>> selectedNotes = new ThreadLocal<>();
+
     public AgentTools(RagService ragService, NoteService noteService, ReviewService reviewService,
                       ModelFactory modelFactory) {
         this.ragService = ragService;
@@ -63,10 +69,35 @@ public class AgentTools {
         lastResult.set(result);
     }
 
-    @Tool("从用户上传的知识库文档中检索相关内容并生成摘要。触发场景：用户提到'知识库'、'文档'、'资料'、'上传的文件'、'根据文档'等关键词时必须调用此工具")
-    public String ragSummary(@P("用户的查询问题，用于检索知识库") String query, @ToolMemoryId String userId) {
+    /** 设置当前请求的检索范围配置（供 AgentService 在启动 agent 前调用） */
+    public void setSearchFilters(boolean sk, boolean sn,
+                                  List<String> selectedKbDocs, List<String> selectedNts) {
+        searchKnowledge.set(sk);
+        searchNotes.set(sn);
+        selectedKnowledgeDocs.set(selectedKbDocs);
+        selectedNotes.set(selectedNts);
+    }
+
+    /** 清除当前请求的检索范围配置（agent 执行完后调用） */
+    public void clearSearchFilters() {
+        searchKnowledge.remove();
+        searchNotes.remove();
+        selectedKnowledgeDocs.remove();
+        selectedNotes.remove();
+    }
+
+    @Tool("从知识库文档或笔记中检索相关内容并生成摘要。触发场景：用户提到'知识库'、'文档'、'资料'、'上传的文件'、'根据文档'、'根据我的笔记'、'根据笔记'、'笔记里怎么说'等关键词时必须调用此工具。注意：如果用户是想找特定笔记打开看，应该用 searchNotes 而不是 ragSummary")
+    public String ragSummary(@P("用户的查询问题，用于检索知识库或笔记") String query, @ToolMemoryId String userId) {
         try {
-            Map<String, Object> result = ragService.getDocumentsAndSummary(userId, query);
+            Boolean sk = searchKnowledge.get();
+            Boolean sn = searchNotes.get();
+            // 默认只搜知识库（兼容未设置的情况）
+            boolean doSearchKnowledge = sk != null ? sk : true;
+            boolean doSearchNotes = sn != null ? sn : false;
+
+            Map<String, Object> result = ragService.getDocumentsAndSummary(userId, query,
+                    doSearchKnowledge, doSearchNotes,
+                    selectedKnowledgeDocs.get(), selectedNotes.get(), null);
             this.latestTraceId = ragService.getLatestTraceId();
             StringBuilder sb = new StringBuilder();
             @SuppressWarnings("unchecked")

@@ -49,14 +49,52 @@
       <div class="config-bar">
 
         <div class="config-right">
-          <div class="config-item">
+          <div class="config-item" style="flex-wrap: wrap; gap: 4px;">
             <span class="config-label">知识库</span>
             <a-switch v-model="config.knowledgeEnabled" size="small" />
+            <a-select
+              v-model="config.selectedKnowledgeDocs"
+              placeholder="文档"
+              multiple
+              :filterable="true"
+              :allow-clear="true"
+              :max-tag-count="1"
+              :max-tag-text-length="8"
+              size="small"
+              style="width: 120px;"
+              :disabled="!config.knowledgeEnabled"
+            >
+              <a-option
+                v-for="doc in knowledgeDocs"
+                :key="doc.id"
+                :value="doc.id"
+                :label="doc.originalFilename || doc.filename"
+              />
+            </a-select>
           </div>
           <a-divider direction="vertical" />
-          <div class="config-item">
+          <div class="config-item" style="flex-wrap: wrap; gap: 4px;">
             <span class="config-label">笔记</span>
             <a-switch v-model="config.notesEnabled" size="small" />
+            <a-select
+              v-model="config.selectedNotes"
+              placeholder="笔记"
+              multiple
+              :filterable="true"
+              :allow-clear="true"
+              :max-tag-count="1"
+              :max-tag-text-length="8"
+              size="small"
+              style="width: 120px;"
+              :disabled="!config.notesEnabled"
+            >
+              <a-option
+                v-for="note in notesList"
+                :key="note.id"
+                :value="note.id"
+                :label="note.title"
+              />
+            </a-select>
           </div>
           <a-divider direction="vertical" />
           <a-select
@@ -351,7 +389,7 @@ import {
   IconCommand,
   IconAttachment,
 } from '@arco-design/web-vue/es/icon'
-import { chatApi, evaluationApi } from '@/api'
+import { chatApi, evaluationApi, knowledgeApi, noteApi } from '@/api'
 import { marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import hljs from 'highlight.js'
@@ -392,10 +430,16 @@ function artifactIcon(type: string) {
   return icons[type] || '📦'
 }
 
+// 知识库文档和笔记列表（供多选下拉使用）
+const knowledgeDocs = ref<{ id: string; filename: string; originalFilename: string }[]>([])
+const notesList = ref<{ id: string; title: string }[]>([])
+
 const config = reactive({
   knowledgeEnabled: true,
   notesEnabled: true,
   selectedPrompt: 'default',
+  selectedKnowledgeDocs: [] as string[],
+  selectedNotes: [] as string[],
 })
 
 const toolList = ref([
@@ -522,6 +566,8 @@ function formatFileSize(bytes: number): string {
 
 onMounted(async () => {
   await fetchSessions()
+  await loadKnowledgeDocs()
+  await loadNotesList()
   // 页面刷新或切换到对话页面时，默认加载最近一次会话
   if (sessions.value.length > 0 && !currentSessionId.value) {
     const latestSession = sessions.value[0]
@@ -529,6 +575,33 @@ onMounted(async () => {
     await fetchMessages()
   }
 })
+
+async function loadKnowledgeDocs() {
+  try {
+    const res: any = await knowledgeApi.list()
+    const data = res?.data || res
+    knowledgeDocs.value = data?.documents?.map((d: any) => ({
+      id: d.id,
+      filename: d.filename,
+      originalFilename: d.originalFilename || d.filename,
+    })) || []
+  } catch (e) {
+    console.error('获取知识库文档列表失败', e)
+  }
+}
+
+async function loadNotesList() {
+  try {
+    const res: any = await noteApi.list({ pageSize: 999 })
+    const data = res?.data || res
+    notesList.value = data?.notes?.map((n: any) => ({
+      id: n.id,
+      title: n.title,
+    })) || []
+  } catch (e) {
+    console.error('获取笔记列表失败', e)
+  }
+}
 
 // ========== 会话管理 ==========
 
@@ -728,6 +801,8 @@ async function sendMessage(text: string, options?: { skipUserMessage?: boolean; 
       sessionId: currentSessionId.value,
       enableKnowledge: config.knowledgeEnabled,
       enableNotes: config.notesEnabled,
+      selectedKnowledgeDocs: config.selectedKnowledgeDocs.length > 0 ? config.selectedKnowledgeDocs : undefined,
+      selectedNotes: config.selectedNotes.length > 0 ? config.selectedNotes : undefined,
       ...(fileIds.length > 0 ? { fileIds } : {}),
       ...(options?.regenerate ? { regenerate: true } : {}),
     })
@@ -789,14 +864,14 @@ async function sendMessage(text: string, options?: { skipUserMessage?: boolean; 
                 }, 1500)
               }
 
-              // 打字机效果：逐字符追加
+              // 打字机效果：批量追加（每批最多30字符，4ms间隔）
               const displayed = msg.content || ''
               const remaining = aiResponse.substring(displayed.length)
-              for (const char of remaining) {
-                if (stopFlag) break
-                msg.content += char
+              const batchSize = 30
+              for (let i = 0; i < remaining.length && !stopFlag; i += batchSize) {
+                msg.content += remaining.substring(i, i + batchSize)
                 scrollToBottom()
-                await new Promise(r => setTimeout(r, 8))
+                await new Promise(r => setTimeout(r, 4))
               }
               break
             }
@@ -1769,5 +1844,35 @@ function formatTime(dateStr: string) {
   .input-area {
     padding: 12px;
   }
+}
+
+/* 多选下拉框：隐藏单个 tag 的关闭按钮，只保留 allow-clear 的清除全部 */
+:deep(.arco-select-multiple .arco-tag-close-btn) {
+  display: none;
+}
+:deep(.arco-select-view-multiple .arco-select-tag) {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+</style>
+
+<style>
+/* 全局样式：多选下拉固定宽度，不随选中项伸缩 */
+.ai-chat .arco-select-view-multiple {
+  width: 120px !important;
+  min-width: 120px !important;
+  max-width: 120px !important;
+}
+.ai-chat .arco-select-view-multiple .arco-select-tag {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 4px;
+}
+.ai-chat .arco-select-multiple .arco-tag-close-btn {
+  display: none !important;
 }
 </style>

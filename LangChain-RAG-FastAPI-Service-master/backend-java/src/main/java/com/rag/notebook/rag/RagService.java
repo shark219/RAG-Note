@@ -70,6 +70,57 @@ public class RagService {
     }
 
     /**
+     * 混合检索：根据开关选择搜索知识库和/或笔记，支持按文档/笔记筛选（消融实验）
+     */
+    public List<Map<String, Object>> retrieveDocuments(String userId, String query,
+                                                       boolean searchKnowledge, boolean searchNotes,
+                                                       List<String> selectedKnowledgeDocs, List<String> selectedNotes,
+                                                       AblationConfig config) {
+        int topK = config != null && config.getTopK() != null ? config.getTopK() : props.getChroma().getK();
+        List<Map<String, Object>> allResults = new ArrayList<>();
+
+        if (searchKnowledge) {
+            List<Map<String, Object>> kbResults = hybridRetriever.searchKnowledge(userId, query, topK, config);
+            kbResults.forEach(r -> r.put("source_type", "knowledge_base"));
+            if (selectedKnowledgeDocs != null && !selectedKnowledgeDocs.isEmpty()) {
+                Set<String> selectedSet = new HashSet<>(selectedKnowledgeDocs);
+                kbResults = kbResults.stream()
+                        .filter(r -> {
+                            Object docId = r.get("doc_id");
+                            if (docId != null) return selectedSet.contains(docId);
+                            // 旧数据没有 doc_id（在加入 doc_id 前已存储），保留不做过滤
+                            return true;
+                        })
+                        .collect(Collectors.toList());
+            }
+            allResults.addAll(kbResults);
+        }
+
+        if (searchNotes) {
+            List<Map<String, Object>> noteResults = hybridRetriever.searchNotes(userId, query, topK, config);
+            noteResults.forEach(r -> r.put("source_type", "note"));
+            if (selectedNotes != null && !selectedNotes.isEmpty()) {
+                Set<String> selectedNoteSet = new HashSet<>(selectedNotes);
+                noteResults = noteResults.stream()
+                        .filter(r -> selectedNoteSet.contains(r.get("note_id")))
+                        .collect(Collectors.toList());
+            }
+            allResults.addAll(noteResults);
+        }
+
+        // 按 similarity 降序排列，取 topK
+        allResults.sort((a, b) -> Double.compare(
+                (double) b.getOrDefault("similarity", 0.0),
+                (double) a.getOrDefault("similarity", 0.0)
+        ));
+        if (allResults.size() > topK) {
+            allResults = allResults.subList(0, topK);
+        }
+
+        return allResults;
+    }
+
+    /**
      * 核心方法：传入用户ID和查询词，返回相关的文档列表和最终的AI总结（支持消融实验）
      */
     public Map<String, Object> getDocumentsAndSummary(String userId, String query, AblationConfig config) {
@@ -119,6 +170,66 @@ public class RagService {
         String finalSummary = generateAnswer(userPrompt);
 
         // Trace 记录结束
+        trace.setGenerationLatencyMs(System.currentTimeMillis() - generationStart);
+        trace.setFinalAnswer(finalSummary);
+        trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
+        saveTrace(trace);
+
+        return Map.of("documents", documents, "summary", finalSummary);
+    }
+
+    /**
+     * 核心方法（增强版）：根据开关选择搜索知识库和/或笔记，支持按文档/笔记筛选
+     */
+    public Map<String, Object> getDocumentsAndSummary(String userId, String query,
+                                                      boolean searchKnowledge, boolean searchNotes,
+                                                      List<String> selectedKnowledgeDocs, List<String> selectedNotes,
+                                                      AblationConfig config) {
+        boolean useSourceAttr = config != null
+                ? config.isSourceAttributionEnabled()
+                : props.getAblation().getRag().isSourceAttributionEnabled();
+
+        RagTrace trace = new RagTrace();
+        trace.setTraceId(UUID.randomUUID().toString().replace("-", ""));
+        trace.setUserId(userId);
+        trace.setQuery(query);
+        long startTime = System.currentTimeMillis();
+
+        // 1. 检索阶段
+        long retrievalStart = System.currentTimeMillis();
+        List<Map<String, Object>> documents = retrieveDocuments(userId, query,
+                searchKnowledge, searchNotes, selectedKnowledgeDocs, selectedNotes, config);
+        trace.setRetrievalLatencyMs(System.currentTimeMillis() - retrievalStart);
+        trace.setRetrievedDocCount(documents.size());
+
+        double avgSim = documents.stream()
+                .mapToDouble(d -> (double) d.getOrDefault("similarity", 0.0))
+                .average().orElse(0.0);
+        trace.setAvgSimilarity(avgSim);
+
+        List<String> docPreviews = documents.stream()
+                .map(d -> (String) d.getOrDefault("content", ""))
+                .map(c -> c.length() > 200 ? c.substring(0, 200) : c)
+                .collect(Collectors.toList());
+        trace.setRetrievedDocs(docPreviews);
+
+        if (documents.isEmpty()) {
+            trace.setFinalAnswer("未找到相关文档。");
+            trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
+            saveTrace(trace);
+            return Map.of("documents", List.of(), "summary", "未找到相关文档。");
+        }
+
+        // 2. 构建参考资料
+        long generationStart = System.currentTimeMillis();
+        String context = useSourceAttr ? buildContext(documents) : buildContextPlain(documents);
+
+        // 3. 构建用户提示词
+        String userPrompt = "参考资料：\n" + context + "\n\n用户问题：" + query;
+
+        // 4. 调用 LLM 生成回答
+        String finalSummary = generateAnswer(userPrompt);
+
         trace.setGenerationLatencyMs(System.currentTimeMillis() - generationStart);
         trace.setFinalAnswer(finalSummary);
         trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);

@@ -134,6 +134,12 @@ public class GoalEvaluator {
 
         // 调用过工具且有成功 → 用 LLM 判断目标是否真正达成
         if (state.hasGoal() && !state.getGoal().isBlank()) {
+            // 已有成功工具结果但已连续被拦截过 → 放行，避免无限循环
+            if (state.getConsecutiveNoProgress() >= 1) {
+                log.info("GoalEvaluator: 放行 — 已有成功工具结果且曾被拦截，避免无限循环");
+                return GoalEvaluation.allowed(state);
+            }
+
             GoalCheckResult check = checkGoalWithLLM(state.getGoal(), state.getOriginalQuery(), llmAnswer);
             if (check.achieved) {
                 log.info("GoalEvaluator: LLM 判定目标已达成 → 放行");

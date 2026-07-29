@@ -1,7 +1,10 @@
 package com.rag.notebook.knowledge.service;
 
 import com.rag.notebook.common.exception.BusinessException;
-import com.rag.notebook.knowledge.dto.*;
+import com.rag.notebook.knowledge.dto.KnowledgeDocument;
+import com.rag.notebook.knowledge.dto.KnowledgeListResponse;
+import com.rag.notebook.knowledge.dto.MD5ListResponse;
+import com.rag.notebook.knowledge.dto.MD5Record;
 import com.rag.notebook.rag.DocumentProcessor;
 import com.rag.notebook.rag.Md5Store;
 import com.rag.notebook.rag.VectorStoreService;
@@ -13,13 +16,11 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
-import java.security.MessageDigest;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 
 @Slf4j
@@ -51,114 +52,164 @@ public class KnowledgeService {
     }
 
     public SseEmitter uploadMultipleStream(String userId, MultipartFile[] files) {
-        SseEmitter emitter = new SseEmitter(600000L);  // 10 分钟超时
+        SseEmitter emitter = new SseEmitter(0L);
         com.fasterxml.jackson.databind.ObjectMapper objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        AtomicBoolean connected = new AtomicBoolean(true);
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failedCount = new AtomicInteger(0);
+        AtomicInteger skippedCount = new AtomicInteger(0);
+        Set<String> skippedFiles = ConcurrentHashMap.newKeySet();
 
-        CompletableFuture.runAsync(() -> {
-            int successCount = 0;
-            int failedCount = 0;
-            int skippedCount = 0;
+        // 心跳（每15秒，防止网关/代理超时断开连接）
+        ScheduledExecutorService heartbeater = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "sse-heartbeat");
+            t.setDaemon(true);
+            return t;
+        });
 
+        Runnable cleanup = () -> {
+            connected.set(false);
+            heartbeater.shutdownNow();
+        };
+        emitter.onCompletion(cleanup);
+        emitter.onError(ex -> { log.warn("SSE连接错误: {}", ex.getMessage()); cleanup.run(); });
+        emitter.onTimeout(() -> { log.warn("SSE连接超时"); cleanup.run(); });
+
+        heartbeater.scheduleAtFixedRate(() -> {
+            if (!connected.get()) { heartbeater.shutdown(); return; }
             try {
-                for (MultipartFile file : files) {
-                    final boolean[] wasSkipped = {false};
-                    final boolean[] wasError = {false};
-
-                    processUploadedFile(userId, file, (stage, data) -> {
-                        try {
-                            // 构建前端期望的事件格式
-                            Map<String, Object> eventData = new java.util.LinkedHashMap<>();
-                            eventData.put("event_type", stage);
-                            eventData.put("filename", file.getOriginalFilename());
-                            eventData.put("message", data.toString());
-
-                            // 处理跳过事件（文档已存在）
-                            if ("skipping".equals(stage)) {
-                                eventData.put("event_type", "skipped");
-                                eventData.put("message", "文档已存在，跳过上传");
-                                wasSkipped[0] = true;
-                            }
-
-                            // 处理错误事件
-                            if ("error".equals(stage)) {
-                                wasError[0] = true;
-                            }
-
-                            // 解析进度信息
-                            String dataStr = data.toString();
-                            if (dataStr.contains("向量化进度:")) {
-                                // 提取百分比
-                                int percentStart = dataStr.lastIndexOf("(");
-                                int percentEnd = dataStr.lastIndexOf("%");
-                                if (percentStart > 0 && percentEnd > percentStart) {
-                                    String percent = dataStr.substring(percentStart + 1, percentEnd);
-                                    try {
-                                        eventData.put("progress", Integer.parseInt(percent));
-                                    } catch (NumberFormatException ignored) {}
-                                }
-                                eventData.put("event_type", "processing");
-                            }
-
-                            String json = objectMapper.writeValueAsString(eventData);
-                            emitter.send(SseEmitter.event().data(json));
-                        } catch (Exception e) {
-                            log.warn("Failed to send SSE event: {}", e.getMessage());
-                        }
-                    });
-
-                    if (wasSkipped[0]) {
-                        skippedCount++;
-                    } else if (wasError[0]) {
-                        failedCount++;
-                    } else {
-                        successCount++;
-                    }
-                }
-
-                // 发送完成事件
-                Map<String, Object> finishEvent = new java.util.LinkedHashMap<>();
-                finishEvent.put("event_type", "finish");
-                finishEvent.put("success_count", successCount);
-                finishEvent.put("failed_count", failedCount);
-                finishEvent.put("skipped_count", skippedCount);
-                emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(finishEvent)));
-                emitter.complete();
-            } catch (Exception e) {
-                failedCount++;
-                try {
-                    Map<String, Object> finishEvent = new java.util.LinkedHashMap<>();
-                    finishEvent.put("event_type", "finish");
-                    finishEvent.put("success_count", successCount);
-                    finishEvent.put("failed_count", failedCount);
-                    finishEvent.put("skipped_count", skippedCount);
-                    emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(finishEvent)));
-                } catch (Exception ignored) {}
-                emitter.completeWithError(e);
+                emitter.send(SseEmitter.event().comment("heartbeat").data("{\"event_type\":\"heartbeat\"}"));
+            } catch (IOException e) {
+                log.warn("心跳发送失败，客户端已断开");
+                connected.set(false);
+                heartbeater.shutdown();
             }
-        }, taskExecutor);
+        }, 15, 15, TimeUnit.SECONDS);
+
+        // 提交所有文件异步处理
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (MultipartFile file : files) {
+            String filename = file.getOriginalFilename();
+            if (filename == null) {
+                failedCount.incrementAndGet();
+                continue;
+            }
+
+            String finalFilename = filename;
+            CompletableFuture<Void> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    File tempFile = Files.createTempFile("upload_", "_" + finalFilename).toFile();
+                    try {
+                        file.transferTo(tempFile);
+                        return documentProcessor.processFile(tempFile, finalFilename, userId,
+                                (stage, data) -> sendSseEvent(emitter, objectMapper, connected, skippedFiles, finalFilename, stage, data));
+                    } finally {
+                        tempFile.delete();
+                    }
+                } catch (Exception e) {
+                    log.error("Failed to process file {}: {}", finalFilename, e.getMessage(), e);
+                    sendSseEvent(emitter, objectMapper, connected, skippedFiles, finalFilename, "error", e.getMessage());
+                    throw new CompletionException(e);
+                }
+            }, taskExecutor).thenCompose(f -> f);
+
+            // 各文件完成后更新计数
+            futures.add(future.whenComplete((res, err) -> {
+                if (err != null) {
+                    log.error("文件异步处理失败: {}, error: {}", finalFilename, err.getMessage() != null ? err.getMessage() : err.toString());
+                    failedCount.incrementAndGet();
+                } else if (skippedFiles.contains(finalFilename)) {
+                    skippedCount.incrementAndGet();
+                } else {
+                    successCount.incrementAndGet();
+                }
+            }));
+        }
+
+        // 所有文件都完成后发送 finish 事件
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                .whenComplete((v, err) -> {
+                    heartbeater.shutdown();
+                    if (connected.get()) {
+                        try {
+                            Map<String, Object> finish = new LinkedHashMap<>();
+                            finish.put("event_type", "finish");
+                            finish.put("success_count", successCount.get());
+                            finish.put("failed_count", failedCount.get());
+                            finish.put("skipped_count", skippedCount.get());
+                            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(finish)));
+                        } catch (Exception e) {
+                            log.warn("发送finish事件失败: {}", e.getMessage());
+                        }
+                        try {
+                            emitter.complete();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                });
 
         return emitter;
     }
 
-    private void processUploadedFile(String userId, MultipartFile file,
-                                     BiConsumer<String, Object> progressCallback) {
+    private void sendSseEvent(SseEmitter emitter,
+                               com.fasterxml.jackson.databind.ObjectMapper objectMapper,
+                               AtomicBoolean connected,
+                               Set<String> skippedFiles,
+                               String filename,
+                               String stage,
+                               Object data) {
+        if (!connected.get()) return;
+        try {
+            Map<String, Object> eventData = new LinkedHashMap<>();
+            eventData.put("event_type", stage);
+            eventData.put("filename", filename);
+            eventData.put("message", data.toString());
+
+            if ("skipping".equals(stage)) {
+                skippedFiles.add(filename);
+            }
+
+            String ds = data.toString();
+            if (ds.contains("向量化进度:")) {
+                int si = ds.lastIndexOf("(");
+                int ei = ds.lastIndexOf("%");
+                if (si > 0 && ei > si) {
+                    try {
+                        eventData.put("progress", Integer.parseInt(ds.substring(si + 1, ei)));
+                    } catch (NumberFormatException ignored) {}
+                }
+                eventData.put("event_type", "processing");
+            }
+
+            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(eventData)));
+        } catch (IOException e) {
+            log.warn("SSE发送失败，客户端可能已断开: {}", e.getMessage());
+            connected.set(false);
+        } catch (Exception e) {
+            log.warn("SSE事件发送异常: {}", e.getMessage());
+        }
+    }
+
+    private CompletableFuture<Void> processUploadedFile(String userId, MultipartFile file,
+                                                         BiConsumer<String, Object> progressCallback) {
         try {
             String originalFilename = file.getOriginalFilename();
             if (originalFilename == null) {
-                throw new BusinessException("文件名不能为空");
+                progressCallback.accept("error", "文件名不能为空");
+                return CompletableFuture.failedFuture(new BusinessException("文件名不能为空"));
             }
 
-            // Write to temp file
             File tempFile = Files.createTempFile("upload_", "_" + originalFilename).toFile();
             try {
                 file.transferTo(tempFile);
-                documentProcessor.processFile(tempFile, originalFilename, userId, progressCallback);
+                return documentProcessor.processFile(tempFile, originalFilename, userId, progressCallback);
             } finally {
                 tempFile.delete();
             }
         } catch (Exception e) {
             log.error("Failed to process uploaded file: {}", e.getMessage(), e);
             progressCallback.accept("error", e.getMessage());
+            return CompletableFuture.failedFuture(e);
         }
     }
 

@@ -53,6 +53,7 @@ public class VectorStoreService {
     private final StringRedisTemplate redisTemplate;
     private final Md5Store md5Store;
     private final NoteChunkRepository noteChunkRepository;
+    private final DocumentTaskExecutor documentTaskExecutor;
 
     // ChromaDB 向量存储（连接成功时使用）
     private EmbeddingStore<TextSegment> noteStore;
@@ -65,7 +66,8 @@ public class VectorStoreService {
                               ChromaCleanupTaskRepository cleanupTaskRepository,
                               StringRedisTemplate redisTemplate,
                               Md5Store md5Store,
-                              NoteChunkRepository noteChunkRepository) {
+                              NoteChunkRepository noteChunkRepository,
+                              DocumentTaskExecutor documentTaskExecutor) {
         this.props = props;
         this.embeddingModel = modelFactory.createEmbeddingModel();
         this.bm25Service = bm25Service;
@@ -75,6 +77,7 @@ public class VectorStoreService {
         this.redisTemplate = redisTemplate;
         this.md5Store = md5Store;
         this.noteChunkRepository = noteChunkRepository;
+        this.documentTaskExecutor = documentTaskExecutor;
 
         // 尝试连接 ChromaDB
         try {
@@ -300,47 +303,47 @@ public class VectorStoreService {
         return searchChroma(noteStore, queryEmbedding, userId, topK, "note");
     }
 
-    // ========== 知识库向量操作（MySQL + ChromaDB 双写） ==========
+    // ========== 知识库向量操作（MySQL + BM25，ChromaDB 由 DocumentTaskExecutor 异步执行） ==========
 
     @Transactional
-    public void addKnowledgeDocument(String userId, String filename, String md5,
-                                     List<String> chunks, Map<String, Object> metadata) {
+    public String addKnowledgeDocument(String userId, String filename, String md5,
+                                        List<String> chunks, Map<String, Object> metadata) {
         String originalFilename = (String) metadata.getOrDefault("original_filename", filename);
         Long fileSize = metadata.containsKey("file_size") ? (Long) metadata.get("file_size") : 0L;
-        addKnowledgeDocument(userId, filename, originalFilename, md5, fileSize, chunks, null);
+        return addKnowledgeDocument(userId, filename, originalFilename, md5, fileSize, chunks, null);
     }
 
     @Transactional
-    public void addKnowledgeDocument(String userId, String filename, String md5,
-                                     List<String> chunks, Map<String, Object> metadata,
-                                     BiConsumer<String, Object> progressCallback) {
+    public String addKnowledgeDocument(String userId, String filename, String md5,
+                                        List<String> chunks, Map<String, Object> metadata,
+                                        BiConsumer<String, Object> progressCallback) {
         String originalFilename = (String) metadata.getOrDefault("original_filename", filename);
         Long fileSize = metadata.containsKey("file_size") ? (Long) metadata.get("file_size") : 0L;
-        addKnowledgeDocument(userId, filename, originalFilename, md5, fileSize, chunks, progressCallback);
+        return addKnowledgeDocument(userId, filename, originalFilename, md5, fileSize, chunks, progressCallback);
     }
 
     @Transactional
-    public void addKnowledgeDocument(String userId, String filename, String originalFilename,
-                                     String md5, Long fileSize, List<String> chunks) {
-        addKnowledgeDocument(userId, filename, originalFilename, md5, fileSize, chunks, null);
+    public String addKnowledgeDocument(String userId, String filename, String originalFilename,
+                                        String md5, Long fileSize, List<String> chunks) {
+        return addKnowledgeDocument(userId, filename, originalFilename, md5, fileSize, chunks, null);
     }
 
     @Transactional
-    public void addKnowledgeDocument(String userId, String filename, String originalFilename,
-                                     String md5, Long fileSize, List<String> chunks,
-                                     BiConsumer<String, Object> progressCallback) {
+    public String addKnowledgeDocument(String userId, String filename, String originalFilename,
+                                        String md5, Long fileSize, List<String> chunks,
+                                        BiConsumer<String, Object> progressCallback) {
         log.info("开始添加知识文档: userId={}, filename={}, md5={}, chunks={}", userId, filename, md5, chunks.size());
 
-        // 0. MD5去重检查：如果已存在相同MD5的文档，跳过重复写入
+        // MD5去重检查
         if (documentRepository.existsByUserIdAndMd5(userId, md5)) {
             log.info("文档已存在（MD5重复），跳过写入: userId={}, md5={}, filename={}", userId, md5, filename);
             if (progressCallback != null) {
                 progressCallback.accept("skipping", originalFilename);
             }
-            return;
+            return null;
         }
 
-        // 1. 先写MySQL（事务保证）
+        // 1. 保存文档到MySQL（事务短，仅含MySQL写入）
         KnowledgeDocument document = new KnowledgeDocument();
         document.setId(UUID.randomUUID().toString());
         document.setUserId(userId);
@@ -351,11 +354,8 @@ public class VectorStoreService {
         document.setChunkCount(chunks.size());
         document.setStatus("processing");
         document.setPreview(chunks.isEmpty() ? "" : chunks.get(0).substring(0, Math.min(200, chunks.get(0).length())));
-
         document = documentRepository.save(document);
-        log.info("MySQL文档保存成功: docId={}", document.getId());
 
-        // 2. 写入切片到MySQL
         List<KnowledgeDocumentChunk> chunkEntities = new ArrayList<>();
         for (int i = 0; i < chunks.size(); i++) {
             KnowledgeDocumentChunk chunk = new KnowledgeDocumentChunk();
@@ -366,144 +366,19 @@ public class VectorStoreService {
             chunkEntities.add(chunk);
         }
         chunkRepository.saveAll(chunkEntities);
-        log.info("MySQL切片保存成功: docId={}, chunks={}", document.getId(), chunks.size());
+        log.info("MySQL文档+切片保存成功: docId={}, chunks={}", document.getId(), chunks.size());
 
-        // 3. 异步写入ChromaDB（写入成功后会更新状态为completed）
-        writeToChromaAsync(userId, filename, md5, document.getId(), chunks, false, progressCallback);
-
-        // 4. 写入BM25索引
+        // 2. 写入BM25索引（快速）
         for (int i = 0; i < chunks.size(); i++) {
             String key = md5 + "_" + i;
             bm25Service.addDocument(userId, key, chunks.get(i),
                     Map.of("source", "knowledge_base", "chunk_id", key,
-                            "filename", filename, "md5", md5, "user_id", userId));
+                            "filename", filename, "md5", md5, "user_id", userId,
+                            "doc_id", document.getId()));
         }
 
-        log.info("知识文档添加完成: docId={}, filename={}, chunks={}", document.getId(), filename, chunks.size());
-    }
-
-    @Async
-    public void writeToChromaAsync(String userId, String filename, String md5, String docId, List<String> chunks) {
-        writeToChromaAsync(userId, filename, md5, docId, chunks, false, null);
-    }
-
-    @Async
-    public void writeToChromaAsync(String userId, String filename, String md5, String docId,
-                                   List<String> chunks, boolean cleanBeforeWrite) {
-        writeToChromaAsync(userId, filename, md5, docId, chunks, cleanBeforeWrite, null);
-    }
-
-    @Async
-    public void writeToChromaAsync(String userId, String filename, String md5, String docId,
-                                   List<String> chunks, boolean cleanBeforeWrite,
-                                   BiConsumer<String, Object> progressCallback) {
-        if (!chromaAvailable) {
-            log.warn("ChromaDB不可用，标记为vector_failed: docId={}", docId);
-            markVectorFailed(docId);
-            return;
-        }
-
-        try {
-            // 1. 如果是重试场景，先清理旧数据
-            if (cleanBeforeWrite) {
-                log.info("重试场景，先清理旧数据: docId={}", docId);
-                deleteFromChromaByDocId(docId);
-            }
-
-            // 2. 批量构建元数据和准备内容
-            List<TextSegment> segments = new ArrayList<>();
-            List<String> validContents = new ArrayList<>();
-            for (int i = 0; i < chunks.size(); i++) {
-                String key = md5 + "_" + i;
-                String content = chunks.get(i);
-
-                // 跳过空切片
-                if (content == null || content.isBlank()) {
-                    log.warn("跳过空切片: key={}", key);
-                    continue;
-                }
-
-                Map<String, Object> meta = new HashMap<>();
-                meta.put("chunk_id", key);
-                meta.put("user_id", userId);
-                meta.put("filename", filename);
-                meta.put("md5", md5);
-                meta.put("doc_id", docId);
-                meta.put("index", i);
-                meta.put("content", content);
-
-                segments.add(TextSegment.from(content, dev.langchain4j.data.document.Metadata.from(meta)));
-                validContents.add(content);
-            }
-
-            // 3. 分批处理（批量 Embedding + 分批写入 ChromaDB）
-            int batchSize = 10;  // 每批处理 10 个 chunks（减小批量避免超时）
-            int totalSegments = segments.size();
-            int totalBatches = (int) Math.ceil((double) totalSegments / batchSize);
-            int processedCount = 0;
-
-            for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-                int start = batchIndex * batchSize;
-                int end = Math.min(start + batchSize, totalSegments);
-
-                List<TextSegment> batchSegments = segments.subList(start, end);
-                List<String> batchContents = validContents.subList(start, end);
-
-                // 批量 Embedding
-                List<Embedding> batchEmbeddings = batchEmbed(batchContents);
-
-                // 分批写入 ChromaDB
-                knowledgeStore.addAll(batchEmbeddings, batchSegments);
-
-                processedCount += batchSegments.size();
-
-                // 发送进度回调
-                if (progressCallback != null) {
-                    int progress = (int) ((double) processedCount / totalSegments * 100);
-                    progressCallback.accept("processing",
-                            String.format("向量化进度: %d/%d (%d%%)", processedCount, totalSegments, progress));
-                }
-
-                log.info("ChromaDB批量写入进度: docId={}, {}/{} chunks", docId, processedCount, totalSegments);
-
-                // 批次之间添加短暂延迟，避免 ChromaDB 过载
-                if (batchIndex < totalBatches - 1) {
-                    Thread.sleep(100);  // 100ms 延迟
-                }
-            }
-
-            log.info("ChromaDB写入成功: docId={}, chunks={}", docId, totalSegments);
-
-            // 写入成功后，更新MySQL状态为completed
-            markVectorCompleted(docId);
-        } catch (Exception e) {
-            log.error("ChromaDB写入失败，标记为vector_failed: docId={}, error={}", docId, e.getMessage());
-            markVectorFailed(docId);
-        }
-    }
-
-    /**
-     * 标记文档向量化失败
-     */
-    private void markVectorFailed(String docId) {
-        documentRepository.findById(docId).ifPresent(doc -> {
-            doc.setStatus("vector_failed");
-            documentRepository.save(doc);
-            log.info("文档状态已更新为vector_failed: docId={}", docId);
-        });
-    }
-
-    /**
-     * 标记文档向量化完成
-     */
-    private void markVectorCompleted(String docId) {
-        documentRepository.findById(docId).ifPresent(doc -> {
-            if (!"completed".equals(doc.getStatus())) {
-                doc.setStatus("completed");
-                documentRepository.save(doc);
-                log.info("文档状态已更新为completed: docId={}", docId);
-            }
-        });
+        log.info("知识文档添加完成（MySQL+BM25）: docId={}, filename={}, chunks={}", document.getId(), filename, chunks.size());
+        return document.getId();
     }
 
     /**
@@ -774,8 +649,12 @@ public class VectorStoreService {
         doc.setStatus("processing");
         documentRepository.save(doc);
 
-        // 异步写入 ChromaDB
-        writeToChromaAsync(doc.getUserId(), doc.getFilename(), doc.getMd5(), doc.getId(), contentList, true);
+        // 先清理旧的 ChromaDB 数据
+        deleteFromChromaByDocId(docId);
+
+        // 通过 DocumentTaskExecutor 异步写入 ChromaDB（真正的 @Async 跨 Bean 调用）
+        documentTaskExecutor.writeToChromaAsync(doc.getUserId(), doc.getFilename(), doc.getMd5(),
+                doc.getId(), contentList, null);
 
         log.info("重试向量化任务已提交: docId={}", docId);
         return true;
@@ -807,6 +686,7 @@ public class VectorStoreService {
                 result.put("user_id", userId);
                 result.put("filename", doc.getFilename());
                 result.put("md5", doc.getMd5());
+                result.put("doc_id", doc.getId());
                 result.put("index", chunk.getChunkIndex());
                 result.put("content", chunk.getContent());
                 result.put("distance", 1.0f - similarity);
@@ -955,7 +835,10 @@ public class VectorStoreService {
     // ========== 工具方法 ==========
 
     /**
-     * 批量 Embedding（减少 API 调用次数）
+     * 文本向量化（降级兜底）
+     */
+    /**
+     * 批量 Embedding（减少 API 调用次数，供笔记向量化使用）
      */
     private List<Embedding> batchEmbed(List<String> texts) {
         try {
@@ -966,7 +849,6 @@ public class VectorStoreService {
             return response.content();
         } catch (Exception e) {
             log.warn("批量向量化失败，降级为逐个处理: {}", e.getMessage());
-            // 降级为逐个处理
             return texts.stream()
                     .map(this::embed)
                     .collect(Collectors.toList());

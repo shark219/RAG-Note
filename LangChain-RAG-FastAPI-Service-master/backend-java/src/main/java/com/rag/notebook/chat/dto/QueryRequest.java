@@ -24,4 +24,10 @@ public class QueryRequest {
 
     /** 附件 ID 列表 */
     private List<String> fileIds;
+
+    /** 选中的知识库文档 filename 列表（空=搜索全部） */
+    private List<String> selectedKnowledgeDocs;
+
+    /** 选中的笔记 ID 列表（空=搜索全部） */
+    private List<String> selectedNotes;
 }

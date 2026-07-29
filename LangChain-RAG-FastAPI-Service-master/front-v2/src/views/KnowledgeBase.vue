@@ -385,13 +385,19 @@ function handleSseEvent(event: any) {
   if (fileIdx >= 0) {
     const fileItem = uploadState.files[fileIdx]
 
-    if (event_type === 'processing' || event_type === 'vectorizing') {
+    if (event_type === 'loading' || event_type === 'splitting' || event_type === 'storing') {
+      // 同步处理阶段：立即显示处理中状态，不再显示"等待上传"
       fileItem.status = 'processing'
-      fileItem.message = message || '处理中...'
+      fileItem.message = event_type === 'loading' ? '读取文件中...'
+        : event_type === 'splitting' ? '文本切片中...'
+        : '存储到数据库...'
+    } else if (event_type === 'processing' || event_type === 'vectorizing') {
+      fileItem.status = 'processing'
+      fileItem.message = message || '向量化中...'
       if (progress !== undefined) {
         fileItem.progress = progress
       }
-    } else if (event_type === 'complete' || event_type === 'done') {
+    } else if (event_type === 'completed') {
       fileItem.status = 'done'
       fileItem.progress = 100
       fileItem.message = '完成'
