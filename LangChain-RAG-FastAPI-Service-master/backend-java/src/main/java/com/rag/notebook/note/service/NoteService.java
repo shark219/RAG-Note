@@ -1,6 +1,7 @@
 package com.rag.notebook.note.service;
 
 import com.rag.notebook.agent.ModelFactory;
+import com.rag.notebook.cache.CacheProtectionService;
 import com.rag.notebook.common.exception.BusinessException;
 import com.rag.notebook.note.dto.*;
 import com.rag.notebook.note.entity.Note;
@@ -31,21 +32,29 @@ import java.util.stream.Collectors;
 @Service
 public class NoteService {
 
+    private static final String CACHE_NOTE = "note:";
+    private static final String CACHE_NOTE_LIST = "note:list:";
+    private static final long TTL_NOTE = 1800L;      // 单条笔记 30 分钟
+    private static final long TTL_NOTE_LIST = 300L;  // 列表 5 分钟
+
     private final NoteRepository noteRepository;
     private final ReviewRecordRepository reviewRecordRepository;
     private final VectorStoreService vectorStoreService;
     private final ModelFactory modelFactory;
+    private final CacheProtectionService cacheProtection;
     private final NoteService self;
 
     public NoteService(NoteRepository noteRepository,
                        ReviewRecordRepository reviewRecordRepository,
                        VectorStoreService vectorStoreService,
                        ModelFactory modelFactory,
+                       CacheProtectionService cacheProtection,
                        @Lazy NoteService self) {
         this.noteRepository = noteRepository;
         this.reviewRecordRepository = reviewRecordRepository;
         this.vectorStoreService = vectorStoreService;
         this.modelFactory = modelFactory;
+        this.cacheProtection = cacheProtection;
         this.self = self;
     }
 
@@ -61,6 +70,9 @@ public class NoteService {
             note.setCategory(request.getCategory());
         }
         note = noteRepository.save(note); // 保存到MySQL
+
+        // 新增笔记后清除用户级的笔记列表缓存（列表数据已变）
+        cacheProtection.evict(CACHE_NOTE_LIST + userId);
 
         try {
             vectorStoreService.addNoteVector(note);
@@ -208,8 +220,13 @@ public class NoteService {
     }
 
     public NoteResponse getNote(String userId, String noteId) {
-        Note note = noteRepository.findById(noteId)
-                .orElseThrow(() -> new BusinessException("笔记不存在"));
+        Note note = cacheProtection.getWithProtection(
+                CACHE_NOTE + noteId, Note.class, TTL_NOTE,
+                () -> noteRepository.findById(noteId).orElse(null)
+        );
+        if (note == null) {
+            throw new BusinessException("笔记不存在");
+        }
         if (!note.getUserId().equals(userId)) {
             throw new BusinessException(403, "无权访问该笔记");
         }
@@ -235,6 +252,10 @@ public class NoteService {
 
         note = noteRepository.save(note);
 
+        // 更新笔记后清除缓存
+        cacheProtection.evict(CACHE_NOTE + noteId);
+        cacheProtection.evict(CACHE_NOTE_LIST + userId);
+
         if (contentChanged) {
             try {
                 vectorStoreService.deleteNoteVector(noteId, note.getUserId());
@@ -257,6 +278,10 @@ public class NoteService {
 
         // 删除笔记
         noteRepository.delete(note);
+
+        // 删除笔记后清除缓存
+        cacheProtection.evict(CACHE_NOTE + noteId);
+        cacheProtection.evict(CACHE_NOTE_LIST + userId);
 
         // 删除关联的复习记录（使用原生 SQL，绕过 Hibernate 实体追踪）
         try {
