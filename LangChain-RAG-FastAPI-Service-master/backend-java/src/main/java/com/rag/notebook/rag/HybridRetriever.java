@@ -24,7 +24,7 @@ import java.util.stream.Collectors;
 public class HybridRetriever {
 
     /** RRF 公式中的常数 k，通常取 60 */
-    private static final int RRF_K = 60;
+    private static final int RRF_K = 30;
 
     private final VectorStoreService vectorStoreService;
     private final Bm25Service bm25Service;
