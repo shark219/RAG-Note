@@ -47,7 +47,12 @@ public class HybridRetriever {
     // ==================== 公开接口（无消融配置，使用默认配置） ====================
 
     public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK) {
-        return searchKnowledge(userId, query, topK, null);
+        return searchKnowledge(userId, query, topK, (AblationConfig) null);
+    }
+
+    public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK,
+                                                     Set<String> knowledgeDocIdentifiers) {
+        return searchKnowledge(userId, query, topK, null, knowledgeDocIdentifiers);
     }
 
     public List<Map<String, Object>> searchNotes(String userId, String query, int topK) {
@@ -66,12 +71,18 @@ public class HybridRetriever {
      * @return 检索结果
      */
     public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK, AblationConfig config) {
+        return searchKnowledge(userId, query, topK, config, Set.of());
+    }
+
+    public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK, AblationConfig config,
+                                                     Set<String> knowledgeDocIdentifiers) {
         boolean expandQuery = isEnabled(config, c -> c.isQueryExpansionEnabled(), props.getAblation().getRag().isQueryExpansionEnabled());
         boolean useVector = isEnabled(config, c -> c.isVectorSearchEnabled(), props.getAblation().getRag().isVectorSearchEnabled());
         boolean useBm25 = isEnabled(config, c -> c.isBm25SearchEnabled(), props.getAblation().getRag().isBm25SearchEnabled());
         boolean useRrf = isEnabled(config, c -> c.isRrfFusionEnabled(), props.getAblation().getRag().isRrfFusionEnabled());
         boolean useRerank = isEnabled(config, c -> c.isRerankEnabled(), props.getAblation().getRag().isRerankEnabled());
         int effectiveTopK = config != null && config.getTopK() != null ? config.getTopK() : topK;
+        Set<String> selectedKnowledgeDocs = normalizeIdentifiers(knowledgeDocIdentifiers);
 
         // 1. Query 扩展
         List<String> queries = expandQuery
@@ -81,18 +92,21 @@ public class HybridRetriever {
                 truncate(query, 30), expandQuery, useVector, useBm25, useRrf, useRerank, queries.size());
 
         // 2. 收集各路检索结果
+        if (!selectedKnowledgeDocs.isEmpty()) {
+            log.info("Knowledge selected-doc retrieval enabled: selected={}", selectedKnowledgeDocs);
+        }
         List<List<Map<String, Object>>> allRankings = new ArrayList<>();
 
         for (String q : queries) {
             if (useVector) {
-                List<Map<String, Object>> vectorResults = vectorStoreService.searchKnowledge(userId, q, effectiveTopK * 2);
+                List<Map<String, Object>> vectorResults = vectorStoreService.searchKnowledge(userId, q,
+                        effectiveTopK * 2, selectedKnowledgeDocs);
                 allRankings.add(vectorResults);
             }
             if (useBm25) {
-                List<Map<String, Object>> bm25Results = bm25Service.search(userId, q, effectiveTopK * 2);
-                bm25Results = bm25Results.stream()
-                        .filter(r -> "knowledge_base".equals(r.get("source")))
-                        .collect(Collectors.toList());
+                List<Map<String, Object>> bm25Results = bm25Service.search(userId, q, effectiveTopK * 2,
+                        r -> matchesKnowledgeSource(r, selectedKnowledgeDocs)
+                                && matchesKnowledgeIdentifiers(r, selectedKnowledgeDocs));
                 allRankings.add(bm25Results);
             }
         }
@@ -232,6 +246,71 @@ public class HybridRetriever {
         if (doc.containsKey("docId")) return (String) doc.get("docId");
         if (doc.containsKey("note_id")) return (String) doc.get("note_id");
         return String.valueOf(doc.getOrDefault("content", "").hashCode());
+    }
+
+    private Set<String> normalizeIdentifiers(Set<String> identifiers) {
+        if (identifiers == null || identifiers.isEmpty()) {
+            return Set.of();
+        }
+        return identifiers.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .filter(s -> !s.isBlank())
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private boolean matchesKnowledgeIdentifiers(Map<String, Object> result, Set<String> identifiers) {
+        if (identifiers == null || identifiers.isEmpty()) {
+            return true;
+        }
+        if (matchesAny(identifiers,
+                result.get("doc_id"),
+                result.get("docId"),
+                result.get("id"),
+                result.get("md5"),
+                result.get("filename"),
+                result.get("original_filename"))) {
+            return true;
+        }
+
+        String chunkId = stringValue(result.get("chunk_id"));
+        if (chunkId == null) {
+            chunkId = stringValue(result.get("docId"));
+        }
+        if (chunkId == null) {
+            return false;
+        }
+        String finalChunkId = chunkId;
+        return identifiers.stream().anyMatch(id -> finalChunkId.startsWith(id + "_"));
+    }
+
+    private boolean matchesKnowledgeSource(Map<String, Object> result, Set<String> selectedIdentifiers) {
+        String source = stringValue(result.get("source"));
+        if ("knowledge_base".equals(source)) {
+            return true;
+        }
+        return source == null
+                && selectedIdentifiers != null
+                && !selectedIdentifiers.isEmpty()
+                && matchesKnowledgeIdentifiers(result, selectedIdentifiers);
+    }
+
+    private boolean matchesAny(Set<String> identifiers, Object... values) {
+        for (Object value : values) {
+            String str = stringValue(value);
+            if (str != null && identifiers.contains(str)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String stringValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        String str = String.valueOf(value);
+        return str.isBlank() || "null".equalsIgnoreCase(str) ? null : str;
     }
 
     private String truncate(String str, int maxLen) {

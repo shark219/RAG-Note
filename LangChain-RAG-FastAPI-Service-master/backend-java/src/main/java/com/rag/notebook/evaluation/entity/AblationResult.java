@@ -66,6 +66,10 @@ public class AblationResult {
     @Column(name = "avg_doc_count")
     private Double avgDocCount;
 
+    /** 平均 Token 消耗 */
+    @Column(name = "avg_token_consumed")
+    private Integer avgTokenConsumed;
+
     // ===== 元数据 =====
 
     @Column(name = "user_id", length = 36)

@@ -182,7 +182,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
 import { IconUpload, IconDelete } from '@arco-design/web-vue/es/icon'
 import { knowledgeApi } from '@/api'
@@ -235,19 +235,45 @@ onMounted(() => {
   fetchDocuments()
 })
 
+onBeforeUnmount(() => {
+  stopStatusPolling()
+})
+
+let statusPollTimer: number | null = null
+
+function refreshStatusPolling() {
+  const hasProcessing = documents.value.some((doc) => doc.status === 'processing')
+  if (hasProcessing && statusPollTimer === null) {
+    statusPollTimer = window.setInterval(() => {
+      fetchDocuments(false)
+    }, 3000)
+  } else if (!hasProcessing) {
+    stopStatusPolling()
+  }
+}
+
+function stopStatusPolling() {
+  if (statusPollTimer !== null) {
+    window.clearInterval(statusPollTimer)
+    statusPollTimer = null
+  }
+}
+
 // ========== 文档列表 ==========
-async function fetchDocuments() {
-  loading.value = true
+async function fetchDocuments(showLoading = true) {
+  if (showLoading) loading.value = true
   try {
     const res: any = await knowledgeApi.list()
     const data = res?.data || res
     documents.value = data?.documents || []
+    refreshStatusPolling()
   } catch (e: any) {
     console.error('获取文档列表失败', e)
     Message.error('获取文档列表失败: ' + (e?.response?.data?.message || e?.message || '未知错误'))
     documents.value = []
+    stopStatusPolling()
   } finally {
-    loading.value = false
+    if (showLoading) loading.value = false
   }
 }
 
@@ -505,7 +531,8 @@ async function handleRetry(doc: any) {
   try {
     await knowledgeApi.retryVectorization(doc.id)
     Message.success('重试任务已提交')
-    fetchDocuments()
+    await fetchDocuments()
+    refreshStatusPolling()
   } catch (e) {
     Message.error('重试失败')
   }

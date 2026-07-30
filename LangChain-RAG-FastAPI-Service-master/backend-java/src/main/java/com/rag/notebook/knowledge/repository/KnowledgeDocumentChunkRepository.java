@@ -25,5 +25,13 @@ public interface KnowledgeDocumentChunkRepository extends JpaRepository<Knowledg
     @Query("SELECT c FROM KnowledgeDocumentChunk c JOIN c.document d WHERE d.userId = :userId AND d.md5 = :md5 ORDER BY c.chunkIndex ASC")
     List<KnowledgeDocumentChunk> findByUserIdAndMd5(@Param("userId") String userId, @Param("md5") String md5);
 
+    @Query("SELECT c FROM KnowledgeDocumentChunk c WHERE c.document.id = :documentId AND c.parentId = :parentId ORDER BY c.chunkIndex ASC")
+    List<KnowledgeDocumentChunk> findByDocumentIdAndParentId(@Param("documentId") String documentId,
+                                                             @Param("parentId") String parentId);
+
+    @Query("SELECT c FROM KnowledgeDocumentChunk c WHERE c.document.id = :documentId AND c.sectionPath = :sectionPath ORDER BY c.chunkIndex ASC")
+    List<KnowledgeDocumentChunk> findByDocumentIdAndSectionPath(@Param("documentId") String documentId,
+                                                                @Param("sectionPath") String sectionPath);
+
     void deleteByDocumentId(String documentId);
 }

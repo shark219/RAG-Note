@@ -150,6 +150,7 @@ public class ModelFactory {
                     .apiKey(props.getEmbed().getZhipu().getApiKey())
                     .baseUrl(props.getEmbed().getZhipu().getBaseUrl())
                     .modelName(props.getEmbed().getZhipu().getModel())
+                    .timeout(Duration.ofSeconds(120))
                     .dimensions(1024)  // 指定输出维度为1024
                     .build();
         } else if ("ALIYUN".equalsIgnoreCase(type)) {

@@ -2,6 +2,8 @@ package com.rag.notebook.rag;
 
 import com.rag.notebook.config.ApplicationProperties;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.tika.Tika;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
@@ -18,6 +20,8 @@ import java.util.function.BiConsumer;
 @Service
 public class DocumentProcessor {
 
+    private static final int MAX_EXTRACTED_TEXT_LENGTH = Integer.MAX_VALUE;
+
     private final ApplicationProperties props;
     private final VectorStoreService vectorStoreService;
     private final Md5Store md5Store;
@@ -30,6 +34,7 @@ public class DocumentProcessor {
         this.vectorStoreService = vectorStoreService;
         this.md5Store = md5Store;
         this.documentTaskExecutor = documentTaskExecutor;
+        this.tika.setMaxStringLength(MAX_EXTRACTED_TEXT_LENGTH);
     }
 
     public CompletableFuture<Void> processFile(File file, String originalFilename, String userId,
@@ -48,13 +53,15 @@ public class DocumentProcessor {
             }
 
             progressCallback.accept("splitting", originalFilename);
-            String content = tika.parseToString(file);
+            String content = extractText(file, originalFilename);
+            log.info("Document text extracted: filename={}, chars={}", originalFilename, content.length());
             String filePrefix = "[文件: " + originalFilename + "]\n";
-            List<String> rawChunks = splitText(content, props.getChroma().getChunkSize(),
-                    props.getChroma().getChunkOverlap());
-            List<String> chunks = new ArrayList<>();
-            for (String chunk : rawChunks) {
-                chunks.add(filePrefix + chunk);
+            List<RagChunk> chunks = RagChunker.splitKnowledge(originalFilename, content,
+                    props.getChroma().getChunkSize(), props.getChroma().getChunkOverlap());
+            log.info("Document text split: filename={}, chunks={}", originalFilename, chunks.size());
+            List<String> qualityWarnings = RagChunker.validate(chunks, props.getChroma().getChunkSize(), isPdf(originalFilename));
+            if (!qualityWarnings.isEmpty()) {
+                log.warn("Document chunk quality warnings: filename={}, warnings={}", originalFilename, qualityWarnings);
             }
 
             progressCallback.accept("storing", originalFilename);
@@ -67,7 +74,7 @@ public class DocumentProcessor {
             );
 
             // 1. MySQL + BM25 保存（同步，快速，事务短）
-            String docId = vectorStoreService.addKnowledgeDocument(userId, originalFilename, md5, chunks, metadata, progressCallback);
+            String docId = vectorStoreService.addKnowledgeDocumentChunks(userId, originalFilename, md5, chunks, metadata, progressCallback);
             if (docId == null) {
                 return CompletableFuture.completedFuture(null);
             }
@@ -99,6 +106,10 @@ public class DocumentProcessor {
     private List<String> splitText(String text, int chunkSize, int chunkOverlap) {
         List<String> chunks = new ArrayList<>();
         if (text == null || text.isEmpty()) return chunks;
+        chunks = TextChunker.split(text, chunkSize, chunkOverlap);
+        if (!chunks.isEmpty()) {
+            return chunks;
+        }
 
         // Split by Chinese-aware separators
         String[] separators = {"\n\n", "\n", "。", "！", "？", ".", "!", "?", "；", ";", "，", ","};
@@ -141,6 +152,53 @@ public class DocumentProcessor {
         }
 
         return result;
+    }
+
+    private String extractText(File file, String originalFilename) throws Exception {
+        if (isPdf(originalFilename)) {
+            return extractPdfTextByPage(file, originalFilename);
+        }
+        return tika.parseToString(file);
+    }
+
+    private boolean isPdf(String originalFilename) {
+        return originalFilename != null
+                && originalFilename.toLowerCase(Locale.ROOT).endsWith(".pdf");
+    }
+
+    private String extractPdfTextByPage(File file, String originalFilename) throws IOException {
+        try (PDDocument document = PDDocument.load(file)) {
+            int pageCount = document.getNumberOfPages();
+            log.info("PDF page extraction started: filename={}, pages={}", originalFilename, pageCount);
+
+            PDFTextStripper stripper = new PDFTextStripper();
+            stripper.setSortByPosition(true);
+
+            StringBuilder content = new StringBuilder();
+            for (int page = 1; page <= pageCount; page++) {
+                stripper.setStartPage(page);
+                stripper.setEndPage(page);
+
+                String pageText = stripper.getText(document);
+                if (pageText == null || pageText.isBlank()) {
+                    log.debug("PDF page has no extractable text: filename={}, page={}/{}",
+                            originalFilename, page, pageCount);
+                    continue;
+                }
+
+                content.append("\n[Page ")
+                        .append(page)
+                        .append("/")
+                        .append(pageCount)
+                        .append("]\n")
+                        .append(pageText.strip())
+                        .append('\n');
+            }
+
+            log.info("PDF page extraction finished: filename={}, pages={}, chars={}",
+                    originalFilename, pageCount, content.length());
+            return content.toString();
+        }
     }
 
     public String computeMd5(File file) throws Exception {

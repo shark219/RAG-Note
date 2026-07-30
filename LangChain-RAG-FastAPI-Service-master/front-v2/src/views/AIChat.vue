@@ -54,12 +54,12 @@
             <a-switch v-model="config.knowledgeEnabled" size="small" />
             <a-select
               v-model="config.selectedKnowledgeDocs"
+              class="fixed-resource-select"
               placeholder="文档"
               multiple
               :filterable="true"
               :allow-clear="true"
               :max-tag-count="1"
-              :max-tag-text-length="8"
               size="small"
               style="width: 120px;"
               :disabled="!config.knowledgeEnabled"
@@ -78,12 +78,12 @@
             <a-switch v-model="config.notesEnabled" size="small" />
             <a-select
               v-model="config.selectedNotes"
+              class="fixed-resource-select"
               placeholder="笔记"
               multiple
               :filterable="true"
               :allow-clear="true"
               :max-tag-count="1"
-              :max-tag-text-length="8"
               size="small"
               style="width: 120px;"
               :disabled="!config.notesEnabled"
@@ -1846,33 +1846,83 @@ function formatTime(dateStr: string) {
   }
 }
 
-/* 多选下拉框：隐藏单个 tag 的关闭按钮，只保留 allow-clear 的清除全部 */
-:deep(.arco-select-multiple .arco-tag-close-btn) {
-  display: none;
-}
-:deep(.arco-select-view-multiple .arco-select-tag) {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 </style>
 
 <style>
-/* 全局样式：多选下拉固定宽度，不随选中项伸缩 */
-.ai-chat .arco-select-view-multiple {
+/* Resource selects keep the config bar stable regardless of selected title length. */
+.ai-chat .fixed-resource-select,
+.ai-chat .fixed-resource-select.arco-select,
+.ai-chat .fixed-resource-select .arco-select-view,
+.ai-chat .fixed-resource-select .arco-select-view-multiple {
   width: 120px !important;
   min-width: 120px !important;
   max-width: 120px !important;
+  height: 24px !important;
+  min-height: 24px !important;
+  max-height: 24px !important;
+  flex: 0 0 120px;
+  overflow: hidden;
 }
-.ai-chat .arco-select-view-multiple .arco-select-tag {
+
+.ai-chat .fixed-resource-select .arco-select-view-multiple {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  padding-top: 0;
+  padding-bottom: 0;
+  line-height: 22px;
+}
+
+.ai-chat .fixed-resource-select .arco-select-view-inner,
+.ai-chat .fixed-resource-select .arco-select-view-value,
+.ai-chat .fixed-resource-select .arco-select-view-input,
+.ai-chat .fixed-resource-select .arco-select-view-input input,
+.ai-chat .fixed-resource-select .arco-select-view-placeholder,
+.ai-chat .fixed-resource-select .arco-select-view-multiple-content {
+  min-width: 0;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding-right: 4px;
 }
-.ai-chat .arco-select-multiple .arco-tag-close-btn {
+
+.ai-chat .fixed-resource-select .arco-select-view-multiple-content {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+
+.ai-chat .fixed-resource-select .arco-select-view-input,
+.ai-chat .fixed-resource-select .arco-select-view-input input {
+  width: 12px !important;
+  flex: 0 0 12px;
+}
+
+.ai-chat .fixed-resource-select .arco-select-view-tag,
+.ai-chat .fixed-resource-select .arco-select-tag {
+  min-width: 0;
+  max-width: calc(100% - 24px);
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-chat .fixed-resource-select .arco-select-view-tag .arco-tag-text,
+.ai-chat .fixed-resource-select .arco-tag-content,
+.ai-chat .fixed-resource-select .arco-select-tag-content {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-chat .fixed-resource-select .arco-select-view-suffix {
+  flex-shrink: 0;
+}
+
+.ai-chat .fixed-resource-select .arco-select-multiple .arco-tag-close-btn,
+.ai-chat .fixed-resource-select .arco-tag-close-btn {
   display: none !important;
 }
 </style>

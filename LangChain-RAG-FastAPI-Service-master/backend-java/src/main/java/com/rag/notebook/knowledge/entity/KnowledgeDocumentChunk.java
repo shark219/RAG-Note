@@ -15,7 +15,8 @@ import java.util.Map;
 @Entity
 @Table(name = "knowledge_document_chunk", indexes = {
         @Index(name = "idx_chunk_document_id", columnList = "document_id"),
-        @Index(name = "idx_chunk_doc_index", columnList = "document_id, chunk_index")
+        @Index(name = "idx_chunk_doc_index", columnList = "document_id, chunk_index"),
+        @Index(name = "idx_chunk_parent", columnList = "document_id, parent_id")
 })
 public class KnowledgeDocumentChunk {
 
@@ -32,6 +33,24 @@ public class KnowledgeDocumentChunk {
 
     @Column(name = "content", columnDefinition = "TEXT", nullable = false)
     private String content;
+
+    @Column(name = "retrieval_text", columnDefinition = "TEXT")
+    private String retrievalText;
+
+    @Column(name = "content_type", length = 50)
+    private String contentType = "text";
+
+    @Column(name = "section_path", length = 700)
+    private String sectionPath;
+
+    @Column(name = "parent_id", length = 80)
+    private String parentId;
+
+    @Column(name = "page_start")
+    private Integer pageStart;
+
+    @Column(name = "page_end")
+    private Integer pageEnd;
 
     @Column(name = "token_count")
     private Integer tokenCount;

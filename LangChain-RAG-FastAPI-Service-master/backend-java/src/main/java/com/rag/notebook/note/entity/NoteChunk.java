@@ -29,6 +29,21 @@ public class NoteChunk {
     @Column(name = "content", columnDefinition = "TEXT", nullable = false)
     private String content;
 
+    @Column(name = "retrieval_text", columnDefinition = "TEXT")
+    private String retrievalText;
+
+    @Column(name = "content_type", length = 50)
+    private String contentType = "text";
+
+    @Column(name = "section_path", length = 700)
+    private String sectionPath;
+
+    @Column(name = "previous_chunk_id", length = 80)
+    private String previousChunkId;
+
+    @Column(name = "next_chunk_id", length = 80)
+    private String nextChunkId;
+
     @CreationTimestamp
     @Column(name = "created_at", updatable = false)
     private LocalDateTime createdAt;

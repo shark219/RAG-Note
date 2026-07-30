@@ -21,6 +21,9 @@ import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.chroma.ChromaEmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.comparison.IsEqualTo;
+import dev.langchain4j.store.embedding.filter.comparison.IsIn;
+import dev.langchain4j.store.embedding.filter.logical.And;
+import dev.langchain4j.store.embedding.filter.logical.Or;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -31,6 +34,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.client.RestTemplate;
 
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
@@ -42,6 +46,10 @@ public class VectorStoreService {
 
     private static final String COLLECTION_ID_CACHE_PREFIX = "chroma:collection:id:";
     private static final long COLLECTION_ID_CACHE_TTL_HOURS = 24;
+    private static final Duration CHROMA_TIMEOUT = Duration.ofMinutes(2);
+    private static final int EMBEDDING_BATCH_SIZE = 3;
+    private static final int EMBEDDING_RETRIES = 5;
+    private static final long EMBEDDING_RETRY_BASE_DELAY_MS = 1000L;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final ApplicationProperties props;
@@ -85,10 +93,12 @@ public class VectorStoreService {
             this.noteStore = ChromaEmbeddingStore.builder()
                     .baseUrl(chromaUrl)
                     .collectionName(props.getChroma().getNotesCollection())
+                    .timeout(CHROMA_TIMEOUT)
                     .build();
             this.knowledgeStore = ChromaEmbeddingStore.builder()
                     .baseUrl(chromaUrl)
                     .collectionName(props.getChroma().getCollection())
+                    .timeout(CHROMA_TIMEOUT)
                     .build();
             this.chromaAvailable = true;
             log.info("ChromaDB 向量存储已连接: {}", chromaUrl);
@@ -110,7 +120,8 @@ public class VectorStoreService {
         String title = note.getTitle() != null ? note.getTitle() : "";
 
         // 1. 文本切片
-        List<String> chunks = splitText(text, props.getChroma().getChunkSize(), props.getChroma().getChunkOverlap());
+        List<RagChunk> chunks = RagChunker.splitNote(note.getId(), title, note.getContent(),
+                props.getChroma().getChunkSize(), props.getChroma().getChunkOverlap());
         log.info("笔记切片完成: noteId={}, chunks={}", note.getId(), chunks.size());
 
         // 2. 写入 MySQL（NoteChunk 表）
@@ -120,7 +131,13 @@ public class VectorStoreService {
             chunk.setId(UUID.randomUUID().toString());
             chunk.setNoteId(note.getId());
             chunk.setChunkIndex(i);
-            chunk.setContent(chunks.get(i));
+            RagChunk ragChunk = chunks.get(i);
+            chunk.setContent(ragChunk.getContent());
+            chunk.setRetrievalText(ragChunk.getRetrievalText());
+            chunk.setContentType(ragChunk.getContentType());
+            chunk.setSectionPath(ragChunk.getSectionPath());
+            chunk.setPreviousChunkId(ragChunk.getPreviousChunkId());
+            chunk.setNextChunkId(ragChunk.getNextChunkId());
             chunkEntities.add(chunk);
         }
         noteChunkRepository.saveAll(chunkEntities);
@@ -128,9 +145,15 @@ public class VectorStoreService {
         // 3. 写入 BM25 索引（不依赖 ChromaDB）
         for (int i = 0; i < chunks.size(); i++) {
             String chunkKey = note.getId() + "_" + i;
-            bm25Service.addDocument(note.getUserId(), chunkKey, chunks.get(i),
-                    Map.of("source", "note", "chunk_id", chunkKey,
-                            "note_id", note.getId(), "title", title, "user_id", note.getUserId()));
+            RagChunk chunk = chunks.get(i);
+            Map<String, Object> bm25Metadata = new HashMap<>();
+            bm25Metadata.put("source", "note");
+            bm25Metadata.put("chunk_id", chunkKey);
+            bm25Metadata.put("note_id", note.getId());
+            bm25Metadata.put("title", title);
+            bm25Metadata.put("user_id", note.getUserId());
+            bm25Metadata.putAll(chunk.toMetadataMap());
+            bm25Service.addDocument(note.getUserId(), chunkKey, chunk.getRetrievalText(), bm25Metadata);
         }
 
         // 4. 异步写入 ChromaDB（可选，失败不影响 BM25）
@@ -147,7 +170,7 @@ public class VectorStoreService {
      * 异步写入笔记向量到 ChromaDB
      */
     @Async
-    public void writeNoteToChromaAsync(String noteId, String userId, String title, List<String> chunks) {
+    public void writeNoteToChromaAsync(String noteId, String userId, String title, List<RagChunk> chunks) {
         try {
             // 1. 清理旧数据
             deleteNoteChunksFromChroma(noteId);
@@ -156,7 +179,9 @@ public class VectorStoreService {
             List<TextSegment> segments = new ArrayList<>();
             for (int i = 0; i < chunks.size(); i++) {
                 String chunkKey = noteId + "_" + i;
-                String content = chunks.get(i);
+                RagChunk chunk = chunks.get(i);
+                String content = chunk.getContent();
+                String retrievalText = chunk.getRetrievalText();
 
                 Map<String, Object> meta = new HashMap<>();
                 meta.put("chunk_id", chunkKey);
@@ -164,18 +189,25 @@ public class VectorStoreService {
                 meta.put("user_id", userId);
                 meta.put("title", title);
                 meta.put("content", content);
+                meta.put("retrieval_text", retrievalText);
                 meta.put("index", i);
                 meta.put("source", "note");
+                meta.put("content_type", chunk.getContentType());
+                meta.put("section_path", chunk.getSectionPath());
+                if (chunk.getPreviousChunkId() != null) meta.put("previous_chunk_id", chunk.getPreviousChunkId());
+                if (chunk.getNextChunkId() != null) meta.put("next_chunk_id", chunk.getNextChunkId());
 
-                segments.add(TextSegment.from(content, dev.langchain4j.data.document.Metadata.from(meta)));
+                segments.add(TextSegment.from(retrievalText, dev.langchain4j.data.document.Metadata.from(meta)));
             }
 
             // 分批写入
-            int batchSize = 10;
+            int batchSize = EMBEDDING_BATCH_SIZE;
             for (int i = 0; i < segments.size(); i += batchSize) {
                 int end = Math.min(i + batchSize, segments.size());
                 List<TextSegment> batch = segments.subList(i, end);
-                List<String> batchContents = chunks.subList(i, end);
+                List<String> batchContents = chunks.subList(i, end).stream()
+                        .map(RagChunk::getRetrievalText)
+                        .collect(Collectors.toList());
                 List<Embedding> embeddings = batchEmbed(batchContents);
                 noteStore.addAll(embeddings, batch);
             }
@@ -323,6 +355,81 @@ public class VectorStoreService {
     }
 
     @Transactional
+    public String addKnowledgeDocumentChunks(String userId, String filename, String md5,
+                                             List<RagChunk> chunks, Map<String, Object> metadata,
+                                             BiConsumer<String, Object> progressCallback) {
+        String originalFilename = (String) metadata.getOrDefault("original_filename", filename);
+        Long fileSize = metadata.containsKey("file_size") ? (Long) metadata.get("file_size") : 0L;
+
+        log.info("开始添加结构化知识文档: userId={}, filename={}, md5={}, chunks={}",
+                userId, filename, md5, chunks.size());
+
+        if (documentRepository.existsByUserIdAndMd5(userId, md5)) {
+            log.info("文档已存在（MD5重复），跳过写入: userId={}, md5={}, filename={}", userId, md5, filename);
+            if (progressCallback != null) {
+                progressCallback.accept("skipping", originalFilename);
+            }
+            return null;
+        }
+
+        KnowledgeDocument document = new KnowledgeDocument();
+        document.setId(UUID.randomUUID().toString());
+        document.setUserId(userId);
+        document.setFilename(filename);
+        document.setOriginalFilename(originalFilename);
+        document.setMd5(md5);
+        document.setFileSize(fileSize);
+        document.setChunkCount(chunks.size());
+        document.setStatus("processing");
+        document.setPreview(chunks.isEmpty() ? "" : chunks.get(0).getContent().substring(0,
+                Math.min(200, chunks.get(0).getContent().length())));
+        document = documentRepository.save(document);
+
+        List<KnowledgeDocumentChunk> chunkEntities = new ArrayList<>();
+        for (int i = 0; i < chunks.size(); i++) {
+            RagChunk ragChunk = chunks.get(i);
+            String parentId = document.getId() + "_p_" + (ragChunk.getParentIndex() != null ? ragChunk.getParentIndex() : i);
+            ragChunk.setParentId(parentId);
+
+            KnowledgeDocumentChunk chunk = new KnowledgeDocumentChunk();
+            chunk.setId(UUID.randomUUID().toString());
+            chunk.setDocument(document);
+            chunk.setChunkIndex(i);
+            chunk.setContent(ragChunk.getContent());
+            chunk.setRetrievalText(ragChunk.getRetrievalText());
+            chunk.setContentType(ragChunk.getContentType());
+            chunk.setSectionPath(ragChunk.getSectionPath());
+            chunk.setParentId(parentId);
+            chunk.setPageStart(ragChunk.getPageStart());
+            chunk.setPageEnd(ragChunk.getPageEnd());
+            chunk.setMetadataJson(ragChunk.toMetadataMap());
+            chunkEntities.add(chunk);
+        }
+        chunkRepository.saveAll(chunkEntities);
+        log.info("MySQL结构化文档+切片保存成功: docId={}, chunks={}", document.getId(), chunks.size());
+
+        for (int i = 0; i < chunks.size(); i++) {
+            RagChunk chunk = chunks.get(i);
+            String key = md5 + "_" + i;
+            Map<String, Object> bm25Metadata = new HashMap<>();
+            bm25Metadata.put("source", "knowledge_base");
+            bm25Metadata.put("chunk_id", key);
+            bm25Metadata.put("filename", filename);
+            bm25Metadata.put("original_filename", originalFilename);
+            bm25Metadata.put("md5", md5);
+            bm25Metadata.put("user_id", userId);
+            bm25Metadata.put("doc_id", document.getId());
+            bm25Metadata.put("index", i);
+            bm25Metadata.putAll(chunk.toMetadataMap());
+            bm25Service.addDocument(userId, key, chunk.getRetrievalText(), bm25Metadata);
+        }
+
+        log.info("结构化知识文档添加完成（MySQL+BM25）: docId={}, filename={}, chunks={}",
+                document.getId(), filename, chunks.size());
+        return document.getId();
+    }
+
+    @Transactional
     public String addKnowledgeDocument(String userId, String filename, String originalFilename,
                                         String md5, Long fileSize, List<String> chunks) {
         return addKnowledgeDocument(userId, filename, originalFilename, md5, fileSize, chunks, null);
@@ -373,7 +480,8 @@ public class VectorStoreService {
             String key = md5 + "_" + i;
             bm25Service.addDocument(userId, key, chunks.get(i),
                     Map.of("source", "knowledge_base", "chunk_id", key,
-                            "filename", filename, "md5", md5, "user_id", userId,
+                            "filename", filename, "original_filename", originalFilename,
+                            "md5", md5, "user_id", userId,
                             "doc_id", document.getId()));
         }
 
@@ -388,7 +496,7 @@ public class VectorStoreService {
     @Transactional
     public void deleteKnowledgeByFilename(String userId, String filename) {
         // 1. 先查找文档
-        Optional<KnowledgeDocument> docOpt = documentRepository.findByUserIdAndFilename(userId, filename);
+        Optional<KnowledgeDocument> docOpt = documentRepository.findByUserIdAndFilenameForUpdate(userId, filename);
         if (docOpt.isEmpty()) {
             log.warn("MySQL文档不存在，尝试清理MD5记录: userId={}, filename={}", userId, filename);
             // 即使MySQL记录不存在，也要清理MD5记录（防止残留）
@@ -409,13 +517,13 @@ public class VectorStoreService {
 
         // 3. 删除当前文档的BM25索引
         List<KnowledgeDocumentChunk> chunks = chunkRepository.findByDocumentIdOrderByChunkIndexAsc(docId);
+        List<String> chunkKeys = new ArrayList<>();
         for (KnowledgeDocumentChunk chunk : chunks) {
-            String chunkKey = md5 + "_" + chunk.getChunkIndex();
-            bm25Service.deleteDocument(userId, chunkKey);
+            chunkKeys.add(md5 + "_" + chunk.getChunkIndex());
         }
+        bm25Service.deleteDocuments(userId, chunkKeys);
 
         // 4. 删除MySQL（无论ChromaDB是否成功）
-        chunkRepository.deleteByDocumentId(docId);
         documentRepository.delete(doc);
 
         // 5. 删除MD5记录
@@ -455,9 +563,6 @@ public class VectorStoreService {
         }
 
         // 3. 删除MySQL（无论ChromaDB是否成功）
-        for (KnowledgeDocument doc : documents) {
-            chunkRepository.deleteByDocumentId(doc.getId());
-        }
         documentRepository.deleteAll(documents);
 
         // 4. 清除BM25索引
@@ -640,9 +745,9 @@ public class VectorStoreService {
 
         // 获取文档的 chunks
         List<KnowledgeDocumentChunk> chunks = chunkRepository.findByDocumentIdOrderByChunkIndexAsc(docId);
-        List<String> contentList = chunks.stream()
+        List<RagChunk> contentList = chunks.stream()
                 .sorted(Comparator.comparingInt(KnowledgeDocumentChunk::getChunkIndex))
-                .map(KnowledgeDocumentChunk::getContent)
+                .map(this::toRagChunk)
                 .collect(Collectors.toList());
 
         // 更新状态为 processing
@@ -661,24 +766,50 @@ public class VectorStoreService {
     }
 
     public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK) {
+        return searchKnowledge(userId, query, topK, Set.of());
+    }
+
+    public List<Map<String, Object>> searchKnowledge(String userId, String query, int topK,
+                                                     Set<String> docIdentifiers) {
         Embedding queryEmbedding = embed(query);
+        Set<String> selectedIdentifiers = normalizeIdentifiers(docIdentifiers);
 
         if (chromaAvailable) {
-            return searchChroma(knowledgeStore, queryEmbedding, userId, topK, "knowledge_base");
+            try {
+                return searchChroma(knowledgeStore, queryEmbedding, userId, topK,
+                        "knowledge_base", buildKnowledgeFilter(selectedIdentifiers));
+            } catch (Exception e) {
+                if (!selectedIdentifiers.isEmpty()) {
+                    log.warn("Selected knowledge Chroma search failed, fallback to MySQL: selected={}, error={}",
+                            selectedIdentifiers, e.getMessage());
+                    return searchKnowledgeFromMySQL(userId, queryEmbedding.vector(), topK, selectedIdentifiers);
+                }
+                throw e;
+            }
         } else {
             // 降级：从MySQL读取内容，使用内存计算相似度
-            return searchKnowledgeFromMySQL(userId, queryEmbedding.vector(), topK);
+            return searchKnowledgeFromMySQL(userId, queryEmbedding.vector(), topK, selectedIdentifiers);
         }
     }
 
     private List<Map<String, Object>> searchKnowledgeFromMySQL(String userId, float[] queryVector, int topK) {
+        return searchKnowledgeFromMySQL(userId, queryVector, topK, Set.of());
+    }
+
+    private List<Map<String, Object>> searchKnowledgeFromMySQL(String userId, float[] queryVector, int topK,
+                                                               Set<String> docIdentifiers) {
         List<KnowledgeDocument> documents = documentRepository.findByUserIdOrderByCreatedAtDesc(userId);
         List<Map<String, Object>> results = new ArrayList<>();
+        Set<String> selectedIdentifiers = normalizeIdentifiers(docIdentifiers);
 
         for (KnowledgeDocument doc : documents) {
+            if (!selectedIdentifiers.isEmpty() && !matchesDocumentIdentifiers(doc, selectedIdentifiers)) {
+                continue;
+            }
             List<KnowledgeDocumentChunk> chunks = chunkRepository.findByDocumentIdOrderByChunkIndexAsc(doc.getId());
             for (KnowledgeDocumentChunk chunk : chunks) {
-                Embedding embedding = embed(chunk.getContent());
+                String retrievalText = chunk.getRetrievalText() != null ? chunk.getRetrievalText() : chunk.getContent();
+                Embedding embedding = embed(retrievalText);
                 float similarity = cosineSimilarity(queryVector, embedding.vector());
 
                 Map<String, Object> result = new HashMap<>();
@@ -689,6 +820,12 @@ public class VectorStoreService {
                 result.put("doc_id", doc.getId());
                 result.put("index", chunk.getChunkIndex());
                 result.put("content", chunk.getContent());
+                result.put("retrieval_text", retrievalText);
+                result.put("content_type", chunk.getContentType());
+                result.put("section_path", chunk.getSectionPath());
+                result.put("parent_id", chunk.getParentId());
+                result.put("page_start", chunk.getPageStart());
+                result.put("page_end", chunk.getPageEnd());
                 result.put("distance", 1.0f - similarity);
                 result.put("similarity", similarity);
                 result.put("source_type", "knowledge_base");
@@ -767,6 +904,11 @@ public class VectorStoreService {
             chunkDetail.put("chunk_id", doc.getMd5() + "_" + chunk.getChunkIndex());
             chunkDetail.put("index", chunk.getChunkIndex());
             chunkDetail.put("content", chunk.getContent());
+            chunkDetail.put("content_type", chunk.getContentType());
+            chunkDetail.put("section_path", chunk.getSectionPath());
+            chunkDetail.put("parent_id", chunk.getParentId());
+            chunkDetail.put("page_start", chunk.getPageStart());
+            chunkDetail.put("page_end", chunk.getPageEnd());
             chunkDetails.add(chunkDetail);
         }
 
@@ -800,7 +942,13 @@ public class VectorStoreService {
             chunkMap.put("chunk_id", doc.getMd5() + "_" + chunk.getChunkIndex());
             chunkMap.put("index", chunk.getChunkIndex());
             chunkMap.put("content", chunk.getContent());
-            chunkMap.put("metadata", Map.of());
+            Map<String, Object> metadata = new HashMap<>();
+            metadata.put("content_type", chunk.getContentType());
+            metadata.put("section_path", chunk.getSectionPath());
+            metadata.put("parent_id", chunk.getParentId());
+            metadata.put("page_start", chunk.getPageStart());
+            metadata.put("page_end", chunk.getPageEnd());
+            chunkMap.put("metadata", metadata);
             chunkMap.put("images", List.of());
             return chunkMap;
         }).toList();
@@ -808,13 +956,236 @@ public class VectorStoreService {
         return Map.of("filename", filename, "total_chunks", chunks.size(), "chunks", chunkList);
     }
 
+    public List<Map<String, Object>> expandRetrievedContexts(List<Map<String, Object>> results) {
+        if (results == null || results.isEmpty()) {
+            return List.of();
+        }
+
+        Map<String, Long> sectionHitCounts = results.stream()
+                .collect(Collectors.groupingBy(this::sectionGroupKey, Collectors.counting()));
+
+        List<Map<String, Object>> expanded = new ArrayList<>();
+        Set<String> seenContexts = new HashSet<>();
+        for (Map<String, Object> result : results) {
+            String sourceType = String.valueOf(result.getOrDefault("source_type", result.get("source")));
+            Map<String, Object> context = "note".equals(sourceType)
+                    ? expandNoteContext(result, sectionHitCounts)
+                    : expandKnowledgeContext(result, sectionHitCounts);
+            String key = String.valueOf(context.getOrDefault("context_key",
+                    context.getOrDefault("chunk_id", UUID.randomUUID().toString())));
+            if (seenContexts.add(key)) {
+                expanded.add(context);
+            }
+        }
+        return expanded;
+    }
+
+    private Map<String, Object> expandKnowledgeContext(Map<String, Object> result,
+                                                       Map<String, Long> sectionHitCounts) {
+        Map<String, Object> expanded = new HashMap<>(result);
+        String docId = stringValue(result.get("doc_id"));
+        String parentId = stringValue(result.get("parent_id"));
+        String sectionPath = stringValue(result.get("section_path"));
+        int hitIndex = intValue(result.get("index"), -1);
+
+        List<KnowledgeDocumentChunk> contextChunks = List.of();
+        String contextLevel = "child";
+        if (docId != null && sectionPath != null
+                && sectionHitCounts.getOrDefault(sectionGroupKey(result), 0L) > 1) {
+            contextChunks = chunkRepository.findByDocumentIdAndSectionPath(docId, sectionPath);
+            contextLevel = "section";
+        }
+        if (contextChunks.isEmpty() && docId != null && parentId != null) {
+            contextChunks = chunkRepository.findByDocumentIdAndParentId(docId, parentId);
+            contextLevel = "parent";
+        }
+        if (contextChunks.isEmpty() && docId != null && hitIndex >= 0) {
+            List<KnowledgeDocumentChunk> all = chunkRepository.findByDocumentIdOrderByChunkIndexAsc(docId);
+            contextChunks = all.stream()
+                    .filter(c -> Math.abs(c.getChunkIndex() - hitIndex) <= 1)
+                    .toList();
+            contextLevel = "neighbor";
+        }
+
+        if (!contextChunks.isEmpty()) {
+            expanded.put("original_content", result.get("content"));
+            expanded.put("content", joinKnowledgeChunks(contextChunks, 6000));
+            expanded.put("context_level", contextLevel);
+            expanded.put("expanded_chunk_count", contextChunks.size());
+            expanded.put("context_key", "knowledge:" + docId + ":" + contextLevel + ":"
+                    + ("section".equals(contextLevel) ? sectionPath : parentId));
+        }
+        return expanded;
+    }
+
+    private Map<String, Object> expandNoteContext(Map<String, Object> result,
+                                                  Map<String, Long> sectionHitCounts) {
+        Map<String, Object> expanded = new HashMap<>(result);
+        String noteId = stringValue(result.get("note_id"));
+        String sectionPath = stringValue(result.get("section_path"));
+        int hitIndex = intValue(result.get("index"), -1);
+
+        List<NoteChunk> contextChunks = List.of();
+        String contextLevel = "neighbor";
+        if (noteId != null && sectionPath != null
+                && sectionHitCounts.getOrDefault(sectionGroupKey(result), 0L) > 1) {
+            contextChunks = noteChunkRepository.findByNoteIdAndSectionPath(noteId, sectionPath);
+            contextLevel = "section";
+        }
+        if (contextChunks.isEmpty() && noteId != null && hitIndex >= 0) {
+            contextChunks = noteChunkRepository.findNeighborhood(noteId,
+                    Math.max(0, hitIndex - 1), hitIndex + 1);
+        }
+
+        if (!contextChunks.isEmpty()) {
+            expanded.put("original_content", result.get("content"));
+            expanded.put("content", joinNoteChunks(contextChunks, 5000));
+            expanded.put("context_level", contextLevel);
+            expanded.put("expanded_chunk_count", contextChunks.size());
+            expanded.put("context_key", "note:" + noteId + ":" + contextLevel + ":"
+                    + ("section".equals(contextLevel) ? sectionPath : hitIndex));
+        }
+        return expanded;
+    }
+
+    private RagChunk toRagChunk(KnowledgeDocumentChunk chunk) {
+        RagChunk ragChunk = new RagChunk();
+        ragChunk.setChunkIndex(chunk.getChunkIndex());
+        ragChunk.setContent(chunk.getContent());
+        ragChunk.setRetrievalText(chunk.getRetrievalText() != null ? chunk.getRetrievalText() : chunk.getContent());
+        ragChunk.setContentType(chunk.getContentType());
+        ragChunk.setSectionPath(chunk.getSectionPath());
+        ragChunk.setParentId(chunk.getParentId());
+        ragChunk.setPageStart(chunk.getPageStart());
+        ragChunk.setPageEnd(chunk.getPageEnd());
+        return ragChunk;
+    }
+
+    private String joinKnowledgeChunks(List<KnowledgeDocumentChunk> chunks, int maxChars) {
+        StringBuilder sb = new StringBuilder();
+        for (KnowledgeDocumentChunk chunk : chunks) {
+            appendWithLimit(sb, chunk.getContent(), maxChars);
+            if (sb.length() >= maxChars) break;
+        }
+        return sb.toString();
+    }
+
+    private String joinNoteChunks(List<NoteChunk> chunks, int maxChars) {
+        StringBuilder sb = new StringBuilder();
+        for (NoteChunk chunk : chunks) {
+            appendWithLimit(sb, chunk.getContent(), maxChars);
+            if (sb.length() >= maxChars) break;
+        }
+        return sb.toString();
+    }
+
+    private void appendWithLimit(StringBuilder sb, String content, int maxChars) {
+        if (content == null || content.isBlank() || sb.length() >= maxChars) {
+            return;
+        }
+        if (sb.length() > 0) {
+            sb.append("\n\n");
+        }
+        int remaining = maxChars - sb.length();
+        sb.append(content, 0, Math.min(content.length(), remaining));
+    }
+
+    private String sectionGroupKey(Map<String, Object> result) {
+        String sourceType = String.valueOf(result.getOrDefault("source_type", result.get("source")));
+        String owner = "note".equals(sourceType) ? stringValue(result.get("note_id")) : stringValue(result.get("doc_id"));
+        String section = stringValue(result.get("section_path"));
+        return sourceType + ":" + owner + ":" + section;
+    }
+
+    private String stringValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        String str = String.valueOf(value);
+        return str.isBlank() || "null".equalsIgnoreCase(str) ? null : str;
+    }
+
+    private int intValue(Object value, int defaultValue) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value != null) {
+            try {
+                return Integer.parseInt(String.valueOf(value));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return defaultValue;
+    }
+
     // ========== 检索工具方法 ==========
 
     /** ChromaDB 向量检索 */
+    private Set<String> normalizeIdentifiers(Set<String> identifiers) {
+        if (identifiers == null || identifiers.isEmpty()) {
+            return Set.of();
+        }
+        return identifiers.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .filter(s -> !s.isBlank())
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private boolean matchesDocumentIdentifiers(KnowledgeDocument doc, Set<String> identifiers) {
+        if (doc == null || identifiers == null || identifiers.isEmpty()) {
+            return true;
+        }
+        return matchesAnyIdentifier(identifiers,
+                doc.getId(), doc.getMd5(), doc.getFilename(), doc.getOriginalFilename());
+    }
+
+    private boolean matchesAnyIdentifier(Set<String> identifiers, Object... values) {
+        for (Object value : values) {
+            String str = stringValue(value);
+            if (str != null && identifiers.contains(str)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Filter buildKnowledgeFilter(Set<String> identifiers) {
+        Set<String> selected = normalizeIdentifiers(identifiers);
+        if (selected.isEmpty()) {
+            return null;
+        }
+        return combineOr(
+                new IsIn("doc_id", selected),
+                new IsIn("md5", selected),
+                new IsIn("filename", selected),
+                new IsIn("original_filename", selected));
+    }
+
+    private Filter combineUserFilter(String userId, Filter extraFilter) {
+        Filter userFilter = new IsEqualTo("user_id", userId);
+        return extraFilter == null ? userFilter : new And(userFilter, extraFilter);
+    }
+
+    private Filter combineOr(Filter first, Filter... rest) {
+        Filter result = first;
+        for (Filter filter : rest) {
+            result = new Or(result, filter);
+        }
+        return result;
+    }
+
     private List<Map<String, Object>> searchChroma(EmbeddingStore<TextSegment> store,
                                                     Embedding queryEmbedding, String userId,
                                                     int topK, String sourceType) {
-        Filter filter = new IsEqualTo("user_id", userId);
+        return searchChroma(store, queryEmbedding, userId, topK, sourceType, null);
+    }
+
+    private List<Map<String, Object>> searchChroma(EmbeddingStore<TextSegment> store,
+                                                    Embedding queryEmbedding, String userId,
+                                                    int topK, String sourceType,
+                                                    Filter extraFilter) {
+        Filter filter = combineUserFilter(userId, extraFilter);
         EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
                 .queryEmbedding(queryEmbedding)
                 .maxResults(topK)
@@ -841,27 +1212,70 @@ public class VectorStoreService {
      * 批量 Embedding（减少 API 调用次数，供笔记向量化使用）
      */
     private List<Embedding> batchEmbed(List<String> texts) {
-        try {
-            List<TextSegment> segments = texts.stream()
-                    .map(TextSegment::from)
-                    .collect(Collectors.toList());
-            Response<List<Embedding>> response = embeddingModel.embedAll(segments);
-            return response.content();
-        } catch (Exception e) {
-            log.warn("批量向量化失败，降级为逐个处理: {}", e.getMessage());
-            return texts.stream()
-                    .map(this::embed)
-                    .collect(Collectors.toList());
+        RuntimeException lastException = null;
+        for (int attempt = 1; attempt <= EMBEDDING_RETRIES; attempt++) {
+            try {
+                List<TextSegment> segments = texts.stream()
+                        .map(TextSegment::from)
+                        .collect(Collectors.toList());
+                Response<List<Embedding>> response = embeddingModel.embedAll(segments);
+                List<Embedding> embeddings = response.content();
+                if (embeddings == null || embeddings.size() != texts.size()) {
+                    throw new IllegalStateException("Embedding response size mismatch: expected "
+                            + texts.size() + ", actual " + (embeddings == null ? 0 : embeddings.size()));
+                }
+                return embeddings;
+            } catch (Exception e) {
+                lastException = asRuntimeException(e);
+                log.warn("Embedding batch failed, retrying: batchSize={}, attempt={}/{}, error={}",
+                        texts.size(), attempt, EMBEDDING_RETRIES, e.getMessage());
+                sleepBeforeEmbeddingRetry(attempt);
+            }
         }
+
+        log.warn("Embedding batch failed after {} attempts, falling back to single requests: batchSize={}, error={}",
+                EMBEDDING_RETRIES, texts.size(), lastException == null ? "" : lastException.getMessage());
+        return texts.stream()
+                .map(this::embedWithRetry)
+                .collect(Collectors.toList());
     }
 
     private Embedding embed(String text) {
+        return embedWithRetry(text);
+    }
+
+    private Embedding embedWithRetry(String text) {
+        RuntimeException lastException = null;
+        for (int attempt = 1; attempt <= EMBEDDING_RETRIES; attempt++) {
+            try {
+                Response<Embedding> response = embeddingModel.embed(TextSegment.from(text));
+                Embedding embedding = response.content();
+                if (embedding == null) {
+                    throw new IllegalStateException("Embedding response is empty");
+                }
+                return embedding;
+            } catch (Exception e) {
+                lastException = asRuntimeException(e);
+                log.warn("Embedding text failed, retrying: chars={}, attempt={}/{}, error={}",
+                        text == null ? 0 : text.length(), attempt, EMBEDDING_RETRIES, e.getMessage());
+                sleepBeforeEmbeddingRetry(attempt);
+            }
+        }
+        throw lastException != null
+                ? lastException
+                : new IllegalStateException("Embedding failed without exception");
+    }
+
+    private RuntimeException asRuntimeException(Exception e) {
+        return e instanceof RuntimeException runtimeException ? runtimeException : new RuntimeException(e);
+    }
+
+    private void sleepBeforeEmbeddingRetry(int attempt) {
         try {
-            Response<Embedding> response = embeddingModel.embed(TextSegment.from(text));
-            return response.content();
-        } catch (Exception e) {
-            log.warn("文本向量化失败，使用零向量兜底: {}", e.getMessage());
-            return Embedding.from(new float[1024]);
+            Thread.sleep(EMBEDDING_RETRY_BASE_DELAY_MS * attempt);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting to retry embedding", e);
         }
     }
 
@@ -880,6 +1294,10 @@ public class VectorStoreService {
     private List<String> splitText(String text, int chunkSize, int chunkOverlap) {
         List<String> chunks = new ArrayList<>();
         if (text == null || text.isEmpty()) return chunks;
+        chunks = TextChunker.split(text, chunkSize, chunkOverlap);
+        if (!chunks.isEmpty()) {
+            return chunks;
+        }
 
         String[] separators = {"\n\n", "\n", "。", "！", "？", ".", "!", "?", "；", ";", "，", ","};
         List<String> sentences = splitBySeparators(text, separators);

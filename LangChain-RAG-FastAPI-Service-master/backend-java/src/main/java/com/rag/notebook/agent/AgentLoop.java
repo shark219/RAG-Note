@@ -17,6 +17,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -145,7 +146,7 @@ public class AgentLoop {
                     }
 
                     // 执行工具
-                    String rawResult = executeTool(toolName, toolArgs, userId);
+                    String rawResult = executeTool(toolName, toolArgs, userId, activeTools);
                     ToolResult toolResult = getLastToolResult();
 
                     // 评估并记录
@@ -215,6 +216,18 @@ public class AgentLoop {
                 if (i == 0 && !state.hasSuccessfulToolCall() && isClarificationQuestion(answer)) {
                     log.info("Agent 识别为反问澄清: {}", answer.length() > 80 ? answer.substring(0, 80) + "..." : answer);
                     return AgentLoopResult.needClarification(state, answer);
+                }
+
+                if (!state.hasSuccessfulToolCall() && shouldForceRagBeforeDirectAnswer(activeTools, state.getOriginalQuery())) {
+                    log.info("Agent Loop 强制先检索知识库/笔记: query={}", state.getOriginalQuery());
+                    state.markNoProgress();
+                    messages.add(UserMessage.from("""
+                            [检索策略]
+                            当前知识库或笔记检索工具已开启。这个问题属于知识讲解/技术问答类问题，请先调用 ragSummary 获取用户资料中的相关内容。
+                            不要直接用通用知识回答；如果 ragSummary 没有结果，再说明资料中未找到，并补充必要的通用解释。
+                            检索 query：%s
+                            """.formatted(state.getOriginalQuery())));
+                    continue;
                 }
 
                 // GoalEvaluator 判断是否放行
@@ -397,6 +410,7 @@ public class AgentLoop {
             case "generateMindMap", "generateDiagram" -> state.upgradeEvidence(AgentState.EvidenceLevel.ARTIFACT_EVIDENCE);
             case "getNote" -> state.upgradeEvidence(AgentState.EvidenceLevel.CONTENT_EVIDENCE);
             case "searchNotes" -> state.upgradeEvidence(AgentState.EvidenceLevel.SEARCH_EVIDENCE);
+            case "ragSummary" -> state.upgradeEvidence(AgentState.EvidenceLevel.SEARCH_EVIDENCE);
             case "listNotes" -> state.upgradeEvidence(AgentState.EvidenceLevel.LIST_EVIDENCE);
         }
     }
@@ -449,8 +463,17 @@ public class AgentLoop {
     // 工具执行
     // ============================================================
 
-    private String executeTool(String toolName, String arguments, String userId) {
+    private String executeTool(String toolName, String arguments, String userId,
+                               List<ToolSpecification> activeTools) {
         try {
+            if (!hasActiveTool(activeTools, toolName)) {
+                String message = "工具已被当前开关禁用: " + toolName;
+                log.warn("Blocked disabled tool execution: tool={}, activeTools={}",
+                        toolName, activeTools == null ? List.of() : activeTools.stream().map(ToolSpecification::name).toList());
+                agentTools.setResult(ToolResult.error(message, "TOOL_DISABLED", false));
+                return message;
+            }
+
             Map<String, String> args = AgentService.parseToolArguments(arguments);
             return switch (toolName) {
                 case "listNotes" -> agentTools.listNotes(args.getOrDefault("count", "20"), args.getOrDefault("category", ""), userId);
@@ -559,6 +582,42 @@ public class AgentLoop {
             if (lower.contains(pattern.toLowerCase())) return true;
         }
 
+        return false;
+    }
+
+    private boolean shouldForceRagBeforeDirectAnswer(List<ToolSpecification> activeTools, String query) {
+        return hasActiveTool(activeTools, "ragSummary") && isKnowledgeSeekingQuery(query);
+    }
+
+    private boolean hasActiveTool(List<ToolSpecification> activeTools, String toolName) {
+        if (activeTools == null) return false;
+        return activeTools.stream().anyMatch(tool -> toolName.equals(tool.name()));
+    }
+
+    private boolean isKnowledgeSeekingQuery(String query) {
+        if (query == null || query.isBlank()) return false;
+        String q = query.toLowerCase(Locale.ROOT);
+
+        boolean operational = containsAny(q,
+                "创建", "新建", "编辑", "修改", "删除", "追加", "写入", "写回", "保存", "生成导图",
+                "安排", "标记", "合并", "create", "edit", "delete", "append", "save");
+        if (operational) return false;
+
+        boolean explicitKnowledge = containsAny(q,
+                "讲解", "解释", "介绍", "说明", "总结", "概述", "是什么", "有哪些", "区别",
+                "原理", "机制", "流程", "模型", "结构", "分区", "分类", "面试", "八股",
+                "explain", "summary", "overview", "what is", "how does");
+        boolean technicalTopic = containsAny(q,
+                "jvm", "java", "spring", "redis", "mysql", "gc", "线程", "并发", "集合",
+                "虚拟机", "内存", "堆", "栈", "方法区", "类加载", "垃圾回收", "算法",
+                "rag", "bm25", "向量", "embedding", "chroma");
+        return explicitKnowledge || technicalTopic;
+    }
+
+    private boolean containsAny(String text, String... keywords) {
+        for (String keyword : keywords) {
+            if (text.contains(keyword)) return true;
+        }
         return false;
     }
 }

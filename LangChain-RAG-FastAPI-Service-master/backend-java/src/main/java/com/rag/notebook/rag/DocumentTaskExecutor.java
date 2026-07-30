@@ -13,6 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -24,6 +25,12 @@ import java.util.function.BiConsumer;
 @Slf4j
 @Service
 public class DocumentTaskExecutor {
+
+    private static final Duration CHROMA_TIMEOUT = Duration.ofMinutes(2);
+    private static final int CHROMA_WRITE_RETRIES = 3;
+    private static final int EMBEDDING_BATCH_SIZE = 3;
+    private static final int EMBEDDING_RETRIES = 5;
+    private static final long EMBEDDING_RETRY_BASE_DELAY_MS = 1000L;
 
     private final ApplicationProperties props;
     private final EmbeddingModel embeddingModel;
@@ -46,6 +53,7 @@ public class DocumentTaskExecutor {
             this.knowledgeStore = ChromaEmbeddingStore.builder()
                     .baseUrl(chromaUrl)
                     .collectionName(props.getChroma().getCollection())
+                    .timeout(CHROMA_TIMEOUT)
                     .build();
             this.chromaAvailable = true;
             log.info("DocumentTaskExecutor ChromaDB已连接: {}", chromaUrl);
@@ -59,7 +67,7 @@ public class DocumentTaskExecutor {
      * 异步写入 ChromaDB，返回的 CompletableFuture 会正确反映执行结果
      */
     public CompletableFuture<Void> writeToChromaAsync(String userId, String filename, String md5,
-                                                       String docId, List<String> chunks,
+                                                       String docId, List<RagChunk> chunks,
                                                        BiConsumer<String, Object> progressCallback) {
         return CompletableFuture.supplyAsync(() -> {
             writeToChromaSync(userId, filename, md5, docId, chunks, progressCallback);
@@ -71,7 +79,7 @@ public class DocumentTaskExecutor {
      * 同步写入 ChromaDB，异常时直接抛出
      */
     private void writeToChromaSync(String userId, String filename, String md5,
-                                    String docId, List<String> chunks,
+                                    String docId, List<RagChunk> chunks,
                                     BiConsumer<String, Object> progressCallback) {
         if (!chromaAvailable) {
             log.warn("ChromaDB不可用，标记为vector_failed: docId={}", docId);
@@ -87,7 +95,9 @@ public class DocumentTaskExecutor {
             List<String> validContents = new ArrayList<>();
             for (int i = 0; i < chunks.size(); i++) {
                 String key = md5 + "_" + i;
-                String content = chunks.get(i);
+                RagChunk chunk = chunks.get(i);
+                String content = chunk.getContent();
+                String retrievalText = chunk.getRetrievalText();
 
                 if (content == null || content.isBlank()) {
                     log.warn("跳过空切片: key={}", key);
@@ -102,12 +112,18 @@ public class DocumentTaskExecutor {
                 meta.put("doc_id", docId);
                 meta.put("index", i);
                 meta.put("content", content);
+                meta.put("retrieval_text", retrievalText);
+                meta.put("content_type", chunk.getContentType());
+                meta.put("section_path", chunk.getSectionPath());
+                if (chunk.getParentId() != null) meta.put("parent_id", chunk.getParentId());
+                if (chunk.getPageStart() != null) meta.put("page_start", chunk.getPageStart());
+                if (chunk.getPageEnd() != null) meta.put("page_end", chunk.getPageEnd());
 
-                segments.add(TextSegment.from(content, dev.langchain4j.data.document.Metadata.from(meta)));
-                validContents.add(content);
+                segments.add(TextSegment.from(retrievalText, dev.langchain4j.data.document.Metadata.from(meta)));
+                validContents.add(retrievalText);
             }
 
-            int batchSize = 10;
+            int batchSize = EMBEDDING_BATCH_SIZE;
             int totalSegments = segments.size();
             int totalBatches = (int) Math.ceil((double) totalSegments / batchSize);
             int processedCount = 0;
@@ -120,7 +136,7 @@ public class DocumentTaskExecutor {
                 List<String> batchContents = validContents.subList(start, end);
 
                 List<Embedding> batchEmbeddings = batchEmbed(batchContents);
-                knowledgeStore.addAll(batchEmbeddings, batchSegments);
+                addBatchToChromaWithRetry(batchEmbeddings, batchSegments, docId, batchIndex + 1);
 
                 processedCount += batchSegments.size();
 
@@ -133,7 +149,7 @@ public class DocumentTaskExecutor {
                 log.info("ChromaDB批量写入进度: docId={}, {}/{} chunks", docId, processedCount, totalSegments);
 
                 if (batchIndex < totalBatches - 1) {
-                    Thread.sleep(100);
+                    Thread.sleep(300);
                 }
             }
 
@@ -145,12 +161,12 @@ public class DocumentTaskExecutor {
             }
 
         } catch (Exception e) {
-            log.error("ChromaDB写入失败，标记为vector_failed: docId={}, error={}", docId, e.getMessage(), e);
+            log.error("向量化或ChromaDB写入失败，标记为vector_failed: docId={}, error={}", docId, e.getMessage(), e);
             markVectorFailed(docId);
             if (progressCallback != null) {
-                progressCallback.accept("error", filename + ": " + e.getMessage());
+                progressCallback.accept("error", filename + ": 向量化或ChromaDB写入失败: " + e.getMessage());
             }
-            throw new RuntimeException("ChromaDB写入失败: " + e.getMessage(), e);
+            throw new RuntimeException("向量化或ChromaDB写入失败: " + e.getMessage(), e);
         }
     }
 
@@ -160,6 +176,25 @@ public class DocumentTaskExecutor {
             documentRepository.save(doc);
             log.info("文档状态已更新为vector_failed: docId={}", docId);
         });
+    }
+
+    private void addBatchToChromaWithRetry(List<Embedding> batchEmbeddings,
+                                           List<TextSegment> batchSegments,
+                                           String docId,
+                                           int batchNumber) throws InterruptedException {
+        for (int attempt = 1; attempt <= CHROMA_WRITE_RETRIES; attempt++) {
+            try {
+                knowledgeStore.addAll(batchEmbeddings, batchSegments);
+                return;
+            } catch (RuntimeException e) {
+                if (attempt == CHROMA_WRITE_RETRIES) {
+                    throw e;
+                }
+                log.warn("ChromaDB batch write failed, retrying: docId={}, batch={}, attempt={}, error={}",
+                        docId, batchNumber, attempt, e.getMessage());
+                Thread.sleep(1000L * attempt);
+            }
+        }
     }
 
     private void markVectorCompleted(String docId) {
@@ -173,27 +208,66 @@ public class DocumentTaskExecutor {
     }
 
     private List<Embedding> batchEmbed(List<String> texts) {
-        try {
-            List<TextSegment> segments = texts.stream()
-                    .map(TextSegment::from)
-                    .toList();
-            Response<List<Embedding>> response = embeddingModel.embedAll(segments);
-            return response.content();
-        } catch (Exception e) {
-            log.warn("批量向量化失败，降级为逐个处理: {}", e.getMessage());
-            return texts.stream()
-                    .map(this::embed)
-                    .toList();
+        RuntimeException lastException = null;
+        for (int attempt = 1; attempt <= EMBEDDING_RETRIES; attempt++) {
+            try {
+                List<TextSegment> segments = texts.stream()
+                        .map(TextSegment::from)
+                        .toList();
+                Response<List<Embedding>> response = embeddingModel.embedAll(segments);
+                List<Embedding> embeddings = response.content();
+                if (embeddings == null || embeddings.size() != texts.size()) {
+                    throw new IllegalStateException("Embedding response size mismatch: expected "
+                            + texts.size() + ", actual " + (embeddings == null ? 0 : embeddings.size()));
+                }
+                return embeddings;
+            } catch (Exception e) {
+                lastException = asRuntimeException(e);
+                log.warn("Embedding batch failed, retrying: batchSize={}, attempt={}/{}, error={}",
+                        texts.size(), attempt, EMBEDDING_RETRIES, e.getMessage());
+                sleepBeforeEmbeddingRetry(attempt);
+            }
         }
+
+        log.warn("Embedding batch failed after {} attempts, falling back to single requests: batchSize={}, error={}",
+                EMBEDDING_RETRIES, texts.size(), lastException == null ? "" : lastException.getMessage());
+        return texts.stream()
+                .map(this::embedWithRetry)
+                .toList();
     }
 
-    private Embedding embed(String text) {
+    private Embedding embedWithRetry(String text) {
+        RuntimeException lastException = null;
+        for (int attempt = 1; attempt <= EMBEDDING_RETRIES; attempt++) {
+            try {
+                Response<Embedding> response = embeddingModel.embed(TextSegment.from(text));
+                Embedding embedding = response.content();
+                if (embedding == null) {
+                    throw new IllegalStateException("Embedding response is empty");
+                }
+                return embedding;
+            } catch (Exception e) {
+                lastException = asRuntimeException(e);
+                log.warn("Embedding text failed, retrying: chars={}, attempt={}/{}, error={}",
+                        text == null ? 0 : text.length(), attempt, EMBEDDING_RETRIES, e.getMessage());
+                sleepBeforeEmbeddingRetry(attempt);
+            }
+        }
+        throw lastException != null
+                ? lastException
+                : new IllegalStateException("Embedding failed without exception");
+    }
+
+    private RuntimeException asRuntimeException(Exception e) {
+        return e instanceof RuntimeException runtimeException ? runtimeException : new RuntimeException(e);
+    }
+
+    private void sleepBeforeEmbeddingRetry(int attempt) {
         try {
-            Response<Embedding> response = embeddingModel.embed(TextSegment.from(text));
-            return response.content();
-        } catch (Exception e) {
-            log.warn("文本向量化失败，使用零向量兜底: {}", e.getMessage());
-            return Embedding.from(new float[1024]);
+            Thread.sleep(EMBEDDING_RETRY_BASE_DELAY_MS * attempt);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting to retry embedding", e);
         }
     }
 }

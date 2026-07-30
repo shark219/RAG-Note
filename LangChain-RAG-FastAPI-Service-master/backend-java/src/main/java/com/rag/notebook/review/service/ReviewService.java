@@ -3,6 +3,7 @@ package com.rag.notebook.review.service;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rag.notebook.agent.ModelFactory;
+import com.rag.notebook.cache.CacheProtectionService;
 import com.rag.notebook.common.exception.BusinessException;
 import com.rag.notebook.note.entity.Note;
 import com.rag.notebook.note.repo.NoteRepository;
@@ -54,16 +55,31 @@ public class ReviewService {
     private final NoteRepository noteRepository;
     private final ModelFactory modelFactory;
     private final Executor taskExecutor;
+    private final CacheProtectionService cacheProtection;
 
     public ReviewService(ReviewRecordRepository reviewRecordRepository, NoteRepository noteRepository,
-                         ModelFactory modelFactory, @org.springframework.beans.factory.annotation.Qualifier("taskExecutor") Executor taskExecutor) {
+                         ModelFactory modelFactory, CacheProtectionService cacheProtection,
+                         @org.springframework.beans.factory.annotation.Qualifier("taskExecutor") Executor taskExecutor) {
         this.reviewRecordRepository = reviewRecordRepository;
         this.noteRepository = noteRepository;
         this.modelFactory = modelFactory;
+        this.cacheProtection = cacheProtection;
         this.taskExecutor = taskExecutor;
     }
 
+    @SuppressWarnings("unchecked")
     public Map<String, Object> getTodayReviews(String userId) {
+        // 缓存防护：复习列表 TTL 10 分钟，数据变更时（markReviewed）自动清除缓存
+        return cacheProtection.getWithProtection(
+                "review:today:" + userId, Map.class, 600L,
+                () -> buildTodayReviews(userId)
+        );
+    }
+
+    /**
+     * 从 DB 构建今日复习列表（被缓存保护包裹）。
+     */
+    private Map<String, Object> buildTodayReviews(String userId) {
         LocalDateTime now = LocalDateTime.now();
         List<ReviewRecord> dueReviews = reviewRecordRepository.findDueReviews(userId, now);
 
@@ -108,6 +124,9 @@ public class ReviewService {
         record.setIntervalDays(nextInterval);
         record.setNextReviewAt(LocalDateTime.now().plusDays(nextInterval));
         record = reviewRecordRepository.save(record);
+
+        // 复习进度已变，清除今日复习列表缓存
+        cacheProtection.evict("review:today:" + userId);
 
         return new ReviewDoneResponse(
                 true, "已标记回顾",

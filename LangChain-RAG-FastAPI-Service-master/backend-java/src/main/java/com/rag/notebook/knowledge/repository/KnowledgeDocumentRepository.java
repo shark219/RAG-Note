@@ -1,7 +1,9 @@
 package com.rag.notebook.knowledge.repository;
 
 import com.rag.notebook.knowledge.entity.KnowledgeDocument;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -17,6 +19,13 @@ public interface KnowledgeDocumentRepository extends JpaRepository<KnowledgeDocu
     Optional<KnowledgeDocument> findByUserIdAndMd5(String userId, String md5);
 
     Optional<KnowledgeDocument> findByUserIdAndFilename(String userId, String filename);
+
+    Optional<KnowledgeDocument> findByUserIdAndOriginalFilename(String userId, String originalFilename);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT d FROM KnowledgeDocument d WHERE d.userId = :userId AND d.filename = :filename")
+    Optional<KnowledgeDocument> findByUserIdAndFilenameForUpdate(@Param("userId") String userId,
+                                                                 @Param("filename") String filename);
 
     boolean existsByUserIdAndMd5(String userId, String md5);
 

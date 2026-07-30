@@ -152,8 +152,9 @@ public class AgentService {
 
                 // 根据用户开关过滤工具列表
                 List<ToolSpecification> activeTools = filterTools(enableKnowledge, enableNotes);
-                log.info("工具过滤: enableKnowledge={}, enableNotes={}, 可用工具数={}",
-                        enableKnowledge, enableNotes, activeTools.size());
+                log.info("工具过滤: enableKnowledge={}, enableNotes={}, selectedKnowledgeDocs={}, selectedNotes={}, 可用工具数={}, tools={}",
+                        enableKnowledge, enableNotes, selectedKnowledgeDocs, selectedNotes,
+                        activeTools.size(), activeTools.stream().map(ToolSpecification::name).toList());
 
                 // 构建附件上下文（注入给执行层，不传给 Supervisor）
                 String attachmentContext = chatService.buildAttachmentContext(fileIds, userId);
@@ -449,8 +450,9 @@ public class AgentService {
         EvidencePack pack = EvidencePack.from(loopResult.state());
         String answer = responseComposer.compose(pack, loopResult.outcome());
 
-        log.info("Composer 完成: outcome={}, 证据笔记 {} 篇, 产物 {} 个, 回答 {} 字",
-                loopResult.outcome(), pack.notes().size(),
+        int knowledgeEvidenceCount = pack.knowledgeBaseSummary() != null && !pack.knowledgeBaseSummary().isBlank() ? 1 : 0;
+        log.info("Composer 完成: outcome={}, 证据笔记 {} 篇, 知识库证据 {} 条, 产物 {} 个, 回答 {} 字",
+                loopResult.outcome(), pack.notes().size(), knowledgeEvidenceCount,
                 pack.artifacts() != null ? pack.artifacts().size() : 0, answer.length());
 
         // 质量审查：传入所有可用证据（笔记内容 + 操作结果 + 知识库摘要）

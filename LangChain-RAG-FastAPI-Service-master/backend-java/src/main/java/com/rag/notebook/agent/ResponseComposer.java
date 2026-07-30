@@ -51,10 +51,15 @@ public class ResponseComposer {
             return fallbackAnswer(pack);
         }
 
-        log.info("Composer: 生成回答 {} 字, 证据笔记 {} 篇, 产物 {} 个",
-                answer.length(), pack.notes().size(),
+        int knowledgeEvidenceCount = hasKnowledgeBaseEvidence(pack) ? 1 : 0;
+        log.info("Composer: 生成回答 {} 字, 证据笔记 {} 篇, 知识库证据 {} 条, 产物 {} 个",
+                answer.length(), pack.notes().size(), knowledgeEvidenceCount,
                 pack.artifacts() != null ? pack.artifacts().size() : 0);
         return answer.trim();
+    }
+
+    private boolean hasKnowledgeBaseEvidence(EvidencePack pack) {
+        return pack.knowledgeBaseSummary() != null && !pack.knowledgeBaseSummary().isBlank();
     }
 
     private String buildUserMessage(EvidencePack pack, AgentLoopResult.Outcome outcome) {

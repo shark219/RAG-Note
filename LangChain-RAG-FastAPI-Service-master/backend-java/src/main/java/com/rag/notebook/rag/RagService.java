@@ -5,6 +5,8 @@ import com.rag.notebook.config.ApplicationProperties;
 import com.rag.notebook.evaluation.dto.AblationConfig;
 import com.rag.notebook.evaluation.entity.RagTrace;
 import com.rag.notebook.evaluation.repository.RagTraceRepository;
+import com.rag.notebook.knowledge.entity.KnowledgeDocument;
+import com.rag.notebook.knowledge.repository.KnowledgeDocumentRepository;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
@@ -36,15 +38,18 @@ public class RagService {
     private final ModelFactory modelFactory;
     private final ApplicationProperties props;
     private final RagTraceRepository traceRepository;
+    private final KnowledgeDocumentRepository documentRepository;
 
     public RagService(VectorStoreService vectorStoreService, HybridRetriever hybridRetriever,
                       ModelFactory modelFactory, ApplicationProperties props,
-                      RagTraceRepository traceRepository) {
+                      RagTraceRepository traceRepository,
+                      KnowledgeDocumentRepository documentRepository) {
         this.vectorStoreService = vectorStoreService;
         this.hybridRetriever = hybridRetriever;
         this.modelFactory = modelFactory;
         this.props = props;
         this.traceRepository = traceRepository;
+        this.documentRepository = documentRepository;
     }
 
     // ==================== 公开接口（无消融配置） ====================
@@ -66,7 +71,7 @@ public class RagService {
         int topK = config != null && config.getTopK() != null ? config.getTopK() : props.getChroma().getK();
         List<Map<String, Object>> knowledgeResults = hybridRetriever.searchKnowledge(userId, query, topK, config);
         knowledgeResults.forEach(r -> r.put("source_type", "knowledge_base"));
-        return knowledgeResults;
+        return vectorStoreService.expandRetrievedContexts(knowledgeResults);
     }
 
     /**
@@ -80,18 +85,20 @@ public class RagService {
         List<Map<String, Object>> allResults = new ArrayList<>();
 
         if (searchKnowledge) {
-            List<Map<String, Object>> kbResults = hybridRetriever.searchKnowledge(userId, query, topK, config);
+            boolean hasSelectedKnowledgeDocs = selectedKnowledgeDocs != null && !selectedKnowledgeDocs.isEmpty();
+            Set<String> selectedSet = hasSelectedKnowledgeDocs
+                    ? resolveSelectedKnowledgeDocIdentifiers(userId, selectedKnowledgeDocs)
+                    : Set.of();
+            List<Map<String, Object>> kbResults = hybridRetriever.searchKnowledge(userId, query, topK, config, selectedSet);
             kbResults.forEach(r -> r.put("source_type", "knowledge_base"));
-            if (selectedKnowledgeDocs != null && !selectedKnowledgeDocs.isEmpty()) {
-                Set<String> selectedSet = new HashSet<>(selectedKnowledgeDocs);
+            if (hasSelectedKnowledgeDocs) {
+                int beforeFilter = kbResults.size();
+                List<String> beforeSamples = sampleKnowledgeIdentities(kbResults);
                 kbResults = kbResults.stream()
-                        .filter(r -> {
-                            Object docId = r.get("doc_id");
-                            if (docId != null) return selectedSet.contains(docId);
-                            // 旧数据没有 doc_id（在加入 doc_id 前已存储），保留不做过滤
-                            return true;
-                        })
+                        .filter(r -> matchesSelectedKnowledgeDoc(r, selectedSet))
                         .collect(Collectors.toList());
+                log.info("Knowledge doc filter verified: selected={}, resolved={}, before={}, after={}, samples={}",
+                        selectedKnowledgeDocs, selectedSet, beforeFilter, kbResults.size(), beforeSamples);
             }
             allResults.addAll(kbResults);
         }
@@ -110,14 +117,98 @@ public class RagService {
 
         // 按 similarity 降序排列，取 topK
         allResults.sort((a, b) -> Double.compare(
-                (double) b.getOrDefault("similarity", 0.0),
-                (double) a.getOrDefault("similarity", 0.0)
+                scoreOf(b),
+                scoreOf(a)
         ));
         if (allResults.size() > topK) {
             allResults = allResults.subList(0, topK);
         }
 
-        return allResults;
+        return vectorStoreService.expandRetrievedContexts(allResults);
+    }
+
+    private boolean matchesSelectedKnowledgeDoc(Map<String, Object> result, Set<String> selectedSet) {
+        Object docId = result.get("doc_id");
+        if (docId == null) {
+            docId = result.get("docId");
+        }
+        Object id = result.get("id");
+        Object md5 = result.get("md5");
+        Object filename = result.get("filename");
+        Object originalFilename = result.get("original_filename");
+        Object originalFilenameCamel = result.get("originalFilename");
+
+        if (matchesAny(selectedSet, docId, id, md5, filename, originalFilename, originalFilenameCamel)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private Set<String> resolveSelectedKnowledgeDocIdentifiers(String userId, List<String> selectedKnowledgeDocs) {
+        Set<String> selectedSet = new HashSet<>(selectedKnowledgeDocs);
+        for (String selected : selectedKnowledgeDocs) {
+            if (selected == null || selected.isBlank()) {
+                continue;
+            }
+            documentRepository.findById(selected)
+                    .filter(doc -> userId.equals(doc.getUserId()))
+                    .ifPresent(doc -> addDocumentIdentifiers(selectedSet, doc));
+            documentRepository.findByUserIdAndMd5(userId, selected)
+                    .ifPresent(doc -> addDocumentIdentifiers(selectedSet, doc));
+            documentRepository.findByUserIdAndFilename(userId, selected)
+                    .ifPresent(doc -> addDocumentIdentifiers(selectedSet, doc));
+            documentRepository.findByUserIdAndOriginalFilename(userId, selected)
+                    .ifPresent(doc -> addDocumentIdentifiers(selectedSet, doc));
+        }
+        return selectedSet;
+    }
+
+    private void addDocumentIdentifiers(Set<String> selectedSet, KnowledgeDocument doc) {
+        addIfNotBlank(selectedSet, doc.getId());
+        addIfNotBlank(selectedSet, doc.getMd5());
+        addIfNotBlank(selectedSet, doc.getFilename());
+        addIfNotBlank(selectedSet, doc.getOriginalFilename());
+    }
+
+    private void addIfNotBlank(Set<String> values, String value) {
+        if (value != null && !value.isBlank()) {
+            values.add(value);
+        }
+    }
+
+    private List<String> sampleKnowledgeIdentities(List<Map<String, Object>> results) {
+        return results.stream()
+                .limit(5)
+                .map(r -> "doc_id=" + r.get("doc_id")
+                        + ", md5=" + r.get("md5")
+                        + ", filename=" + r.get("filename"))
+                .toList();
+    }
+
+    private boolean matchesAny(Set<String> selectedSet, Object... values) {
+        for (Object value : values) {
+            if (value != null && selectedSet.contains(String.valueOf(value))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private double scoreOf(Map<String, Object> result) {
+        Object value = result.getOrDefault("similarity",
+                result.getOrDefault("rerank_score",
+                        result.getOrDefault("rrf_score", 0.0)));
+        if (value instanceof Number number) {
+            return number.doubleValue();
+        }
+        if (value != null) {
+            try {
+                return Double.parseDouble(String.valueOf(value));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0.0;
     }
 
     /**
@@ -142,7 +233,7 @@ public class RagService {
         trace.setRetrievedDocCount(documents.size());
 
         double avgSim = documents.stream()
-                .mapToDouble(d -> (double) d.getOrDefault("similarity", 0.0))
+                .mapToDouble(this::scoreOf)
                 .average().orElse(0.0);
         trace.setAvgSimilarity(avgSim);
 
@@ -156,7 +247,13 @@ public class RagService {
             trace.setFinalAnswer("未找到相关文档。");
             trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
             saveTrace(trace);
-            return Map.of("documents", List.of(), "summary", "未找到相关文档。");
+            Map<String, Object> emptyResult = new LinkedHashMap<>();
+            emptyResult.put("documents", List.of());
+            emptyResult.put("summary", "未找到相关文档。");
+            emptyResult.put("totalLatencyMs", trace.getTotalLatencyMs());
+            emptyResult.put("retrievalLatencyMs", trace.getRetrievalLatencyMs());
+            emptyResult.put("tokenConsumed", 0);
+            return emptyResult;
         }
 
         // 2. 构建参考资料（根据消融配置决定是否添加来源标注）
@@ -167,15 +264,25 @@ public class RagService {
         String userPrompt = "参考资料：\n" + context + "\n\n用户问题：" + query;
 
         // 4. 调用 LLM 生成回答
-        String finalSummary = generateAnswer(userPrompt);
+        Map.Entry<String, Integer> answerWithTokens = generateAnswerWithTokens(userPrompt);
+        String finalSummary = answerWithTokens.getKey();
+        int tokenCount = answerWithTokens.getValue();
 
         // Trace 记录结束
         trace.setGenerationLatencyMs(System.currentTimeMillis() - generationStart);
         trace.setFinalAnswer(finalSummary);
+        trace.setTokenConsumed(tokenCount);
         trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
         saveTrace(trace);
 
-        return Map.of("documents", documents, "summary", finalSummary);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("documents", documents);
+        result.put("summary", finalSummary);
+        result.put("totalLatencyMs", trace.getTotalLatencyMs());
+        result.put("retrievalLatencyMs", trace.getRetrievalLatencyMs());
+        result.put("generationLatencyMs", trace.getGenerationLatencyMs());
+        result.put("tokenConsumed", trace.getTokenConsumed());
+        return result;
     }
 
     /**
@@ -203,7 +310,7 @@ public class RagService {
         trace.setRetrievedDocCount(documents.size());
 
         double avgSim = documents.stream()
-                .mapToDouble(d -> (double) d.getOrDefault("similarity", 0.0))
+                .mapToDouble(this::scoreOf)
                 .average().orElse(0.0);
         trace.setAvgSimilarity(avgSim);
 
@@ -217,7 +324,13 @@ public class RagService {
             trace.setFinalAnswer("未找到相关文档。");
             trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
             saveTrace(trace);
-            return Map.of("documents", List.of(), "summary", "未找到相关文档。");
+            Map<String, Object> emptyResult2 = new LinkedHashMap<>();
+            emptyResult2.put("documents", List.of());
+            emptyResult2.put("summary", "未找到相关文档。");
+            emptyResult2.put("totalLatencyMs", trace.getTotalLatencyMs());
+            emptyResult2.put("retrievalLatencyMs", trace.getRetrievalLatencyMs());
+            emptyResult2.put("tokenConsumed", 0);
+            return emptyResult2;
         }
 
         // 2. 构建参考资料
@@ -228,14 +341,24 @@ public class RagService {
         String userPrompt = "参考资料：\n" + context + "\n\n用户问题：" + query;
 
         // 4. 调用 LLM 生成回答
-        String finalSummary = generateAnswer(userPrompt);
+        Map.Entry<String, Integer> answerWithTokens2 = generateAnswerWithTokens(userPrompt);
+        String finalSummary2 = answerWithTokens2.getKey();
+        int tokenCount2 = answerWithTokens2.getValue();
 
         trace.setGenerationLatencyMs(System.currentTimeMillis() - generationStart);
-        trace.setFinalAnswer(finalSummary);
+        trace.setFinalAnswer(finalSummary2);
+        trace.setTokenConsumed(tokenCount2);
         trace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
         saveTrace(trace);
 
-        return Map.of("documents", documents, "summary", finalSummary);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("documents", documents);
+        result.put("summary", finalSummary2);
+        result.put("totalLatencyMs", trace.getTotalLatencyMs());
+        result.put("retrievalLatencyMs", trace.getRetrievalLatencyMs());
+        result.put("generationLatencyMs", trace.getGenerationLatencyMs());
+        result.put("tokenConsumed", trace.getTokenConsumed());
+        return result;
     }
 
     /**
@@ -265,20 +388,31 @@ public class RagService {
     }
 
     /**
-     * 调用 LLM 生成回答
+     * 调用 LLM 生成回答，返回 (answer, tokenCount)
      */
-    private String generateAnswer(String userPrompt) {
+    private Map.Entry<String, Integer> generateAnswerWithTokens(String userPrompt) {
         try {
             ChatLanguageModel chatModel = modelFactory.createChatModel();
             Response<AiMessage> response = chatModel.generate(
                     SystemMessage.from(SYSTEM_PROMPT),
                     UserMessage.from(userPrompt)
             );
-            return response.content().text();
+            int tokenCount = 0;
+            if (response.tokenUsage() != null) {
+                tokenCount = response.tokenUsage().totalTokenCount();
+            }
+            return Map.entry(response.content().text(), tokenCount);
         } catch (Exception e) {
             log.error("LLM 生成回答失败: {}", e.getMessage());
-            return "生成回答时发生错误，请稍后重试。";
+            return Map.entry("生成回答时发生错误，请稍后重试。", 0);
         }
+    }
+
+    /**
+     * 调用 LLM 生成回答
+     */
+    private String generateAnswer(String userPrompt) {
+        return generateAnswerWithTokens(userPrompt).getKey();
     }
 
     public String ragSummary(String userId, String query) {

@@ -134,6 +134,11 @@ public class GoalEvaluator {
 
         // 调用过工具且有成功 → 用 LLM 判断目标是否真正达成
         if (state.hasGoal() && !state.getGoal().isBlank()) {
+            if (isInformationalAnswerQuery(state.getOriginalQuery())) {
+                log.info("GoalEvaluator: 放行 — 解释/总结类问题已有成功工具结果，避免过度追问细节");
+                return GoalEvaluation.allowed(state);
+            }
+
             // 已有成功工具结果但已连续被拦截过 → 放行，避免无限循环
             if (state.getConsecutiveNoProgress() >= 1) {
                 log.info("GoalEvaluator: 放行 — 已有成功工具结果且曾被拦截，避免无限循环");
@@ -235,6 +240,18 @@ public class GoalEvaluator {
             if (q.contains(kw)) return false;
         }
         return true;
+    }
+
+    private boolean isInformationalAnswerQuery(String query) {
+        if (query == null || query.isBlank()) return false;
+        String q = query.toLowerCase(Locale.ROOT);
+        boolean asksForExplanation = containsAny(q,
+                "讲解", "解释", "介绍", "说明", "总结", "概述", "说一下", "聊一下", "是什么", "怎么理解",
+                "explain", "summary", "summarize", "overview", "what is");
+        boolean requiresOperation = containsAny(q,
+                "创建", "新建", "编辑", "修改", "删除", "追加", "写入", "写回", "保存", "生成导图",
+                "安排", "标记", "合并", "create", "edit", "delete", "append", "save");
+        return asksForExplanation && !requiresOperation;
     }
 
     /**

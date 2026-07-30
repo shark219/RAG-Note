@@ -1,5 +1,6 @@
 package com.rag.notebook.auth;
 
+import com.rag.notebook.cache.CacheProtectionService;
 import com.rag.notebook.cache.RedisCacheService;
 import com.rag.notebook.common.exception.BusinessException;
 import com.rag.notebook.user.dto.*;
@@ -18,11 +19,14 @@ public class AuthService {
     private final UserService userService;
     private final JwtService jwtService;
     private final RedisCacheService redisCacheService;
+    private final CacheProtectionService cacheProtection;
 
-    public AuthService(UserService userService, JwtService jwtService, RedisCacheService redisCacheService) {
+    public AuthService(UserService userService, JwtService jwtService,
+                       RedisCacheService redisCacheService, CacheProtectionService cacheProtection) {
         this.userService = userService;
         this.jwtService = jwtService;
         this.redisCacheService = redisCacheService;
+        this.cacheProtection = cacheProtection;
     }
 
     public LoginResponse login(LoginRequest request) {
@@ -153,8 +157,21 @@ public class AuthService {
     }
 
     public UserResponse getUserDetail(String userId) {
-        User user = userService.findByUuid(userId);
-        return toUserResponse(user);
+        // 缓存防护：Cache Aside 模式，TTL 30 分钟 + 随机抖动，防击穿/穿透/雪崩
+        UserResponse cached = cacheProtection.getWithProtection(
+                "user:" + userId, UserResponse.class, 1800L,
+                () -> {
+                    try {
+                        return toUserResponse(userService.findByUuid(userId));
+                    } catch (BusinessException e) {
+                        return null; // 用户不存在 → 缓存空值防穿透
+                    }
+                }
+        );
+        if (cached == null) {
+            throw new BusinessException("用户不存在");
+        }
+        return cached;
     }
 
     public Map<String, Object> updateUser(String userId, UserUpdateRequest request) {

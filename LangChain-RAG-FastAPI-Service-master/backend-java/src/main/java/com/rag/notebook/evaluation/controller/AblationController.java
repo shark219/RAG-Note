@@ -51,6 +51,19 @@ public class AblationController {
     }
 
     /**
+     * Phase 1: 启动 TopK 参数优化实验（异步，R-9a ~ R-9d）
+     */
+    @PostMapping("/run-topk")
+    public ApiResponse<Map<String, Object>> runTopKExperiments(@UserId String userId) {
+        log.info("启动 TopK 参数优化实验: userId={}", userId);
+        ablationExperimentService.runTopKExperiments(userId);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "started");
+        result.put("message", "TopK 参数优化实验（R-9a ~ R-9d）已在后台启动");
+        return ApiResponse.success(result);
+    }
+
+    /**
      * 获取预设的实验配置列表
      */
     @GetMapping("/experiments")
@@ -63,8 +76,24 @@ public class AblationController {
                 "experimentName", baseline.getExperimentName(),
                 "ablationComponent", baseline.getAblationComponent()
         ));
-        // R-1 ~ R-7
+        // R-1 ~ R-7 模块消融
         for (AblationConfig config : AblationConfig.allRagExperiments()) {
+            list.add(Map.of(
+                    "experimentId", config.getExperimentId(),
+                    "experimentName", config.getExperimentName(),
+                    "ablationComponent", config.getAblationComponent()
+            ));
+        }
+        // R-8 chunk size 实验
+        for (AblationConfig config : AblationConfig.chunkSizeExperiments()) {
+            list.add(Map.of(
+                    "experimentId", config.getExperimentId(),
+                    "experimentName", config.getExperimentName(),
+                    "ablationComponent", config.getAblationComponent()
+            ));
+        }
+        // R-9 topK 实验
+        for (AblationConfig config : AblationConfig.topKExperiments()) {
             list.add(Map.of(
                     "experimentId", config.getExperimentId(),
                     "experimentName", config.getExperimentName(),

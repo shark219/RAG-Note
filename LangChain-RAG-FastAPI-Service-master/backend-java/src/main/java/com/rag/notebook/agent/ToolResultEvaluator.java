@@ -59,6 +59,7 @@ public class ToolResultEvaluator {
             case "RAG_ERROR" -> "知识库检索失败";
             case "SEARCH_ERROR" -> "笔记搜索执行失败";
             case "LIST_ERROR" -> "获取笔记列表失败";
+            case "TOOL_DISABLED" -> "该工具已被当前开关禁用";
             case "EXCEPTION" -> "工具执行时发生异常";
             default -> "工具执行出错: " + errorCode;
         };
@@ -81,6 +82,7 @@ public class ToolResultEvaluator {
             }
             case "RAG_ERROR" -> "知识库检索暂时不可用，可以尝试用 searchNotes 在笔记中搜索相关内容。";
             case "SEARCH_ERROR" -> "搜索执行失败，请尝试用更简单的关键词或改用 listNotes 浏览笔记。";
+            case "TOOL_DISABLED" -> "不要继续调用该工具，请改用当前已开启的数据源对应的工具。";
             case "EXCEPTION" -> "该操作暂时不可用，请尝试其他工具完成相同目标。";
             default -> "请调整参数后重试，或使用其他工具完成相同目标。";
         };

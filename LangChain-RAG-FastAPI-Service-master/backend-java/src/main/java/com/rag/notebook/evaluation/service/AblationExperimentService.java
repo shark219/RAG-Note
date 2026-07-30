@@ -87,11 +87,67 @@ public class AblationExperimentService {
     }
 
     /**
+     * Phase 1: 异步运行 TopK 参数优化实验（R-9a ~ R-9d）
+     */
+    @Async
+    public CompletableFuture<List<AblationResult>> runTopKExperiments(String userId) {
+        return runParameterExperiments(AblationConfig.topKExperiments(), userId, "TopK");
+    }
+
+    /**
+     * Phase 1: 运行参数优化类实验（TopK / Chunk 等），以参数间对比为主
+     */
+    private CompletableFuture<List<AblationResult>> runParameterExperiments(
+            AblationConfig[] configs, String userId, String componentType) {
+        List<TestCase> testCases = testCaseRepository.findByUserIdOrderByCreatedAtDesc(userId);
+        if (testCases.isEmpty()) {
+            log.warn("{} 参数实验: 用户 {} 没有测试用例", componentType, userId);
+            return CompletableFuture.completedFuture(List.of());
+        }
+
+        log.info("开始 {} 参数优化实验: 用户={}, 测试用例数={}, 配置数={}",
+                componentType, userId, testCases.size(), configs.length);
+
+        List<AblationResult> results = new ArrayList<>();
+        Double bestScore = null;
+
+        for (int ci = 0; ci < configs.length; ci++) {
+            AblationConfig config = configs[ci];
+            try {
+                if (ci > 0) Thread.sleep(1000);
+                AblationResult result = runExperiment(config, testCases, userId);
+                if (bestScore != null) {
+                    result.setBaselineScore(bestScore);
+                    result.setDeltaScore(round(result.getCompositeScore() - bestScore));
+                }
+                result.setKeyFindings(generateParameterFindings(result, config, componentType));
+                ablationResultRepository.save(result);
+                results.add(result);
+
+                if (bestScore == null || result.getCompositeScore() > bestScore) {
+                    bestScore = result.getCompositeScore();
+                }
+
+                log.info("{} 参数实验 {} 完成: score={}, latency={}, token={}",
+                        componentType, config.getExperimentId(),
+                        result.getCompositeScore(), result.getAvgLatencyMs(), result.getAvgTokenConsumed());
+            } catch (Exception e) {
+                log.error("{} 参数实验 {} 失败: {}", componentType, config.getExperimentId(), e.getMessage());
+            }
+        }
+
+        log.info("{} 参数优化实验全部完成", componentType);
+        return CompletableFuture.completedFuture(results);
+    }
+
+    /**
      * 运行单个消融实验
      */
     public AblationResult runExperiment(AblationConfig config, List<TestCase> testCases, String userId) {
         double totalFaithfulness = 0, totalRelevancy = 0, totalPrecision = 0, totalRecall = 0;
         double totalDocCount = 0;
+        long totalLatencyMs = 0, totalRetrievalLatencyMs = 0, totalGenerationLatencyMs = 0;
+        long totalTokenConsumed = 0;
         int successCount = 0;
 
         for (int i = 0; i < testCases.size(); i++) {
@@ -103,6 +159,12 @@ public class AblationExperimentService {
                 Map<String, Object> ragResult = ragService.getDocumentsAndSummary(userId, tc.getQuestion(), config);
                 String answer = (String) ragResult.get("summary");
 
+                // 读取成本数据
+                totalLatencyMs += toLong(ragResult.get("totalLatencyMs"));
+                totalRetrievalLatencyMs += toLong(ragResult.get("retrievalLatencyMs"));
+                totalGenerationLatencyMs += toLong(ragResult.get("generationLatencyMs"));
+                totalTokenConsumed += toLong(ragResult.get("tokenConsumed"));
+
                 // 构造 RagTrace
                 RagTrace trace = new RagTrace();
                 trace.setTraceId(UUID.randomUUID().toString().replace("-", ""));
@@ -110,6 +172,10 @@ public class AblationExperimentService {
                 trace.setQuery(tc.getQuestion());
                 trace.setFinalAnswer(answer);
                 trace.setGroundTruth(tc.getGroundTruth());
+                trace.setTotalLatencyMs(toLong(ragResult.get("totalLatencyMs")));
+                trace.setRetrievalLatencyMs(toLong(ragResult.get("retrievalLatencyMs")));
+                trace.setGenerationLatencyMs(toLong(ragResult.get("generationLatencyMs")));
+                trace.setTokenConsumed((int) toLong(ragResult.get("tokenConsumed")));
 
                 @SuppressWarnings("unchecked")
                 List<Map<String, Object>> docs = (List<Map<String, Object>>) ragResult.get("documents");
@@ -186,6 +252,9 @@ public class AblationExperimentService {
         result.setContextRecall(round(avgRecall));
         result.setCompositeScore(round(composite));
         result.setAvgDocCount(round(totalDocCount / successCount));
+        result.setAvgLatencyMs(totalLatencyMs / successCount);
+        result.setAvgRetrievalLatencyMs(totalRetrievalLatencyMs / successCount);
+        result.setAvgTokenConsumed((int) (totalTokenConsumed / successCount));
         result.setConfigSnapshot(configToJson(config));
 
         return result;
@@ -218,9 +287,16 @@ public class AblationExperimentService {
             row.put("contextPrecision", r.getContextPrecision());
             row.put("contextRecall", r.getContextRecall());
             row.put("avgDocCount", r.getAvgDocCount());
+            row.put("avgLatencyMs", r.getAvgLatencyMs());
+            row.put("avgRetrievalLatencyMs", r.getAvgRetrievalLatencyMs());
+            row.put("avgTokenConsumed", r.getAvgTokenConsumed());
             row.put("testCaseCount", r.getTestCaseCount());
             row.put("keyFindings", r.getKeyFindings());
             row.put("createdAt", r.getCreatedAt());
+            // 价值评估卡：计算收益/成本比
+            if (baseline != null && r.getDeltaScore() != null && r.getAvgLatencyMs() != null) {
+                row.put("valueAssessment", buildValueAssessment(r, baseline));
+            }
             rows.add(row);
         }
 
@@ -246,11 +322,8 @@ public class AblationExperimentService {
     private String generateSummary(AblationResult baseline, List<Map<String, Object>> rows) {
         if (rows.isEmpty()) return "暂无实验数据";
 
-        // 找影响最大的组件（delta 绝对值最大）
         Map<String, Object> mostImpactful = rows.get(0);
         double maxImpact = Math.abs((Double) mostImpactful.get("deltaScore"));
-
-        // 找影响最小的组件
         Map<String, Object> leastImpactful = rows.get(rows.size() - 1);
 
         StringBuilder sb = new StringBuilder();
@@ -265,7 +338,28 @@ public class AblationExperimentService {
         sb.append("影响最小的组件是「")
                 .append(leastImpactful.get("experimentName"))
                 .append("」。");
-        sb.append("建议保留对得分贡献大的组件，可考虑移除对得分贡献微弱且耗时较长的组件以优化性能。");
+
+        // 成本收益分析
+        @SuppressWarnings("unchecked")
+        Map<String, Object> bestRoiRow = rows.stream()
+                .filter(r -> r.get("valueAssessment") != null)
+                .min((a, b) -> {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> va = (Map<String, Object>) a.get("valueAssessment");
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> vb = (Map<String, Object>) b.get("valueAssessment");
+                    double ra = va.get("roi") instanceof Double ? (Double) va.get("roi") : 0;
+                    double rb = vb.get("roi") instanceof Double ? (Double) vb.get("roi") : 0;
+                    return Double.compare(Math.abs(rb), Math.abs(ra));
+                }).orElse(null);
+
+        if (bestRoiRow != null) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> va = (Map<String, Object>) bestRoiRow.get("valueAssessment");
+            sb.append("收益/成本比最高的组件是「").append(bestRoiRow.get("experimentName")).append("」")
+                    .append("（决策: ").append(va.get("decision")).append("）。");
+        }
+        sb.append("建议保留对得分贡献大且成本低的组件，可考虑移除或条件化对得分贡献微弱且成本高的组件。");
 
         return sb.toString();
     }
@@ -301,8 +395,96 @@ public class AblationExperimentService {
         return sb.toString();
     }
 
+    /**
+     * Phase 1: 参数实验结果的关键发现
+     */
+    private String generateParameterFindings(AblationResult result, AblationConfig config, String componentType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("%s=%s", componentType,
+                config.getTopK() != null ? config.getTopK().toString()
+                        : config.getChunkSize() != null ? config.getChunkSize().toString()
+                        : "default"));
+        sb.append(String.format(", 综合得分=%.3f", result.getCompositeScore()));
+        sb.append(String.format(", 延迟=%dms", result.getAvgLatencyMs() != null ? result.getAvgLatencyMs() : 0));
+        sb.append(String.format(", Token=%d",
+                result.getAvgTokenConsumed() != null ? result.getAvgTokenConsumed() : 0));
+
+        if (result.getDeltaScore() != null && Math.abs(result.getDeltaScore()) > 0.01) {
+            sb.append(String.format(", Δ=%.3f", result.getDeltaScore()));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Phase 2: 计算模块价值评估卡
+     * 收益率 = ΔScore / ΔCost
+     * ΔCost = (latency增比例 + token增比例)
+     */
+    private Map<String, Object> buildValueAssessment(AblationResult experiment, AblationResult baseline) {
+        Map<String, Object> card = new LinkedHashMap<>();
+        double deltaScore = experiment.getDeltaScore() != null ? experiment.getDeltaScore() : 0;
+
+        long baseLatency = baseline.getAvgLatencyMs() != null ? baseline.getAvgLatencyMs() : 1;
+        long expLatency = experiment.getAvgLatencyMs() != null ? experiment.getAvgLatencyMs() : 0;
+        int baseToken = baseline.getAvgTokenConsumed() != null ? baseline.getAvgTokenConsumed() : 1;
+        int expToken = experiment.getAvgTokenConsumed() != null ? experiment.getAvgTokenConsumed() : 0;
+
+        double latencyRatio = (double) (expLatency - baseLatency) / baseLatency;
+        double tokenRatio = (double) (expToken - baseToken) / baseToken;
+        double deltaCost = latencyRatio + tokenRatio;
+
+        card.put("deltaScore", round(deltaScore));
+        card.put("deltaLatencyMs", expLatency - baseLatency);
+        card.put("deltaToken", expToken - baseToken);
+        card.put("deltaCost", round(deltaCost));
+
+        // 收益率 = 效果变化 / 成本变化（成本下降为正，成本上升为负）
+        double roi;
+        if (Math.abs(deltaCost) < 0.001) {
+            roi = Math.abs(deltaScore) > 0.01 ? Double.POSITIVE_INFINITY : 0;
+            card.put("roi", roi);
+        } else {
+            roi = deltaScore / deltaCost;
+            card.put("roi", round(roi));
+        }
+
+        // 决策建议
+        card.put("decision", recommendDecision(deltaScore, deltaCost, roi));
+
+        return card;
+    }
+
+    private String recommendDecision(double deltaScore, double deltaCost, double roi) {
+        // 消融后得分降低 → 即原模块有正面贡献
+        boolean moduleHelps = deltaScore < 0;
+        boolean moduleCosts = deltaCost > 0.05;
+
+        if (!moduleHelps && Math.abs(deltaScore) < 0.01) {
+            return "可移除——对效果几乎无影响";
+        }
+        if (moduleHelps && !moduleCosts) {
+            return "强烈保留——有效果且成本低";
+        }
+        if (moduleHelps && moduleCosts) {
+            if (Math.abs(roi) > 10) return "保留——效果好，性价比高";
+            if (Math.abs(roi) > 3) return "建议保留——以中等成本换取明显改善";
+            return "需优化——效果好但成本偏高，考虑条件启停";
+        }
+        if (!moduleHelps && Math.abs(deltaScore) > 0.02) {
+            return "需优化——当前配置下引入噪音，建议调参后再评估";
+        }
+        return "待进一步分析";
+    }
+
     private double round(double v) {
         return Math.round(v * 1000.0) / 1000.0;
+    }
+
+    private long toLong(Object value) {
+        if (value instanceof Number num) {
+            return num.longValue();
+        }
+        return 0L;
     }
 
     private String configToJson(AblationConfig config) {

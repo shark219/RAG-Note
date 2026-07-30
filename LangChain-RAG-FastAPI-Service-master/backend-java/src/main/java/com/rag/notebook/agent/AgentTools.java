@@ -86,6 +86,17 @@ public class AgentTools {
         selectedNotes.remove();
     }
 
+    private boolean isNotesEnabled() {
+        Boolean enabled = searchNotes.get();
+        return enabled == null || enabled;
+    }
+
+    private String notesDisabled(String toolName) {
+        String message = "笔记工具已被当前开关禁用: " + toolName;
+        setResult(ToolResult.error(message, "TOOL_DISABLED", false));
+        return message;
+    }
+
     @Tool("从知识库文档或笔记中检索相关内容并生成摘要。触发场景：用户提到'知识库'、'文档'、'资料'、'上传的文件'、'根据文档'、'根据我的笔记'、'根据笔记'、'笔记里怎么说'等关键词时必须调用此工具。注意：如果用户是想找特定笔记打开看，应该用 searchNotes 而不是 ragSummary")
     public String ragSummary(@P("用户的查询问题，用于检索知识库或笔记") String query, @ToolMemoryId String userId) {
         try {
@@ -102,7 +113,8 @@ public class AgentTools {
             StringBuilder sb = new StringBuilder();
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> docs = (List<Map<String, Object>>) result.get("documents");
-            if (docs != null && !docs.isEmpty()) {
+            boolean hasDocs = docs != null && !docs.isEmpty();
+            if (hasDocs) {
                 sb.append("找到以下相关文档：\n");
                 for (int i = 0; i < docs.size(); i++) {
                     Map<String, Object> doc = docs.get(i);
@@ -113,7 +125,11 @@ public class AgentTools {
             }
             sb.append("\n摘要：\n").append(result.get("summary"));
             String display = sb.toString();
-            setResult(ToolResult.success(display));
+            if (hasDocs) {
+                setResult(ToolResult.success(display));
+            } else {
+                setResult(ToolResult.empty(display));
+            }
             return display;
         } catch (Exception e) {
             setResult(ToolResult.error("RAG检索失败: " + e.getMessage(), "RAG_ERROR", true));
@@ -131,6 +147,7 @@ public class AgentTools {
             @P("获取几条，默认20") String count,
             @P("按分类筛选，不筛选传空字符串") String category,
             @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("listNotes");
         try {
             int n = 20;
             try { n = Integer.parseInt(count); } catch (Exception ignored) {}
@@ -172,6 +189,7 @@ public class AgentTools {
     public String getNote(
             @P("笔记ID（必须是 listNotes 或 searchNotes 返回结果中提取的有效 ID，不能自己编造）") String noteId,
             @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("getNote");
         try {
             var note = noteService.getNote(userId, noteId);
             StringBuilder sb = new StringBuilder();
@@ -193,6 +211,7 @@ public class AgentTools {
 
     @Tool("按关键词搜索笔记内容，返回匹配笔记的标题、ID 和内容摘要。前置条件：需要有明确的搜索关键词。触发场景：用户说'找一下xxx笔记'、'搜索xxx'、'有没有关于xxx的笔记'、'我之前记过xxx吗'、'查找xxx'时调用此工具。适用场景：用户想看特定主题的笔记但不知道 noteId 时，或 getNote 因 NOTE_NOT_FOUND 失败后需要重新定位笔记时。注意：如果用户只是想看'有哪些笔记'、'笔记列表'，应该用 listNotes 而不是 searchNotes。常见失败 EMPTY（搜索无结果）说明关键词可能太窄或太具体，应该换更通用/简短的关键词重试")
     public String searchNotes(@P("搜索关键词，从用户问题中提取核心词（建议先用简短通用词，无结果再精确）") String query, @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("searchNotes");
         try {
             var result = noteService.searchNotes(userId, query);
             if (result.notes().isEmpty()) {
@@ -226,6 +245,7 @@ public class AgentTools {
     public String getRecentNotes(
             @P("获取几条，默认3") String count,
             @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("getRecentNotes");
         try {
             int n = 3;
             try { n = Integer.parseInt(count); } catch (Exception ignored) {}
@@ -249,6 +269,7 @@ public class AgentTools {
 
     @Tool("获取用户的笔记统计信息，包括笔记总数、分类等。触发场景：用户问'笔记有几篇'、'统计'、'多少篇'、'总共多少笔记'时调用此工具")
     public String getNoteStats(@ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("getNoteStats");
         try {
             Map<String, Object> stats = noteService.getStats(userId);
             return "笔记统计：总计 " + stats.get("total") + " 条笔记，" +
@@ -260,6 +281,7 @@ public class AgentTools {
 
     @Tool("获取用户今天需要复习的笔记列表。触发场景：用户提到’复习’、’复习时间’、’回顾’、’今天复习’、’复习计划’时调用此工具")
     public String getTodayReviews(@ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("getTodayReviews");
         try {
             Map<String, Object> result = reviewService.getTodayReviews(userId);
             @SuppressWarnings("unchecked")
@@ -283,6 +305,7 @@ public class AgentTools {
 
     @Tool("标记指定笔记已完成复习。触发场景：用户说'标记已复习'、'完成复习'、'复习完了'时调用此工具，需要先用 getTodayReviews 或 searchNotes 获取笔记ID")
     public String markReviewed(@P("笔记ID，通过 getTodayReviews 或 searchNotes 获取") String noteId, @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("markReviewed");
         try {
             var result = reviewService.markReviewed(userId, noteId);
             if (result.success()) {
@@ -297,6 +320,7 @@ public class AgentTools {
 
     @Tool("创建一篇新笔记。触发场景：用户说'创建笔记'、'新建笔记'、'写一篇笔记'、'帮我记录'、'记一下'时调用此工具。内容必须使用Markdown格式")
     public String createNote(@P("笔记标题，简洁明了") String title, @P("笔记内容，必须使用Markdown格式（#标题、-列表、```代码块等）") String content, @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("createNote");
         try {
             NoteCreate noteCreate = new NoteCreate();
             noteCreate.setTitle(title);
@@ -314,6 +338,7 @@ public class AgentTools {
             @P("新标题，不修改传空字符串") String title,
             @P("新内容，必须使用Markdown格式，不修改传空字符串") String content,
             @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("editNote");
         try {
             NoteUpdate update = new NoteUpdate();
             if (title != null && !title.isBlank()) update.setTitle(title);
@@ -330,6 +355,7 @@ public class AgentTools {
             @P("笔记ID，通过 searchNotes 或 getRecentNotes 获取") String noteId,
             @P("要追加的内容，使用Markdown格式") String appendContent,
             @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("appendNote");
         try {
             var note = noteService.getNote(userId, noteId);
             String oldContent = note.content() != null ? note.content() : "";
@@ -352,6 +378,7 @@ public class AgentTools {
 
     @Tool("删除指定笔记（不可撤销）。触发场景：用户说'删除笔记'、'删掉xxx'、'移除xxx'时调用此工具，需要先用 searchNotes 或 getRecentNotes 获取笔记ID")
     public String deleteNote(@P("笔记ID，通过 searchNotes 或 getRecentNotes 获取") String noteId, @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("deleteNote");
         try {
             noteService.deleteNote(userId, noteId);
             return "笔记删除成功，ID: " + noteId;
@@ -362,6 +389,7 @@ public class AgentTools {
 
     @Tool("查找与指定笔记相关的其他笔记。触发场景：用户说'相关笔记'、'类似笔记'、'还有什么相关的'时调用此工具，需要先用 searchNotes 获取笔记ID")
     public String getRelatedNotes(@P("笔记ID，通过 searchNotes 获取") String noteId, @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("getRelatedNotes");
         try {
             var results = noteService.getRelatedNotes(userId, noteId, 3);
             if (results.isEmpty()) {
@@ -384,6 +412,7 @@ public class AgentTools {
             @P("要合并的笔记ID列表，逗号分隔，如：id1,id2,id3") String noteIds,
             @P("新笔记的标题") String newTitle,
             @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("mergeNotes");
         try {
             String[] ids = noteIds.split(",");
             StringBuilder mergedContent = new StringBuilder();
@@ -475,6 +504,7 @@ public class AgentTools {
     public String generateMindMap(
             @P("笔记ID，通过 searchNotes 获取或从对话上下文中获取") String noteId,
             @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("generateMindMap");
         try {
             var note = noteService.getNote(userId, noteId);
             String title = note.title();
@@ -533,6 +563,7 @@ public class AgentTools {
             @P("笔记ID，通过 searchNotes 获取") String noteId,
             @P("复习间隔天数，如1、3、7、15、30") String days,
             @ToolMemoryId String userId) {
+        if (!isNotesEnabled()) return notesDisabled("scheduleReview");
         try {
             int intervalDays = 1;
             try { intervalDays = Integer.parseInt(days); } catch (Exception ignored) {}
