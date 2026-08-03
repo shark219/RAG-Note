@@ -372,6 +372,12 @@ public class TestCaseGenerator {
         return false;
     }
 
+    /** 出现这些措辞，说明模型自认无法从素材中回答问题（常见于复合问题里有一半原文没提到），
+     * 这类答案不是格式问题，重试没有意义，直接判定这条测试用例失败。 */
+    private static final String[] UNANSWERABLE_MARKERS = {
+            "无法确定", "未说明", "未提及", "文档未", "没有提到", "不明确", "无法从文档中"
+    };
+
     private String generateGroundTruth(ChatLanguageModel model, String docContent, String question) {
         String truncated = truncateHeadAndTail(docContent, 1500);
         String prompt = "你是一个知识库问答评测答案生成助手。\n"
@@ -380,11 +386,25 @@ public class TestCaseGenerator {
                 + "1. 答案必须来自文档内容，不要引入外部信息。\n"
                 + "2. 保留关键技术细节和设计原理。\n"
                 + "3. 如果文档无法回答问题，请明确说明无法确定。\n"
-                + "4. 只输出答案正文，不要解释生成过程。\n\n"
+                + "4. 只输出答案正文，不要解释生成过程，不要以“根据文档内容”“根据文档”等套话开头。\n\n"
                 + "文档：\n" + truncated
                 + "\n\n问题：" + question
                 + "\n\n答案：";
-        return callLlm(model, prompt);
+        String groundTruth = callLlm(model, prompt);
+        if (groundTruth != null && isUnanswerable(groundTruth)) {
+            log.warn("标准答案疑似无法从素材回答，丢弃该测试用例: {}", truncate(groundTruth, 50));
+            return null;
+        }
+        return groundTruth;
+    }
+
+    private boolean isUnanswerable(String groundTruth) {
+        for (String marker : UNANSWERABLE_MARKERS) {
+            if (groundTruth.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String callLlm(ChatLanguageModel model, String prompt) {
