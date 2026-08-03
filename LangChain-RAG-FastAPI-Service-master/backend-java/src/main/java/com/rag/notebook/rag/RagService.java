@@ -228,7 +228,9 @@ public class RagService {
 
         // 1. 检索阶段
         long retrievalStart = System.currentTimeMillis();
+        hybridRetriever.resetQueryExpansionTokens();
         List<Map<String, Object>> documents = retrieveDocuments(userId, query, config);
+        int queryExpansionTokens = hybridRetriever.getLastQueryExpansionTokens();
         trace.setRetrievalLatencyMs(System.currentTimeMillis() - retrievalStart);
         trace.setRetrievedDocCount(documents.size());
 
@@ -253,6 +255,8 @@ public class RagService {
             emptyResult.put("totalLatencyMs", trace.getTotalLatencyMs());
             emptyResult.put("retrievalLatencyMs", trace.getRetrievalLatencyMs());
             emptyResult.put("tokenConsumed", 0);
+            emptyResult.put("queryExpansionTokens", 0);
+            emptyResult.put("rerankerTokens", 0);
             return emptyResult;
         }
 
@@ -282,6 +286,8 @@ public class RagService {
         result.put("retrievalLatencyMs", trace.getRetrievalLatencyMs());
         result.put("generationLatencyMs", trace.getGenerationLatencyMs());
         result.put("tokenConsumed", trace.getTokenConsumed());
+        result.put("queryExpansionTokens", queryExpansionTokens);
+        result.put("rerankerTokens", 0);  // Reranker 使用 REST API，不产生 LLM Token
         return result;
     }
 
@@ -304,8 +310,10 @@ public class RagService {
 
         // 1. 检索阶段
         long retrievalStart = System.currentTimeMillis();
+        hybridRetriever.resetQueryExpansionTokens();
         List<Map<String, Object>> documents = retrieveDocuments(userId, query,
                 searchKnowledge, searchNotes, selectedKnowledgeDocs, selectedNotes, config);
+        int queryExpansionTokens2 = hybridRetriever.getLastQueryExpansionTokens();
         trace.setRetrievalLatencyMs(System.currentTimeMillis() - retrievalStart);
         trace.setRetrievedDocCount(documents.size());
 
@@ -330,6 +338,8 @@ public class RagService {
             emptyResult2.put("totalLatencyMs", trace.getTotalLatencyMs());
             emptyResult2.put("retrievalLatencyMs", trace.getRetrievalLatencyMs());
             emptyResult2.put("tokenConsumed", 0);
+            emptyResult2.put("queryExpansionTokens", 0);
+            emptyResult2.put("rerankerTokens", 0);
             return emptyResult2;
         }
 
@@ -358,6 +368,8 @@ public class RagService {
         result.put("retrievalLatencyMs", trace.getRetrievalLatencyMs());
         result.put("generationLatencyMs", trace.getGenerationLatencyMs());
         result.put("tokenConsumed", trace.getTokenConsumed());
+        result.put("queryExpansionTokens", queryExpansionTokens2);
+        result.put("rerankerTokens", 0);
         return result;
     }
 
@@ -379,7 +391,7 @@ public class RagService {
     }
 
     /**
-     * 构建参考资料（不带来源标注，用于消融实验 R-6）
+     * 构建参考资料（不带来源标注，用于 Source Attribution 消融场景）
      */
     private String buildContextPlain(List<Map<String, Object>> documents) {
         return documents.stream()

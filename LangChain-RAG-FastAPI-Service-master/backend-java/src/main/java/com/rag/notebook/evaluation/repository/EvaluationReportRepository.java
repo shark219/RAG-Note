@@ -2,6 +2,7 @@ package com.rag.notebook.evaluation.repository;
 
 import com.rag.notebook.evaluation.entity.EvaluationReport;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -28,6 +29,13 @@ public interface EvaluationReportRepository extends JpaRepository<EvaluationRepo
 
     @Query("SELECT r FROM EvaluationReport r WHERE r.totalScore < 60 ORDER BY r.totalScore ASC")
     List<EvaluationReport> findLowScoreReports();
+
+    @Query("SELECT r FROM EvaluationReport r WHERE r.totalScore < 60 AND r.userId = :userId ORDER BY r.totalScore ASC")
+    List<EvaluationReport> findLowScoreReportsByUserId(@Param("userId") String userId);
+
+    @Modifying
+    @Query("DELETE FROM EvaluationReport r WHERE r.totalScore < 60 AND r.userId = :userId")
+    int deleteLowScoreReportsByUserId(@Param("userId") String userId);
 
     @Query("SELECT AVG(r.totalScore) FROM EvaluationReport r WHERE r.createdAt >= :start")
     Double avgTotalScoreByDate(@Param("start") LocalDateTime start);

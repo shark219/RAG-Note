@@ -11,6 +11,7 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -621,8 +622,11 @@ public class EvaluationService {
 
     /**
      * 批量评估（跳过已有报告的 trace，避免重复评估）
+     * 异步执行：trace 数量增多后串行评估耗时会超过任何 HTTP 超时上限，
+     * 调用方（Controller）应立即返回，不等待此方法完成。
      */
-    public int batchEvaluate(List<RagTrace> traces) {
+    @Async("taskExecutor")
+    public CompletableFuture<Integer> batchEvaluate(List<RagTrace> traces) {
         int count = 0;
         int skipped = 0;
         for (RagTrace trace : traces) {
@@ -641,6 +645,6 @@ public class EvaluationService {
         if (skipped > 0) {
             log.info("批量评估: 跳过 {} 条已有报告, 新评估 {} 条", skipped, count);
         }
-        return count;
+        return CompletableFuture.completedFuture(count);
     }
 }

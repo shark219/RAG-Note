@@ -12,6 +12,8 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
+import java.text.Normalizer;
+import java.text.Normalizer;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
@@ -55,9 +57,8 @@ public class DocumentProcessor {
             progressCallback.accept("splitting", originalFilename);
             String content = extractText(file, originalFilename);
             log.info("Document text extracted: filename={}, chars={}", originalFilename, content.length());
-            String filePrefix = "[文件: " + originalFilename + "]\n";
-            List<RagChunk> chunks = RagChunker.splitKnowledge(originalFilename, content,
-                    props.getChroma().getChunkSize(), props.getChroma().getChunkOverlap());
+            List<RagChunk> chunks = RagChunker.splitKnowledge(content,
+                    props.getChroma().getChunkSize(), props.getChroma().getChunkOverlap(), isPdf(originalFilename));
             log.info("Document text split: filename={}, chunks={}", originalFilename, chunks.size());
             List<String> qualityWarnings = RagChunker.validate(chunks, props.getChroma().getChunkSize(), isPdf(originalFilename));
             if (!qualityWarnings.isEmpty()) {
@@ -186,12 +187,15 @@ public class DocumentProcessor {
                     continue;
                 }
 
+                // PDF 抽取常把标准 CJK 字符替换成 Unicode 兼容表意文字变体（如"⽹络"里的"⽹"），
+                // NFKC 归一化转回标准字形，避免检索时和用户输入的标准字符匹配不上。
+                String normalizedText = Normalizer.normalize(pageText.strip(), Normalizer.Form.NFKC);
                 content.append("\n[Page ")
                         .append(page)
                         .append("/")
                         .append(pageCount)
                         .append("]\n")
-                        .append(pageText.strip())
+                        .append(normalizedText)
                         .append('\n');
             }
 

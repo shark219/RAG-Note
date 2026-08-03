@@ -17,6 +17,11 @@ public interface RagTraceRepository extends JpaRepository<RagTrace, String> {
     @Query("SELECT t FROM RagTrace t WHERE t.createdAt >= :start AND t.createdAt < :end ORDER BY t.createdAt DESC")
     List<RagTrace> findByDateRange(@Param("start") LocalDateTime start, @Param("end") LocalDateTime end);
 
+    @Query("SELECT t FROM RagTrace t WHERE t.userId = :userId AND t.createdAt >= :start AND t.createdAt < :end ORDER BY t.createdAt DESC")
+    List<RagTrace> findByUserIdAndDateRange(@Param("userId") String userId,
+                                            @Param("start") LocalDateTime start,
+                                            @Param("end") LocalDateTime end);
+
     @Query("SELECT t FROM RagTrace t WHERE t.userFeedback IS NOT NULL ORDER BY t.createdAt DESC")
     List<RagTrace> findTracesWithFeedback();
 

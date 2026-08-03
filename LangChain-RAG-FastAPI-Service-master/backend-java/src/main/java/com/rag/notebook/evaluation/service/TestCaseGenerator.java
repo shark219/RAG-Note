@@ -1,10 +1,13 @@
 package com.rag.notebook.evaluation.service;
 
 import com.rag.notebook.agent.ModelFactory;
+import com.rag.notebook.common.exception.BusinessException;
 import com.rag.notebook.evaluation.entity.TestCase;
 import com.rag.notebook.evaluation.repository.TestCaseRepository;
 import com.rag.notebook.knowledge.entity.KnowledgeDocument;
 import com.rag.notebook.knowledge.repository.KnowledgeDocumentRepository;
+import com.rag.notebook.note.entity.Note;
+import com.rag.notebook.note.repo.NoteRepository;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
@@ -21,42 +24,58 @@ public class TestCaseGenerator {
 
     private final ModelFactory modelFactory;
     private final KnowledgeDocumentRepository documentRepository;
+    private final NoteRepository noteRepository;
     private final TestCaseRepository testCaseRepository;
 
     public TestCaseGenerator(ModelFactory modelFactory,
                              KnowledgeDocumentRepository documentRepository,
+                             NoteRepository noteRepository,
                              TestCaseRepository testCaseRepository) {
         this.modelFactory = modelFactory;
         this.documentRepository = documentRepository;
+        this.noteRepository = noteRepository;
         this.testCaseRepository = testCaseRepository;
     }
 
+    /** 测试用例的来源（知识库文档或笔记） */
+    private record Source(String id, String type, String content) {}
+
     /**
-     * 从用户的知识库文档自动生成测试用例
+     * 从用户的知识库文档和笔记自动生成测试用例
      *
      * @param userId 目标用户
      * @param count  目标生成数量
      * @return 实际生成的测试用例数
      */
     public int generateTestCases(String userId, int count) {
+        List<Source> sources = new ArrayList<>();
         List<KnowledgeDocument> docs = documentRepository.findByUserIdOrderByCreatedAtDesc(userId);
-        if (docs.isEmpty()) {
-            log.warn("用户 {} 没有知识库文档，无法生成测试用例", userId);
+        for (KnowledgeDocument doc : docs) {
+            if (doc.getPreview() != null && doc.getPreview().length() >= 50) {
+                sources.add(new Source(doc.getId(), "doc", doc.getPreview()));
+            }
+        }
+        List<Note> notes = noteRepository.findAllByUserId(userId);
+        for (Note note : notes) {
+            if (note.getContent() != null && note.getContent().length() >= 50) {
+                sources.add(new Source(note.getId(), "note", note.getContent()));
+            }
+        }
+
+        if (sources.isEmpty()) {
+            log.warn("用户 {} 没有知识库文档或笔记，无法生成测试用例", userId);
             return 0;
         }
 
         ChatLanguageModel model = modelFactory.createBalancedModel();
         int generated = 0;
 
-        for (KnowledgeDocument doc : docs) {
+        for (Source source : sources) {
             if (generated >= count) break;
-
-            String content = doc.getPreview();
-            if (content == null || content.length() < 50) continue;
 
             try {
                 // Step 1: 提取知识点
-                String keyPoints = extractKeyPoints(model, content);
+                String keyPoints = extractKeyPoints(model, source.content());
                 if (keyPoints == null || keyPoints.isBlank()) continue;
 
                 String[] points = keyPoints.split("\n");
@@ -71,7 +90,7 @@ public class TestCaseGenerator {
                         if (question == null || question.isBlank()) continue;
 
                         // Step 3: 生成标准答案
-                        String groundTruth = generateGroundTruth(model, content, question);
+                        String groundTruth = generateGroundTruth(model, source.content(), question);
                         if (groundTruth == null || groundTruth.isBlank()) continue;
 
                         // Step 4: 保存
@@ -79,7 +98,12 @@ public class TestCaseGenerator {
                         testCase.setUserId(userId);
                         testCase.setQuestion(question.trim());
                         testCase.setGroundTruth(groundTruth.trim());
-                        testCase.setDocId(doc.getId());
+                        testCase.setSourceType(source.type());
+                        if ("note".equals(source.type())) {
+                            testCase.setNoteId(source.id());
+                        } else {
+                            testCase.setDocId(source.id());
+                        }
                         testCase.setDifficulty("simple");
                         testCaseRepository.save(testCase);
 
@@ -96,6 +120,96 @@ public class TestCaseGenerator {
 
         log.info("测试用例生成完成: 用户={}, 生成{}条", userId, generated);
         return generated;
+    }
+
+    /**
+     * 手动新增测试用例：根据用户填写的 question，直接基于所选来源内容生成标准答案
+     */
+    public TestCase createManualTestCase(String userId, String question, String sourceType, String docId, String noteId) {
+        if (question == null || question.isBlank()) {
+            throw new BusinessException("问题不能为空");
+        }
+        log.info("手动新增测试用例: 用户={}, question={}, 来源类型={}, docId={}, noteId={}",
+                userId, truncate(question, 30), sourceType, docId, noteId);
+        String content = loadSourceContent(userId, sourceType, docId, noteId);
+        String groundTruth = generateGroundTruth(modelFactory.createBalancedModel(), content, question);
+        if (groundTruth == null || groundTruth.isBlank()) {
+            throw new BusinessException("标准答案生成失败，请稍后重试");
+        }
+
+        TestCase testCase = new TestCase();
+        testCase.setUserId(userId);
+        testCase.setQuestion(question.trim());
+        testCase.setGroundTruth(groundTruth.trim());
+        testCase.setSourceType("note".equals(sourceType) ? "note" : "doc");
+        if ("note".equals(sourceType)) {
+            testCase.setNoteId(noteId);
+        } else {
+            testCase.setDocId(docId);
+        }
+        testCase.setDifficulty("simple");
+        testCaseRepository.save(testCase);
+        log.info("手动新增测试用例保存成功: id={}, 用户={}, 来源={}", testCase.getId(), userId, sourceType);
+        return testCase;
+    }
+
+    /**
+     * 编辑测试用例：更新 question 与来源，直接基于所选来源内容重新生成标准答案
+     */
+    public TestCase updateManualTestCase(String userId, Long id, String question, String sourceType, String docId, String noteId) {
+        TestCase testCase = testCaseRepository.findById(id)
+                .orElseThrow(() -> new BusinessException(404, "测试用例不存在"));
+        if (!testCase.getUserId().equals(userId)) {
+            throw new BusinessException(403, "无权编辑他人的测试用例");
+        }
+        if (question == null || question.isBlank()) {
+            throw new BusinessException("问题不能为空");
+        }
+        log.info("编辑测试用例: id={}, 用户={}, question={}, 来源类型={}, docId={}, noteId={}",
+                id, userId, truncate(question, 30), sourceType, docId, noteId);
+        String content = loadSourceContent(userId, sourceType, docId, noteId);
+        String groundTruth = generateGroundTruth(modelFactory.createBalancedModel(), content, question);
+        if (groundTruth == null || groundTruth.isBlank()) {
+            throw new BusinessException("标准答案生成失败，请稍后重试");
+        }
+
+        testCase.setQuestion(question.trim());
+        testCase.setGroundTruth(groundTruth.trim());
+        testCase.setSourceType("note".equals(sourceType) ? "note" : "doc");
+        testCase.setDocId("note".equals(sourceType) ? null : docId);
+        testCase.setNoteId("note".equals(sourceType) ? noteId : null);
+        testCaseRepository.save(testCase);
+        log.info("编辑测试用例保存成功: id={}, 用户={}, 来源={}", id, userId, sourceType);
+        return testCase;
+    }
+
+    /**
+     * 根据来源类型加载文档预览或笔记正文
+     */
+    private String loadSourceContent(String userId, String sourceType, String docId, String noteId) {
+        if ("note".equals(sourceType)) {
+            if (noteId == null || noteId.isBlank()) {
+                throw new BusinessException("请选择笔记");
+            }
+            Note note = noteRepository.findById(noteId)
+                    .filter(n -> n.getUserId().equals(userId))
+                    .orElseThrow(() -> new BusinessException(404, "笔记不存在"));
+            if (note.getContent() == null || note.getContent().isBlank()) {
+                throw new BusinessException("该笔记内容为空，无法生成标准答案");
+            }
+            return note.getContent();
+        }
+
+        if (docId == null || docId.isBlank()) {
+            throw new BusinessException("请选择知识库文档");
+        }
+        KnowledgeDocument doc = documentRepository.findById(docId)
+                .filter(d -> d.getUserId().equals(userId))
+                .orElseThrow(() -> new BusinessException(404, "知识库文档不存在"));
+        if (doc.getPreview() == null || doc.getPreview().isBlank()) {
+            throw new BusinessException("该文档无可用内容，无法生成标准答案");
+        }
+        return doc.getPreview();
     }
 
     private String extractKeyPoints(ChatLanguageModel model, String content) {
@@ -123,5 +237,9 @@ public class TestCaseGenerator {
             log.warn("LLM 调用失败: {}", e.getMessage());
             return null;
         }
+    }
+
+    private String truncate(String s, int max) {
+        return s == null ? "" : (s.length() > max ? s.substring(0, max) + "..." : s);
     }
 }

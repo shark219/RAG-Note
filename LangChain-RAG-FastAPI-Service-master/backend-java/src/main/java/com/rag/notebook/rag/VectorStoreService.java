@@ -47,7 +47,7 @@ public class VectorStoreService {
     private static final String COLLECTION_ID_CACHE_PREFIX = "chroma:collection:id:";
     private static final long COLLECTION_ID_CACHE_TTL_HOURS = 24;
     private static final Duration CHROMA_TIMEOUT = Duration.ofMinutes(2);
-    private static final int EMBEDDING_BATCH_SIZE = 3;
+    private static final int EMBEDDING_BATCH_SIZE = 10;
     private static final int EMBEDDING_RETRIES = 5;
     private static final long EMBEDDING_RETRY_BASE_DELAY_MS = 1000L;
 
@@ -388,8 +388,6 @@ public class VectorStoreService {
         List<KnowledgeDocumentChunk> chunkEntities = new ArrayList<>();
         for (int i = 0; i < chunks.size(); i++) {
             RagChunk ragChunk = chunks.get(i);
-            String parentId = document.getId() + "_p_" + (ragChunk.getParentIndex() != null ? ragChunk.getParentIndex() : i);
-            ragChunk.setParentId(parentId);
 
             KnowledgeDocumentChunk chunk = new KnowledgeDocumentChunk();
             chunk.setId(UUID.randomUUID().toString());
@@ -398,8 +396,6 @@ public class VectorStoreService {
             chunk.setContent(ragChunk.getContent());
             chunk.setRetrievalText(ragChunk.getRetrievalText());
             chunk.setContentType(ragChunk.getContentType());
-            chunk.setSectionPath(ragChunk.getSectionPath());
-            chunk.setParentId(parentId);
             chunk.setPageStart(ragChunk.getPageStart());
             chunk.setPageEnd(ragChunk.getPageEnd());
             chunk.setMetadataJson(ragChunk.toMetadataMap());
@@ -823,7 +819,6 @@ public class VectorStoreService {
                 result.put("retrieval_text", retrievalText);
                 result.put("content_type", chunk.getContentType());
                 result.put("section_path", chunk.getSectionPath());
-                result.put("parent_id", chunk.getParentId());
                 result.put("page_start", chunk.getPageStart());
                 result.put("page_end", chunk.getPageEnd());
                 result.put("distance", 1.0f - similarity);
@@ -906,7 +901,6 @@ public class VectorStoreService {
             chunkDetail.put("content", chunk.getContent());
             chunkDetail.put("content_type", chunk.getContentType());
             chunkDetail.put("section_path", chunk.getSectionPath());
-            chunkDetail.put("parent_id", chunk.getParentId());
             chunkDetail.put("page_start", chunk.getPageStart());
             chunkDetail.put("page_end", chunk.getPageEnd());
             chunkDetails.add(chunkDetail);
@@ -945,7 +939,6 @@ public class VectorStoreService {
             Map<String, Object> metadata = new HashMap<>();
             metadata.put("content_type", chunk.getContentType());
             metadata.put("section_path", chunk.getSectionPath());
-            metadata.put("parent_id", chunk.getParentId());
             metadata.put("page_start", chunk.getPageStart());
             metadata.put("page_end", chunk.getPageEnd());
             chunkMap.put("metadata", metadata);
@@ -980,40 +973,40 @@ public class VectorStoreService {
         return expanded;
     }
 
+    /**
+     * 知识库检索结果扩展：扁平切片没有 section/parent 结构，
+     * overlap 已经承接了跨 chunk 的语义连续性，这里只做 chunk_index ± 1 的邻域兜底，
+     * 避免命中的片段正好落在句子边界上时丢失前后文。
+     */
     private Map<String, Object> expandKnowledgeContext(Map<String, Object> result,
                                                        Map<String, Long> sectionHitCounts) {
         Map<String, Object> expanded = new HashMap<>(result);
         String docId = stringValue(result.get("doc_id"));
-        String parentId = stringValue(result.get("parent_id"));
-        String sectionPath = stringValue(result.get("section_path"));
         int hitIndex = intValue(result.get("index"), -1);
 
         List<KnowledgeDocumentChunk> contextChunks = List.of();
-        String contextLevel = "child";
-        if (docId != null && sectionPath != null
-                && sectionHitCounts.getOrDefault(sectionGroupKey(result), 0L) > 1) {
-            contextChunks = chunkRepository.findByDocumentIdAndSectionPath(docId, sectionPath);
-            contextLevel = "section";
-        }
-        if (contextChunks.isEmpty() && docId != null && parentId != null) {
-            contextChunks = chunkRepository.findByDocumentIdAndParentId(docId, parentId);
-            contextLevel = "parent";
-        }
-        if (contextChunks.isEmpty() && docId != null && hitIndex >= 0) {
+        if (docId != null && hitIndex >= 0) {
             List<KnowledgeDocumentChunk> all = chunkRepository.findByDocumentIdOrderByChunkIndexAsc(docId);
             contextChunks = all.stream()
                     .filter(c -> Math.abs(c.getChunkIndex() - hitIndex) <= 1)
                     .toList();
-            contextLevel = "neighbor";
         }
 
         if (!contextChunks.isEmpty()) {
+            String originalFilename = docId != null
+                    ? documentRepository.findById(docId).map(KnowledgeDocument::getOriginalFilename).orElse(null)
+                    : null;
+            if (originalFilename == null) {
+                originalFilename = stringValue(result.get("original_filename"));
+            }
+            if (originalFilename == null) {
+                originalFilename = stringValue(result.get("filename"));
+            }
             expanded.put("original_content", result.get("content"));
-            expanded.put("content", joinKnowledgeChunks(contextChunks, 6000));
-            expanded.put("context_level", contextLevel);
+            expanded.put("content", joinKnowledgeChunks(originalFilename, contextChunks, 3000));
+            expanded.put("context_level", "neighbor");
             expanded.put("expanded_chunk_count", contextChunks.size());
-            expanded.put("context_key", "knowledge:" + docId + ":" + contextLevel + ":"
-                    + ("section".equals(contextLevel) ? sectionPath : parentId));
+            expanded.put("context_key", "knowledge:" + docId + ":neighbor:" + hitIndex);
         }
         return expanded;
     }
@@ -1038,8 +1031,9 @@ public class VectorStoreService {
         }
 
         if (!contextChunks.isEmpty()) {
+            String title = stringValue(result.get("title"));
             expanded.put("original_content", result.get("content"));
-            expanded.put("content", joinNoteChunks(contextChunks, 5000));
+            expanded.put("content", joinNoteChunks(title, contextChunks, 5000));
             expanded.put("context_level", contextLevel);
             expanded.put("expanded_chunk_count", contextChunks.size());
             expanded.put("context_key", "note:" + noteId + ":" + contextLevel + ":"
@@ -1055,26 +1049,57 @@ public class VectorStoreService {
         ragChunk.setRetrievalText(chunk.getRetrievalText() != null ? chunk.getRetrievalText() : chunk.getContent());
         ragChunk.setContentType(chunk.getContentType());
         ragChunk.setSectionPath(chunk.getSectionPath());
-        ragChunk.setParentId(chunk.getParentId());
         ragChunk.setPageStart(chunk.getPageStart());
         ragChunk.setPageEnd(chunk.getPageEnd());
         return ragChunk;
     }
 
-    private String joinKnowledgeChunks(List<KnowledgeDocumentChunk> chunks, int maxChars) {
+    /**
+     * 拼接知识库上下文 chunk：来源标注（文件名/页码）在这里现场生成并作为分隔符，
+     * 不再从 chunk.content 里读取（content 只存干净正文），避免多 chunk 拼接后无法分辨来源边界。
+     */
+    private String joinKnowledgeChunks(String originalFilename, List<KnowledgeDocumentChunk> chunks, int maxChars) {
         StringBuilder sb = new StringBuilder();
         for (KnowledgeDocumentChunk chunk : chunks) {
-            appendWithLimit(sb, chunk.getContent(), maxChars);
+            String label = buildKnowledgeSourceLabel(originalFilename, chunk.getPageStart(), chunk.getPageEnd());
+            appendWithLimit(sb, label + chunk.getContent(), maxChars);
             if (sb.length() >= maxChars) break;
         }
         return sb.toString();
     }
 
-    private String joinNoteChunks(List<NoteChunk> chunks, int maxChars) {
+    private String joinNoteChunks(String title, List<NoteChunk> chunks, int maxChars) {
         StringBuilder sb = new StringBuilder();
         for (NoteChunk chunk : chunks) {
-            appendWithLimit(sb, chunk.getContent(), maxChars);
+            String label = buildNoteSourceLabel(title, chunk.getSectionPath());
+            appendWithLimit(sb, label + chunk.getContent(), maxChars);
             if (sb.length() >= maxChars) break;
+        }
+        return sb.toString();
+    }
+
+    private String buildKnowledgeSourceLabel(String filename, Integer pageStart, Integer pageEnd) {
+        StringBuilder sb = new StringBuilder();
+        if (filename != null && !filename.isBlank()) {
+            sb.append("[文件: ").append(filename).append("]\n");
+        }
+        if (pageStart != null) {
+            sb.append("[页码: ").append(pageStart);
+            if (pageEnd != null && !pageEnd.equals(pageStart)) {
+                sb.append("-").append(pageEnd);
+            }
+            sb.append("]\n");
+        }
+        return sb.toString();
+    }
+
+    private String buildNoteSourceLabel(String title, String sectionPath) {
+        StringBuilder sb = new StringBuilder();
+        if (title != null && !title.isBlank()) {
+            sb.append("[笔记: ").append(title).append("]\n");
+        }
+        if (sectionPath != null && !sectionPath.isBlank()) {
+            sb.append("[章节: ").append(sectionPath).append("]\n");
         }
         return sb.toString();
     }

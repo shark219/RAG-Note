@@ -7,129 +7,57 @@ import java.util.regex.Pattern;
 
 final class RagChunker {
 
-    private static final Pattern PDF_PAGE_MARKER = Pattern.compile("^\\[Page\\s+(\\d+)/(\\d+)]$");
-    private static final Pattern CHUNK_PAGE_MARKER = Pattern.compile("(?m)^\\[Page\\s+(\\d+)]$");
     private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,6})\\s+(.+)$");
-    private static final Pattern NUMBERED_HEADING = Pattern.compile(
-            "^(\\d+(\\.\\d+)*[\\s.．、]+|[一二三四五六七八九十]+[、.．]+|第.{1,12}[章节篇])[\\s\\S]{1,80}$");
-    private static final int KNOWLEDGE_CHILD_DEFAULT_CHARS = 500;
-    private static final int KNOWLEDGE_CHILD_MIN_CHARS = 300;
-    private static final int KNOWLEDGE_PARENT_MIN_CHARS = 1600;
+    // 纯分隔线（---、***、___、- - -），和 MarkdownBlockParser 保持一致，跳过而不是当成正文/列表项
+    private static final Pattern SEPARATOR_LINE = Pattern.compile("^\\s*([-*_])(\\s*\\1){2,}\\s*$");
     private static final int NOTE_SHORT_TEXT_MAX_CHARS = 600;
 
     private RagChunker() {
     }
 
-    static List<RagChunk> splitKnowledge(String filename, String text, int chunkSize, int chunkOverlap) {
-        List<SectionBuffer> sections = buildKnowledgeSections(MarkdownBlockParser.parse(text));
+    /**
+     * 知识库文档切片：按中文标点层级递归切分为固定大小的扁平 chunk（无父子/章节结构）。
+     * 章节检测（标题识别）不可靠，容易产生错误的 section 归属，因此不再用它切分边界；
+     * 仅保留 code/table/list 整块不拆和 PDF 页码识别这两个独立、可靠的能力。
+     * isPdf=true 时关闭标题启发式识别（PDF 纯文本没有可靠的标题标记，容易误判并把
+     * 猜测出的标题包装成多余的 "#"/"##" 混入正文）。
+     */
+    static List<RagChunk> splitKnowledge(String text, int chunkSize, int chunkOverlap, boolean isPdf) {
+        List<DocumentBlock> blocks = MarkdownBlockParser.parse(text, isPdf);
+        List<KnowledgeChild> pieces = buildKnowledgeChildren(blocks, chunkSize, chunkOverlap);
+
         List<RagChunk> chunks = new ArrayList<>();
-        int childChunkSize = Math.max(chunkSize, KNOWLEDGE_CHILD_DEFAULT_CHARS);
-        int childOverlap = Math.max(chunkOverlap, Math.min(80, childChunkSize / 5));
-        int childMinChars = Math.min(KNOWLEDGE_CHILD_MIN_CHARS, childChunkSize / 2);
-        int parentMaxChars = Math.max(KNOWLEDGE_PARENT_MIN_CHARS, childChunkSize * 4);
-        int parentIndex = 0;
-
-        for (SectionBuffer section : sections) {
-            List<KnowledgeChild> childTexts = compactKnowledgeChildren(
-                    buildKnowledgeChildren(section, childChunkSize, childOverlap),
-                    childMinChars,
-                    childChunkSize);
-            int parentChars = 0;
-            for (KnowledgeChild child : childTexts) {
-                if (child == null || child.text().isBlank()) {
-                    continue;
-                }
-                if (parentChars > 0 && parentChars + child.text().length() > parentMaxChars) {
-                    parentIndex++;
-                    parentChars = 0;
-                }
-
-                RagChunk chunk = new RagChunk();
-                chunk.setChunkIndex(chunks.size());
-                chunk.setContent(buildKnowledgeContent(filename, section.sectionPath,
-                        child.pageStart(), child.pageEnd(), child.text()));
-                chunk.setRetrievalText(buildRetrievalText(filename, section.sectionPath,
-                        child.contentType(), child.text()));
-                chunk.setContentType(child.contentType());
-                chunk.setSectionPath(section.sectionPath);
-                chunk.setPageStart(child.pageStart());
-                chunk.setPageEnd(child.pageEnd());
-                chunk.setParentIndex(parentIndex);
-                chunks.add(chunk);
-
-                parentChars += child.text().length();
-            }
-            parentIndex++;
-        }
-        return chunks;
-    }
-
-    private static List<KnowledgeChild> compactKnowledgeChildren(List<KnowledgeChild> pieces, int minChars, int targetChars) {
-        List<KnowledgeChild> compacted = new ArrayList<>();
-        if (pieces == null || pieces.isEmpty()) {
-            return compacted;
-        }
-
-        int mergeLimit = targetChars + minChars;
         for (KnowledgeChild piece : pieces) {
             if (piece == null || piece.text().isBlank()) {
                 continue;
             }
-            KnowledgeChild normalized = piece.strip();
-            if (!compacted.isEmpty()) {
-                int lastIndex = compacted.size() - 1;
-                KnowledgeChild previous = compacted.get(lastIndex);
-                boolean shouldMerge = normalized.text().length() < minChars || previous.text().length() < minChars;
-                if (shouldMerge
-                        && canMergeContentTypes(previous.contentType(), normalized.contentType())
-                        && previous.text().length() + normalized.text().length() + 2 <= mergeLimit) {
-                    compacted.set(lastIndex, previous.merge(normalized));
-                    continue;
-                }
-            }
-            compacted.add(normalized);
+            RagChunk chunk = new RagChunk();
+            chunk.setChunkIndex(chunks.size());
+            // content 只存干净正文；文件名/页码等来源信息由生成阶段（VectorStoreService.joinKnowledgeChunks）
+            // 结合 KnowledgeDocument/KnowledgeDocumentChunk 的独立字段动态拼接，不再预先烧进存储内容。
+            chunk.setContent(piece.text().strip());
+            chunk.setRetrievalText(piece.text());
+            chunk.setContentType(piece.contentType());
+            chunk.setPageStart(piece.pageStart());
+            chunk.setPageEnd(piece.pageEnd());
+            chunks.add(chunk);
         }
-        return compacted;
+        return chunks;
     }
 
-    private static List<SectionBuffer> buildKnowledgeSections(List<DocumentBlock> blocks) {
-        List<SectionBuffer> sections = new ArrayList<>();
-        SectionBuffer current = new SectionBuffer("正文");
-        sections.add(current);
-
-        for (DocumentBlock block : blocks) {
-            if (block.type() == DocumentBlock.Type.PAGE_BREAK) {
-                current.markPage(block.pageStart());
-                continue;
-            }
-
-            if (block.type() == DocumentBlock.Type.HEADING) {
-                String sectionPath = block.headingPath().isEmpty()
-                        ? block.text()
-                        : String.join(" > ", block.headingPath());
-                if (!current.isEmpty()) {
-                    current = new SectionBuffer(sectionPath);
-                    sections.add(current);
-                } else {
-                    current.sectionPath = sectionPath;
-                }
-                current.addBlock(block);
-                continue;
-            }
-
-            current.addBlock(block);
-        }
-        return sections.stream().filter(section -> !section.isEmpty()).toList();
-    }
-
-    private static List<KnowledgeChild> buildKnowledgeChildren(SectionBuffer section, int targetChars, int overlap) {
+    /**
+     * 在扁平的 block 流上做切分：普通文本按 targetChars/overlap 累积，
+     * code/table/list 尽量整块保留；HEADING 类型的 block 不再触发新的分组，
+     * 直接作为普通文本并入当前累积段（即使标题识别有误也不会影响切片边界）。
+     */
+    private static List<KnowledgeChild> buildKnowledgeChildren(List<DocumentBlock> blocks, int targetChars, int overlap) {
         List<KnowledgeChild> children = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         String currentType = "text";
         Integer pageStart = null;
         Integer pageEnd = null;
 
-        for (DocumentBlock block : section.blocks) {
+        for (DocumentBlock block : blocks) {
             if (block.type() == DocumentBlock.Type.PAGE_BREAK || !block.hasText()) {
                 continue;
             }
@@ -146,10 +74,12 @@ final class RagChunker {
                     pageStart = null;
                     pageEnd = null;
                 }
-                if (blockText.length() <= targetChars * 2) {
+                // 用和 shouldKeepKnowledgeBlockTogether 相同的阈值判断是否要拆，避免两处阈值不一致导致
+                // 本应整块保留的 table/code/list 又被按字符硬切（表格被从单元格中间切断）。
+                if (blockText.length() <= knowledgeKeepTogetherLimit(targetChars)) {
                     children.add(new KnowledgeChild(blockText, blockType, block.pageStart(), block.pageEnd()));
                 } else {
-                    children.addAll(splitLargeKnowledgeBlock(blockText, blockType, block.pageStart(), block.pageEnd(),
+                    children.addAll(splitLargeKnowledgeBlockByLine(blockText, blockType, block.pageStart(), block.pageEnd(),
                             targetChars, overlap));
                 }
                 continue;
@@ -163,8 +93,15 @@ final class RagChunker {
                     pageStart = null;
                     pageEnd = null;
                 }
-                children.addAll(splitLargeKnowledgeBlock(blockText, blockType, block.pageStart(), block.pageEnd(),
-                        targetChars, overlap));
+                // code/table/list 超限时按行切，保证不会在表格行/代码行中间断开；
+                // 普通文本仍走字符级的 TextChunker.split（标点感知切分更适合自然语言）。
+                if ("code".equals(blockType) || "table".equals(blockType) || "list".equals(blockType)) {
+                    children.addAll(splitLargeKnowledgeBlockByLine(blockText, blockType, block.pageStart(), block.pageEnd(),
+                            targetChars, overlap));
+                } else {
+                    children.addAll(splitLargeKnowledgeBlock(blockText, blockType, block.pageStart(), block.pageEnd(),
+                            targetChars, overlap));
+                }
                 continue;
             }
 
@@ -197,6 +134,9 @@ final class RagChunker {
     private static List<KnowledgeChild> splitLargeKnowledgeBlock(String text, String contentType,
                                                                  Integer pageStart, Integer pageEnd,
                                                                  int targetChars, int overlap) {
+        if ("code".equals(contentType) || "table".equals(contentType) || "list".equals(contentType)) {
+            return splitLargeKnowledgeBlockByLine(text, contentType, pageStart, pageEnd, targetChars, overlap);
+        }
         List<KnowledgeChild> children = new ArrayList<>();
         for (String piece : TextChunker.split(text, targetChars, overlap)) {
             if (!piece.isBlank()) {
@@ -206,15 +146,80 @@ final class RagChunker {
         return children;
     }
 
-    private static boolean shouldKeepKnowledgeBlockTogether(String contentType, String text, int targetChars) {
-        if ("code".equals(contentType) || "table".equals(contentType) || "list".equals(contentType)) {
-            return text.length() <= Math.max(targetChars * 2, 1200);
+    /**
+     * 按行（而不是字符）切分超长的 table/code/list block，保证每个 chunk 内的表格行/代码行完整，
+     * 不会在单元格或代码语句中间断开。单行本身超过 targetChars 时才不得已按字符兜底切分。
+     */
+    private static List<KnowledgeChild> splitLargeKnowledgeBlockByLine(String text, String contentType,
+                                                                       Integer pageStart, Integer pageEnd,
+                                                                       int targetChars, int overlap) {
+        List<KnowledgeChild> children = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+
+        for (String line : text.split("\n", -1)) {
+            if (current.length() > 0 && current.length() + line.length() + 1 > targetChars) {
+                children.add(new KnowledgeChild(current.toString().strip(), contentType, pageStart, pageEnd));
+                String carry = overlapByLine(current.toString(), overlap);
+                current.setLength(0);
+                if (!carry.isBlank() && carry.length() + line.length() + 1 <= targetChars) {
+                    current.append(carry).append('\n');
+                }
+            }
+            if (line.length() > targetChars) {
+                if (current.length() > 0) {
+                    children.add(new KnowledgeChild(current.toString().strip(), contentType, pageStart, pageEnd));
+                    current.setLength(0);
+                }
+                for (String piece : TextChunker.split(line, targetChars, overlap)) {
+                    if (!piece.isBlank()) {
+                        children.add(new KnowledgeChild(piece, contentType, pageStart, pageEnd));
+                    }
+                }
+                continue;
+            }
+            if (current.length() > 0) {
+                current.append('\n');
+            }
+            current.append(line);
         }
-        return false;
+        if (!current.toString().isBlank()) {
+            children.add(new KnowledgeChild(current.toString().strip(), contentType, pageStart, pageEnd));
+        }
+        return children;
     }
 
-    private static boolean canMergeContentTypes(String left, String right) {
-        return "text".equals(left) || "text".equals(right) || left.equals(right);
+    /**
+     * 按整行（而不是字符）截取重叠内容，避免重叠部分正好落在表格行/代码行中间，
+     * 导致拼接到下一个 chunk 开头时出现半行残留（如 "0t0 | TCP | LISTEN |" 这种断行）。
+     */
+    private static String overlapByLine(String text, int overlap) {
+        if (overlap <= 0) {
+            return "";
+        }
+        String[] lines = text.strip().split("\n", -1);
+        StringBuilder carry = new StringBuilder();
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String candidate = lines[i] + (carry.length() > 0 ? "\n" + carry : "");
+            if (candidate.length() > overlap && carry.length() > 0) {
+                break;
+            }
+            carry = new StringBuilder(candidate);
+            if (candidate.length() >= overlap) {
+                break;
+            }
+        }
+        return carry.toString();
+    }
+
+    private static int knowledgeKeepTogetherLimit(int targetChars) {
+        return Math.max(targetChars * 2, 1200);
+    }
+
+    private static boolean shouldKeepKnowledgeBlockTogether(String contentType, String text, int targetChars) {
+        if ("code".equals(contentType) || "table".equals(contentType) || "list".equals(contentType)) {
+            return text.length() <= knowledgeKeepTogetherLimit(targetChars);
+        }
+        return false;
     }
 
     private static String mergeContentType(String current, String next) {
@@ -256,27 +261,6 @@ final class RagChunker {
         return value.substring(start);
     }
 
-    private static PageRange pageRangeForChild(String text, Integer fallbackPage, SectionBuffer section) {
-        Integer start = null;
-        Integer end = null;
-        Matcher matcher = CHUNK_PAGE_MARKER.matcher(text);
-        while (matcher.find()) {
-            int page = Integer.parseInt(matcher.group(1));
-            if (start == null) {
-                start = page;
-            }
-            end = page;
-        }
-        if (start != null) {
-            return new PageRange(start, end, end);
-        }
-        if (fallbackPage != null) {
-            return new PageRange(fallbackPage, fallbackPage, fallbackPage);
-        }
-        Integer sectionFallback = section.pageStart != null ? section.pageStart : section.pageEnd;
-        return new PageRange(sectionFallback, sectionFallback, sectionFallback);
-    }
-
     static List<RagChunk> splitNote(String noteId, String title, String content,
                                     int chunkSize, int chunkOverlap) {
         String safeTitle = title != null && !title.isBlank() ? title.trim() : "Untitled Note";
@@ -287,7 +271,9 @@ final class RagChunker {
         if (allText.length() <= NOTE_SHORT_TEXT_MAX_CHARS) {
             RagChunk chunk = new RagChunk();
             chunk.setChunkIndex(0);
-            chunk.setContent(buildNoteContent(safeTitle, safeTitle, safeContent));
+            // content 只存干净正文；笔记标题/章节等来源信息由生成阶段（VectorStoreService.joinNoteChunks）
+            // 结合 Note.title/NoteChunk.sectionPath 动态拼接，不再预先烧进存储内容。
+            chunk.setContent(safeContent.strip());
             chunk.setRetrievalText(buildRetrievalText(safeTitle, safeTitle, "text", safeContent));
             chunk.setContentType(detectContentType(safeContent));
             chunk.setSectionPath(safeTitle);
@@ -337,49 +323,6 @@ final class RagChunker {
         return warnings;
     }
 
-    private static List<SectionBuffer> parseKnowledgeSections(String text) {
-        List<SectionBuffer> sections = new ArrayList<>();
-        SectionBuffer current = new SectionBuffer("正文");
-        sections.add(current);
-
-        Integer currentPage = null;
-        String[] lines = (text != null ? text : "").split("\\R");
-        for (int i = 0; i < lines.length; i++) {
-            String rawLine = lines[i];
-            String line = rawLine.strip();
-            Matcher pageMatcher = PDF_PAGE_MARKER.matcher(line);
-            if (pageMatcher.matches()) {
-                currentPage = Integer.parseInt(pageMatcher.group(1));
-                current.markPage(currentPage);
-                current.text.append("\n[Page ").append(currentPage).append("]\n");
-                continue;
-            }
-
-            if (line.isBlank()) {
-                current.text.append('\n');
-                continue;
-            }
-
-            boolean previousBoundary = i == 0 || isBlankOrPageMarker(lines[i - 1]);
-            boolean nextBoundary = i == lines.length - 1 || isBlankOrPageMarker(lines[i + 1]);
-            if (looksLikeHeading(line, previousBoundary, nextBoundary)) {
-                if (!current.isEmpty()) {
-                    current = new SectionBuffer(cleanHeading(line));
-                    sections.add(current);
-                } else {
-                    current.sectionPath = cleanHeading(line);
-                }
-                current.markPage(currentPage);
-                current.text.append(line).append('\n');
-                continue;
-            }
-
-            current.markPage(currentPage);
-            current.text.append(rawLine).append('\n');
-        }
-        return sections.stream().filter(section -> !section.isEmpty()).toList();
-    }
-
     private static List<SectionBuffer> parseNoteSections(String title, String content) {
         List<SectionBuffer> sections = new ArrayList<>();
         List<String> headingStack = new ArrayList<>();
@@ -405,7 +348,7 @@ final class RagChunker {
                 String sectionPath = String.join(" > ", headingStack);
                 current = new SectionBuffer(sectionPath);
                 sections.add(current);
-                current.text.append(rawLine).append('\n');
+                // 标题行只用于生成 sectionPath，不再重复写入正文（sectionPath 已经携带同样的信息）
                 continue;
             }
 
@@ -436,7 +379,8 @@ final class RagChunker {
                 }
                 RagChunk chunk = new RagChunk();
                 chunk.setChunkIndex(chunks.size());
-                chunk.setContent(buildNoteContent(title, section.sectionPath, piece));
+                // content 只存干净正文，标题/章节前缀改为生成阶段动态拼接
+                chunk.setContent(piece.strip());
                 chunk.setRetrievalText(buildRetrievalText(title, section.sectionPath, contentType, piece));
                 chunk.setContentType(contentType);
                 chunk.setSectionPath(section.sectionPath);
@@ -466,7 +410,7 @@ final class RagChunker {
                 continue;
             }
 
-            if (!inCode && trimmed.isBlank()) {
+            if (!inCode && (trimmed.isBlank() || SEPARATOR_LINE.matcher(trimmed).matches())) {
                 if (current.length() > 0) {
                     blocks.add(current.toString());
                     current.setLength(0);
@@ -500,35 +444,6 @@ final class RagChunker {
         }
     }
 
-    private static String buildKnowledgeContent(String filename, String sectionPath,
-                                                Integer pageStart, Integer pageEnd,
-                                                String text) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("[文件: ").append(filename).append("]\n");
-        if (sectionPath != null && !sectionPath.isBlank()) {
-            sb.append("[章节: ").append(sectionPath).append("]\n");
-        }
-        if (pageStart != null) {
-            sb.append("[页码: ").append(pageStart);
-            if (pageEnd != null && !pageEnd.equals(pageStart)) {
-                sb.append("-").append(pageEnd);
-            }
-            sb.append("]\n");
-        }
-        sb.append(text.strip());
-        return sb.toString();
-    }
-
-    private static String buildNoteContent(String title, String sectionPath, String text) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("[笔记: ").append(title).append("]\n");
-        if (sectionPath != null && !sectionPath.isBlank()) {
-            sb.append("[章节: ").append(sectionPath).append("]\n");
-        }
-        sb.append(text.strip());
-        return sb.toString();
-    }
-
     private static String buildRetrievalText(String title, String sectionPath,
                                              String contentType, String text) {
         return "标题: " + title + "\n"
@@ -537,76 +452,16 @@ final class RagChunker {
                 + "正文: " + text.strip();
     }
 
-    private static boolean looksLikeHeading(String line, boolean previousBoundary, boolean nextBoundary) {
-        if (line == null || line.isBlank()) {
-            return false;
-        }
-        String text = line.strip();
-        if (text.length() > 100 || text.startsWith("http://") || text.startsWith("https://")) {
-            return false;
-        }
-        if (MARKDOWN_HEADING.matcher(text).matches() || NUMBERED_HEADING.matcher(text).matches()) {
-            return true;
-        }
-        if ((text.endsWith("?") || text.endsWith("？"))
-                && text.length() <= 90
-                && !text.contains("，")
-                && !text.contains(",")) {
-            return true;
-        }
-        return previousBoundary && nextBoundary && looksLikeStandaloneTitle(text);
-    }
-
-    private static boolean isBlankOrPageMarker(String rawLine) {
-        String line = rawLine == null ? "" : rawLine.strip();
-        return line.isBlank() || PDF_PAGE_MARKER.matcher(line).matches();
-    }
-
-    private static boolean looksLikeStandaloneTitle(String text) {
-        if (text.length() < 2 || text.length() > 50) {
-            return false;
-        }
-        if (text.matches(".*\\d+\\s*(题|w|W|万|字).*")) {
-            return false;
-        }
-        if (text.contains("，") || text.contains(",") || text.contains("。")
-                || text.contains("；") || text.contains(";")) {
-            return false;
-        }
-        return !(text.endsWith(".") || text.endsWith("!") || text.endsWith("！"));
-    }
-
-    private record PageRange(Integer start, Integer end, Integer lastKnownPage) {
-    }
-
-    private record KnowledgeChild(String text, String contentType, Integer pageStart, Integer pageEnd) {
-        private KnowledgeChild strip() {
-            return new KnowledgeChild(text.strip(), normalizeContentType(contentType), pageStart, pageEnd);
-        }
-
-        private KnowledgeChild merge(KnowledgeChild other) {
-            return new KnowledgeChild(
-                    text.strip() + "\n\n" + other.text().strip(),
-                    mergeContentType(contentType, other.contentType()),
-                    minPage(pageStart, other.pageStart()),
-                    maxPage(pageEnd, other.pageEnd()));
-        }
-    }
-
-    private static String cleanHeading(String line) {
-        Matcher markdown = MARKDOWN_HEADING.matcher(line);
-        if (markdown.matches()) {
-            return markdown.group(2).trim();
-        }
-        return line.strip();
-    }
-
+    /**
+     * 表格/列表行数统计优先于代码关键词匹配：单元格内容里出现 public/private 等词
+     * （比如对比 Java 修饰符的表格）不应该抢先把整块判成 code。
+     */
     private static String detectContentType(String text) {
         if (text == null || text.isBlank()) {
             return "text";
         }
         String trimmed = text.strip();
-        if (trimmed.startsWith("```") || trimmed.matches("(?s).*(public|private|class|def|function|SELECT|CREATE TABLE).*")) {
+        if (trimmed.startsWith("```")) {
             return "code";
         }
         String[] lines = trimmed.split("\\R");
@@ -627,49 +482,25 @@ final class RagChunker {
         if (listLines >= 2) {
             return "list";
         }
+        if (trimmed.matches("(?s).*(public|private|class|def|function|SELECT|CREATE TABLE).*")) {
+            return "code";
+        }
         return "text";
+    }
+
+    private record KnowledgeChild(String text, String contentType, Integer pageStart, Integer pageEnd) {
     }
 
     private static final class SectionBuffer {
         private String sectionPath;
         private final StringBuilder text = new StringBuilder();
-        private final List<DocumentBlock> blocks = new ArrayList<>();
-        private Integer pageStart;
-        private Integer pageEnd;
 
         private SectionBuffer(String sectionPath) {
             this.sectionPath = sectionPath;
         }
 
-        private void markPage(Integer page) {
-            if (page == null) {
-                return;
-            }
-            if (pageStart == null || page < pageStart) {
-                pageStart = page;
-            }
-            if (pageEnd == null || page > pageEnd) {
-                pageEnd = page;
-            }
-        }
-
-        private void addBlock(DocumentBlock block) {
-            if (block == null || block.type() == DocumentBlock.Type.PAGE_BREAK) {
-                return;
-            }
-            blocks.add(block);
-            if (block.markdown() != null && !block.markdown().isBlank()) {
-                if (text.length() > 0) {
-                    text.append("\n\n");
-                }
-                text.append(block.markdown().strip());
-            }
-            markPage(block.pageStart());
-            markPage(block.pageEnd());
-        }
-
         private boolean isEmpty() {
-            return blocks.isEmpty() && text.toString().replaceAll("(?m)^\\[Page \\d+]$", "").isBlank();
+            return text.toString().isBlank();
         }
     }
 }

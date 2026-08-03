@@ -29,6 +29,10 @@ public class AblationResult {
     @Column(name = "ablation_component", length = 50)
     private String ablationComponent;
 
+    /** 关联的 run_id */
+    @Column(name = "run_id", length = 36)
+    private String runId;
+
     // ===== RAGAS 四项指标 =====
 
     @Column(name = "faithfulness")
@@ -66,9 +70,17 @@ public class AblationResult {
     @Column(name = "avg_doc_count")
     private Double avgDocCount;
 
-    /** 平均 Token 消耗 */
-    @Column(name = "avg_token_consumed")
-    private Integer avgTokenConsumed;
+    /** 平均 Query Expansion Token */
+    @Column(name = "avg_query_expansion_tokens")
+    private Integer avgQueryExpansionTokens;
+
+    /** 平均 Reranker Token */
+    @Column(name = "avg_reranker_tokens")
+    private Integer avgRerankerTokens;
+
+    /** 平均 Generation Token */
+    @Column(name = "avg_generation_tokens")
+    private Integer avgGenerationTokens;
 
     // ===== 元数据 =====
 

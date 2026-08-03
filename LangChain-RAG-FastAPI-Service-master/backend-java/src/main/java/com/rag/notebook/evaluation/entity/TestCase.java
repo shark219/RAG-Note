@@ -29,6 +29,12 @@ public class TestCase {
     @Column(name = "doc_id", length = 36)
     private String docId;
 
+    @Column(name = "note_id", length = 36)
+    private String noteId;
+
+    @Column(name = "source_type", length = 10)
+    private String sourceType;
+
     @Column(name = "difficulty", length = 20)
     private String difficulty;
 

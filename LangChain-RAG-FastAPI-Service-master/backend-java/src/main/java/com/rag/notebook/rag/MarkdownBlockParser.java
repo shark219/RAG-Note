@@ -14,11 +14,22 @@ final class MarkdownBlockParser {
             "^(\\d+(\\.\\d+)*[\\s.．、]+|[一二三四五六七八九十]+[、.．]+|第.{1,12}[章节篇])[\\s\\S]{1,90}$");
     private static final Pattern LIST_LINE = Pattern.compile("^\\s*([-*+]|\\d+[.)]|[一二三四五六七八九十]+[、.．])\\s+.+$");
     private static final Pattern TABLE_SEPARATOR = Pattern.compile("^\\s*\\|?\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)+\\|?\\s*$");
+    // 纯分隔线（---、***、___、- - -），不含 | 因此不会误判为表格分隔行；用于跳过而不是当成段落/列表项
+    private static final Pattern SEPARATOR_LINE = Pattern.compile("^\\s*([-*_])(\\s*\\1){2,}\\s*$");
 
     private MarkdownBlockParser() {
     }
 
     static List<DocumentBlock> parse(String text) {
+        return parse(text, false);
+    }
+
+    /**
+     * @param isPdf PDF 抽取出的纯文本没有真实的 markdown 语法，标题启发式（数字编号/疑问句/独立短行）
+     *              在这种文本上误判率高，因此对 PDF 来源关闭这些启发式，只识别真正的 "# " 标题写法
+     *              （PDF 纯文本中基本不会出现），code/table/list 的整块保留逻辑不受影响。
+     */
+    static List<DocumentBlock> parse(String text, boolean isPdf) {
         List<DocumentBlock> blocks = new ArrayList<>();
         List<String> headingStack = new ArrayList<>();
         String[] lines = (text != null ? text : "").split("\\R", -1);
@@ -49,9 +60,14 @@ final class MarkdownBlockParser {
                 continue;
             }
 
+            if (SEPARATOR_LINE.matcher(line).matches()) {
+                i++;
+                continue;
+            }
+
             boolean previousBoundary = i == 0 || isBoundary(lines[i - 1]);
             boolean nextBoundary = i == lines.length - 1 || isBoundary(lines[i + 1]);
-            Heading heading = parseHeading(line, previousBoundary, nextBoundary);
+            Heading heading = parseHeading(line, previousBoundary, nextBoundary, isPdf);
             if (heading != null) {
                 headingStack = updateHeadingStack(headingStack, heading.level(), heading.title());
                 String markdown = "#".repeat(Math.max(1, Math.min(6, heading.level()))) + " " + heading.title();
@@ -89,7 +105,7 @@ final class MarkdownBlockParser {
                 continue;
             }
 
-            ParseResult paragraph = consumeParagraph(lines, i, currentPage, headingStack);
+            ParseResult paragraph = consumeParagraph(lines, i, currentPage, headingStack, isPdf);
             blocks.add(paragraph.block());
             i = paragraph.nextIndex();
         }
@@ -170,7 +186,8 @@ final class MarkdownBlockParser {
                 0, headingPath, page, page, "code"), i);
     }
 
-    private static ParseResult consumeParagraph(String[] lines, int start, Integer page, List<String> headingPath) {
+    private static ParseResult consumeParagraph(String[] lines, int start, Integer page, List<String> headingPath,
+                                                boolean isPdf) {
         StringBuilder sb = new StringBuilder();
         int i = start;
         while (i < lines.length) {
@@ -180,7 +197,7 @@ final class MarkdownBlockParser {
             }
             boolean previousBoundary = i == 0 || isBoundary(lines[i - 1]);
             boolean nextBoundary = i == lines.length - 1 || isBoundary(lines[i + 1]);
-            if (i > start && (parseHeading(line, previousBoundary, nextBoundary) != null
+            if (i > start && (parseHeading(line, previousBoundary, nextBoundary, isPdf) != null
                     || LIST_LINE.matcher(lines[i]).matches()
                     || isMarkdownTableStart(lines, i)
                     || isPdfTableStart(lines, i)
@@ -198,10 +215,18 @@ final class MarkdownBlockParser {
                 0, headingPath, page, page, "text"), Math.max(i, start + 1));
     }
 
-    private static Heading parseHeading(String line, boolean previousBoundary, boolean nextBoundary) {
+    /**
+     * isPdf=true 时只识别真正的 "# " markdown 标题语法，不启用数字编号/疑问句/独立短行等启发式。
+     * PDF 抽取出的纯文本本来没有可靠的标题标记，这些启发式在其上误判率较高（例如把编号列表项、
+     * 表格行误判成标题），还会把猜测出的标题包装成 "#"/"##" 混入原本不含 markdown 语法的正文。
+     */
+    private static Heading parseHeading(String line, boolean previousBoundary, boolean nextBoundary, boolean isPdf) {
         Matcher markdown = MARKDOWN_HEADING.matcher(line);
         if (markdown.matches()) {
             return new Heading(markdown.group(1).length(), markdown.group(2).trim());
+        }
+        if (isPdf) {
+            return null;
         }
         if (line.length() > 100 || line.startsWith("http://") || line.startsWith("https://")) {
             return null;

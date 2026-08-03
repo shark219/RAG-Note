@@ -89,19 +89,20 @@ public class EvaluationController {
 
     @PostMapping("/batch")
     public ApiResponse<Map<String, Object>> batchEvaluate(
+            @UserId String userId,
             @RequestParam(defaultValue = "0") int days) {
         LocalDateTime start = LocalDate.now().minusDays(days).atStartOfDay();
         LocalDateTime end = LocalDate.now().plusDays(1).atStartOfDay();
-        List<RagTrace> traces = traceRepository.findByDateRange(start, end);
+        List<RagTrace> traces = traceRepository.findByUserIdAndDateRange(userId, start, end);
 
         if (traces.isEmpty()) {
             return ApiResponse.success("没有待评估的 Trace", Map.of("count", 0));
         }
 
-        int evaluated = evaluationService.batchEvaluate(traces);
-        return ApiResponse.success("评估完成", Map.of(
-                "total", traces.size(),
-                "evaluated", evaluated
+        // 异步执行，不阻塞 HTTP 请求；trace 数量多时串行评估耗时可能远超前端超时
+        evaluationService.batchEvaluate(traces);
+        return ApiResponse.success("评估已在后台启动，请稍后刷新查看结果", Map.of(
+                "total", traces.size()
         ));
     }
 
@@ -132,8 +133,15 @@ public class EvaluationController {
     }
 
     @GetMapping("/low-scores")
-    public ApiResponse<List<EvaluationReport>> getLowScores() {
-        return ApiResponse.success(reportRepository.findLowScoreReports());
+    public ApiResponse<List<EvaluationReport>> getLowScores(@UserId String userId) {
+        return ApiResponse.success(reportRepository.findLowScoreReportsByUserId(userId));
+    }
+
+    @DeleteMapping("/low-scores")
+    @Transactional
+    public ApiResponse<Map<String, Object>> clearLowScores(@UserId String userId) {
+        int deleted = reportRepository.deleteLowScoreReportsByUserId(userId);
+        return ApiResponse.success("低分样本已清空", Map.of("deleted", deleted));
     }
 
     // ========== Phase 3: 趋势数据 ==========
@@ -245,6 +253,20 @@ public class EvaluationController {
         return ApiResponse.success(testCaseRepository.findByUserIdOrderByCreatedAtDesc(userId));
     }
 
+    @PostMapping("/test-cases")
+    public ApiResponse<TestCase> createTestCase(@UserId String userId, @RequestBody TestCaseRequest request) {
+        TestCase testCase = testCaseGenerator.createManualTestCase(
+                userId, request.getQuestion(), request.getSourceType(), request.getDocId(), request.getNoteId());
+        return ApiResponse.success("测试用例创建成功", testCase);
+    }
+
+    @PutMapping("/test-cases/{id}")
+    public ApiResponse<TestCase> updateTestCase(@UserId String userId, @PathVariable Long id, @RequestBody TestCaseRequest request) {
+        TestCase testCase = testCaseGenerator.updateManualTestCase(
+                userId, id, request.getQuestion(), request.getSourceType(), request.getDocId(), request.getNoteId());
+        return ApiResponse.success("测试用例更新成功", testCase);
+    }
+
     @DeleteMapping("/test-cases/batch")
     @Transactional
     public ApiResponse<Map<String, Object>> deleteTestCases(@UserId String userId, @RequestBody List<Long> ids) {
@@ -346,5 +368,21 @@ public class EvaluationController {
         public void setScore(Integer score) { this.score = score; }
         public String getReason() { return reason; }
         public void setReason(String reason) { this.reason = reason; }
+    }
+
+    public static class TestCaseRequest {
+        private String question;
+        private String sourceType;
+        private String docId;
+        private String noteId;
+
+        public String getQuestion() { return question; }
+        public void setQuestion(String question) { this.question = question; }
+        public String getSourceType() { return sourceType; }
+        public void setSourceType(String sourceType) { this.sourceType = sourceType; }
+        public String getDocId() { return docId; }
+        public void setDocId(String docId) { this.docId = docId; }
+        public String getNoteId() { return noteId; }
+        public void setNoteId(String noteId) { this.noteId = noteId; }
     }
 }

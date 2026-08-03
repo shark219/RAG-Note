@@ -57,7 +57,14 @@ public class BatchEvaluationService {
         List<RagTrace> toEvaluate = sampleTraces(traces);
         log.info("采样后 {} 条待评估", toEvaluate.size());
 
-        int evaluated = evaluationService.batchEvaluate(toEvaluate);
+        // batchEvaluate 已改为 @Async；定时任务本身运行在独立线程，阻塞等待结果不会影响 HTTP 请求
+        int evaluated;
+        try {
+            evaluated = evaluationService.batchEvaluate(toEvaluate).get();
+        } catch (Exception e) {
+            log.error("每日评估任务执行异常: {}", e.getMessage());
+            return;
+        }
 
         log.info("每日评估完成: 总计 {} 条，采样 {} 条，成功评估 {} 条",
                 traces.size(), toEvaluate.size(), evaluated);

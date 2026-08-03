@@ -328,13 +328,14 @@ async function fetchDiagnosisStats() {
 async function triggerBatchEvaluate() {
   evaluating.value = true
   try {
+    // 后端已改为异步启动评估任务，接口立即返回，不再需要为长耗时做客户端超时兜底
     const res = await fetch('/evaluation/batch?days=7', {
       method: 'POST', headers: getHeaders()
     })
     const json = await res.json()
     if (json.code === 200) {
-      showToast(`评估完成: ${json.data.evaluated}/${json.data.total}`)
-      refreshAll()
+      showToast(`评估已在后台启动，共 ${json.data.total} 条待评估`)
+      setTimeout(refreshAll, 5000)
     }
   } catch (e) { showToast('评估失败') }
   finally { evaluating.value = false }
@@ -357,9 +358,13 @@ async function generateTestCases() {
 async function runRegression() {
   regressing.value = true
   try {
+    // 回归测试要对每条测试用例重新跑一次检索+生成+评估，耗时同样可能远超普通请求
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 180000)
     const res = await fetch('/evaluation/regression', {
-      method: 'POST', headers: getHeaders()
+      method: 'POST', headers: getHeaders(), signal: controller.signal
     })
+    clearTimeout(timeoutId)
     const json = await res.json()
     if (json.code === 200) {
       regressionResult.value = json.data

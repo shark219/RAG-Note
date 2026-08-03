@@ -24,6 +24,29 @@ public class QueryExpander {
     private static final int MAX_EXPANSIONS = 3;
 
     private static final String EXPAND_PROMPT =
+            "你是一个专业的RAG检索优化助手。"
+                    + "请针对用户查询生成3个用于知识库检索的扩展查询。\n"
+                    + "\n"
+                    + "要求：\n"
+                    + "1. 保留原始查询的核心意图，不改变问题方向\n"
+                    + "2. 从不同检索角度扩展，包括：同义词、专业术语、相关概念、文档常见表达\n"
+                    + "3. 每个查询必须能够独立用于搜索知识库\n"
+                    + "4. 不要生成答案，不要解释原因\n"
+                    + "5. 避免简单重复原查询或罗列大量关键词\n"
+                    + "6. 每个查询长度控制在10~30个字\n"
+                    + "7. 只输出查询列表，每行一个，不要编号\n"
+                    + "\n"
+                    + "示例：\n"
+                    + "输入：垃圾回收优化\n"
+                    + "输出：\n"
+                    + "JVM垃圾回收机制优化\n"
+                    + "GC调优策略与性能分析\n"
+                    + "G1 CMS收集器优化方法\n"
+                    + "\n"
+                    + "当前查询：{query}\n"
+                    + "扩展查询：";
+
+/*
             "请将以下查询改写为3个不同的版本，用于从知识库中检索相关文档。\n" +
             "要求：\n" +
             "1. 每个版本一行，不要编号\n" +
@@ -34,11 +57,20 @@ public class QueryExpander {
             "6. 每个版本不超过20个字\n\n" +
             "原始查询：{query}\n\n" +
             "改写结果：";
+*/
 
     private final ModelFactory modelFactory;
 
+    /** 最近一次扩展的 Token 消耗 */
+    private volatile int lastExpansionTokens = 0;
+
     public QueryExpander(ModelFactory modelFactory) {
         this.modelFactory = modelFactory;
+    }
+
+    /** 获取最近一次扩展消耗的 Token 数 */
+    public int getLastExpansionTokens() {
+        return lastExpansionTokens;
     }
 
     /**
@@ -59,18 +91,22 @@ public class QueryExpander {
             String prompt = EXPAND_PROMPT.replace("{query}", shortQuery);
             Response<AiMessage> response = chatModel.generate(UserMessage.from(prompt));
 
+            // 记录 Token 消耗
+            if (response.tokenUsage() != null) {
+                lastExpansionTokens = response.tokenUsage().totalTokenCount();
+            } else {
+                lastExpansionTokens = 0;
+            }
+
             String result = response.content().text();
             String[] lines = result.split("\n");
             for (String line : lines) {
-                if (queries.size() >= MAX_EXPANSIONS + 1) break;  // 硬限制：最多 1+3 个
+                if (queries.size() >= MAX_EXPANSIONS + 1) break;
 
                 String trimmed = line.trim();
                 if (!trimmed.isEmpty() && !trimmed.equals(query)) {
-                    // 去掉可能的编号前缀（1. 2. 3. - * 等）
                     trimmed = trimmed.replaceFirst("^[\\d.\\-*)\\s]+", "").trim();
-                    // 去掉引号
                     trimmed = trimmed.replaceAll("[\"\"']", "").trim();
-                    // 限制每个变体长度不超过 50 字
                     if (trimmed.length() > 50) {
                         trimmed = trimmed.substring(0, 50);
                     }
@@ -80,9 +116,11 @@ public class QueryExpander {
                 }
             }
 
-            log.info("Query 扩展: [{}] → {} 个版本", truncate(query, 30), queries.size());
+            log.info("Query 扩展: [{}] → {} 个版本, tokens={}", truncate(query, 30), queries.size(), lastExpansionTokens);
+            log.info("Expanded queries: {}", queries);
         } catch (Exception e) {
             log.warn("Query 扩展失败，仅使用原始查询: {}", e.getMessage());
+            lastExpansionTokens = 0;
         }
 
         return queries;

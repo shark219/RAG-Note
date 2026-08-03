@@ -26,7 +26,7 @@ public class AblationController {
     }
 
     /**
-     * 启动所有 RAG 消融实验（异步，R-1 ~ R-7）
+     * 启动所有 RAG 消融实验（异步，BASELINE + R-1~R-5）
      */
     @PostMapping("/run-all")
     public ApiResponse<Map<String, Object>> runAllExperiments(@UserId String userId) {
@@ -37,7 +37,7 @@ public class AblationController {
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "started");
-        result.put("message", "RAG 消融实验（R-1 ~ R-7）已在后台启动，完成后可在报告中查看结果");
+        result.put("message", "RAG Pipeline 消融实验（BASELINE + R-1~R-5）已在后台启动，完成后可在报告中查看结果");
         return ApiResponse.success(result);
     }
 
@@ -51,7 +51,24 @@ public class AblationController {
     }
 
     /**
-     * Phase 1: 启动 TopK 参数优化实验（异步，R-9a ~ R-9d）
+     * 获取指定 run_id 的消融实验报告
+     */
+    @GetMapping("/report/{runId}")
+    public ApiResponse<Map<String, Object>> getReportByRunId(@PathVariable String runId) {
+        Map<String, Object> report = ablationExperimentService.getReportByRunId(runId);
+        return ApiResponse.success(report);
+    }
+
+    /**
+     * 获取历史 run 列表
+     */
+    @GetMapping("/runs")
+    public ApiResponse<List<Map<String, Object>>> getRunHistory(@UserId String userId) {
+        return ApiResponse.success(ablationExperimentService.getRunHistory(userId));
+    }
+
+    /**
+     * Phase 1: 启动 TopK 参数优化实验（异步，R-6a ~ R-6d）
      */
     @PostMapping("/run-topk")
     public ApiResponse<Map<String, Object>> runTopKExperiments(@UserId String userId) {
@@ -59,42 +76,74 @@ public class AblationController {
         ablationExperimentService.runTopKExperiments(userId);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "started");
-        result.put("message", "TopK 参数优化实验（R-9a ~ R-9d）已在后台启动");
+        result.put("message", "TopK 参数优化实验（R-6a ~ R-6d）已在后台启动");
         return ApiResponse.success(result);
     }
 
     /**
-     * 获取预设的实验配置列表
+     * 启动 RRF_K 参数优化实验（异步，R-7a ~ R-7d）
+     */
+    @PostMapping("/run-rrfk")
+    public ApiResponse<Map<String, Object>> runRrfKExperiments(@UserId String userId) {
+        log.info("启动 RRF_K 参数优化实验: userId={}", userId);
+        ablationExperimentService.runRrfKExperiments(userId);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "started");
+        result.put("message", "RRF_K 参数优化实验（R-7a ~ R-7d）已在后台启动");
+        return ApiResponse.success(result);
+    }
+
+    /**
+     * 获取 TopK 参数实验结果（R-6a ~ R-6d）
+     */
+    @GetMapping("/report/topk")
+    public ApiResponse<List<Map<String, Object>>> getTopKResults(@UserId String userId) {
+        return ApiResponse.success(ablationExperimentService.getParameterExperimentResults(userId, "R-6"));
+    }
+
+    /**
+     * 获取 RRF_K 参数实验结果（R-7a ~ R-7d）
+     */
+    @GetMapping("/report/rrfk")
+    public ApiResponse<List<Map<String, Object>>> getRrfKResults(@UserId String userId) {
+        return ApiResponse.success(ablationExperimentService.getParameterExperimentResults(userId, "R-7"));
+    }
+
+    /**
+     * 获取预设的实验配置列表（RAG Pipeline 消融 + 参数实验）
      */
     @GetMapping("/experiments")
     public ApiResponse<List<Map<String, String>>> listExperiments() {
         List<Map<String, String>> list = new ArrayList<>();
-        // 基线
-        AblationConfig baseline = AblationConfig.baseline();
+
+        // RAG Pipeline 消融实验
         list.add(Map.of(
-                "experimentId", baseline.getExperimentId(),
-                "experimentName", baseline.getExperimentName(),
-                "ablationComponent", baseline.getAblationComponent()
+                "category", "RAG Pipeline 消融实验",
+                "experimentId", "BASELINE",
+                "experimentName", "完整 RAG Pipeline",
+                "ablationComponent", "none"
         ));
-        // R-1 ~ R-7 模块消融
         for (AblationConfig config : AblationConfig.allRagExperiments()) {
             list.add(Map.of(
+                    "category", "RAG Pipeline 消融实验",
                     "experimentId", config.getExperimentId(),
                     "experimentName", config.getExperimentName(),
                     "ablationComponent", config.getAblationComponent()
             ));
         }
-        // R-8 chunk size 实验
-        for (AblationConfig config : AblationConfig.chunkSizeExperiments()) {
+
+        // 索引参数实验（独立，不属于消融）
+        for (AblationConfig config : AblationConfig.rrfKExperiments()) {
             list.add(Map.of(
+                    "category", "索引参数实验",
                     "experimentId", config.getExperimentId(),
                     "experimentName", config.getExperimentName(),
                     "ablationComponent", config.getAblationComponent()
             ));
         }
-        // R-9 topK 实验
         for (AblationConfig config : AblationConfig.topKExperiments()) {
             list.add(Map.of(
+                    "category", "索引参数实验",
                     "experimentId", config.getExperimentId(),
                     "experimentName", config.getExperimentName(),
                     "ablationComponent", config.getAblationComponent()

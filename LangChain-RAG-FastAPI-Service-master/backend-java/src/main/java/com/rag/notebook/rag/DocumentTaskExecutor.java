@@ -28,7 +28,7 @@ public class DocumentTaskExecutor {
 
     private static final Duration CHROMA_TIMEOUT = Duration.ofMinutes(2);
     private static final int CHROMA_WRITE_RETRIES = 3;
-    private static final int EMBEDDING_BATCH_SIZE = 3;
+    private static final int EMBEDDING_BATCH_SIZE = 10;
     private static final int EMBEDDING_RETRIES = 5;
     private static final long EMBEDDING_RETRY_BASE_DELAY_MS = 1000L;
 
@@ -115,7 +115,6 @@ public class DocumentTaskExecutor {
                 meta.put("retrieval_text", retrievalText);
                 meta.put("content_type", chunk.getContentType());
                 meta.put("section_path", chunk.getSectionPath());
-                if (chunk.getParentId() != null) meta.put("parent_id", chunk.getParentId());
                 if (chunk.getPageStart() != null) meta.put("page_start", chunk.getPageStart());
                 if (chunk.getPageEnd() != null) meta.put("page_end", chunk.getPageEnd());
 

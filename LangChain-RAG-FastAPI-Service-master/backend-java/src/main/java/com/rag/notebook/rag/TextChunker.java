@@ -97,8 +97,10 @@ final class TextChunker {
         if (chunkOverlap <= 0) {
             return "";
         }
-        String value = chunk.toString().trim();
+        // 只掐掉开头的空白，保留原有的换行结构；如果对整体 trim() 会把结尾的 \n 削掉，
+        // 导致重叠内容和下一段拼接时两行粘连在一起（比如表格行/命令行被硬拼成一行）。
+        String value = chunk.toString();
         int start = Math.max(0, value.length() - chunkOverlap);
-        return value.substring(start);
+        return value.substring(start).stripLeading();
     }
 }

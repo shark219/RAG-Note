@@ -166,23 +166,34 @@ export const evaluationApi = {
   getReports: (params?: { page?: number; size?: number }) =>
     api.get('/evaluation/reports', { params }),
   getReport: (traceId: string) => api.get(`/evaluation/report/${traceId}`),
-  runBatch: (days?: number) => api.post('/evaluation/batch', null, { params: { days: days || 0 } }),
+  runBatch: (days?: number) => api.post('/evaluation/batch', null, { params: { days: days || 0 }, timeout: 180000 }),
   submitFeedback: (data: { traceId: string; score: number; reason?: string }) =>
     api.post('/evaluation/feedback', data),
   getTrend: (days?: number) => api.get('/evaluation/trend', { params: { days: days || 14 } }),
   getDistribution: (days?: number) => api.get('/evaluation/distribution', { params: { days: days || 30 } }),
   getDiagnosisStats: (days?: number) => api.get('/evaluation/diagnosis-stats', { params: { days: days || 30 } }),
   getLowScores: () => api.get('/evaluation/low-scores'),
+  clearLowScores: () => api.delete('/evaluation/low-scores'),
   generateTestCases: (count?: number) =>
     api.post('/evaluation/test-cases/generate', null, { params: { count: count || 10 } }),
   getTestCases: () => api.get('/evaluation/test-cases'),
+  createTestCase: (data: { question: string; sourceType: string; docId?: string; noteId?: string }) =>
+    api.post('/evaluation/test-cases', data, { timeout: 180000 }),
+  updateTestCase: (id: number, data: { question: string; sourceType: string; docId?: string; noteId?: string }) =>
+    api.put(`/evaluation/test-cases/${id}`, data, { timeout: 180000 }),
   deleteTestCase: (id: number) => api.delete(`/evaluation/test-cases/${id}`),
   deleteTestCases: (ids: number[]) => api.delete('/evaluation/test-cases/batch', { data: ids }),
   dedupTestCases: () => api.post('/evaluation/test-cases/dedup'),
-  runRegression: () => api.post('/evaluation/regression'),
+  runRegression: () => api.post('/evaluation/regression', null, { timeout: 180000 }),
 
   // 消融实验
   getAblationExperiments: () => api.get('/evaluation/ablation/experiments'),
   runAblationAll: () => api.post('/evaluation/ablation/run-all'),
   getAblationReport: () => api.get('/evaluation/ablation/report'),
+  getAblationReportByRunId: (runId: string) => api.get(`/evaluation/ablation/report/${runId}`),
+  getAblationRuns: () => api.get('/evaluation/ablation/runs'),
+  runTopKExperiments: () => api.post('/evaluation/ablation/run-topk'),
+  runRrfKExperiments: () => api.post('/evaluation/ablation/run-rrfk'),
+  getTopKResults: () => api.get('/evaluation/ablation/report/topk'),
+  getRrfKResults: () => api.get('/evaluation/ablation/report/rrfk'),
 }

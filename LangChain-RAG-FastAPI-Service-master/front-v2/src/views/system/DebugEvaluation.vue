@@ -341,6 +341,10 @@
               </template>
               <template #extra>
                 <a-space>
+                  <a-button size="small" type="primary" @click="openCreateModal">
+                    <template #icon><icon-plus /></template>
+                    新增
+                  </a-button>
                   <a-button size="small" status="warning" @click="handleDedupTestCases" :loading="deduping">
                     <template #icon><icon-common /></template>
                     去重
@@ -350,12 +354,19 @@
               <div v-if="testCases.length > 0" class="testcase-list">
                 <div v-for="tc in testCases" :key="tc.id" class="testcase-item">
                   <div class="testcase-header">
-                    <a-tag size="small" :color="tc.difficulty === 'simple' ? 'green' : tc.difficulty === 'medium' ? 'blue' : 'red'">
-                      {{ tc.difficulty || 'simple' }}
-                    </a-tag>
-                    <a-button type="text" size="mini" status="danger" @click="handleDeleteTestCase(tc.id)">
-                      删除
-                    </a-button>
+                    <a-space>
+                      <a-tag size="small" :color="tc.difficulty === 'simple' ? 'green' : tc.difficulty === 'medium' ? 'blue' : 'red'">
+                        {{ tc.difficulty || 'simple' }}
+                      </a-tag>
+                      <a-tag v-if="tc.sourceType === 'note'" size="small" color="arcoblue">笔记</a-tag>
+                      <a-tag v-else-if="tc.sourceType === 'doc'" size="small" color="purple">文档</a-tag>
+                    </a-space>
+                    <a-space>
+                      <a-button type="text" size="mini" @click="openEditModal(tc)">编辑</a-button>
+                      <a-button type="text" size="mini" status="danger" @click="handleDeleteTestCase(tc.id)">
+                        删除
+                      </a-button>
+                    </a-space>
                   </div>
                   <div class="testcase-question">{{ tc.question }}</div>
                   <div class="testcase-date">{{ formatDate(tc.createdAt) }}</div>
@@ -365,7 +376,16 @@
             </a-card>
 
             <!-- 低分样本 -->
-            <a-card :title="`低分样本（${lowScores.length}）`" class="section-card">
+            <a-card class="section-card">
+              <template #title>
+                <span>低分样本（{{ lowScores.length }}）</span>
+              </template>
+              <template #extra>
+                <a-button size="small" status="danger" :disabled="lowScores.length === 0" @click="handleClearLowScores">
+                  <template #icon><icon-delete /></template>
+                  清空
+                </a-button>
+              </template>
               <div v-if="lowScores.length > 0" class="low-score-list">
                 <div v-for="item in lowScores" :key="item.id" class="low-score-item" @click="showDetail(item)">
                   <div class="low-score-header">
@@ -400,19 +420,35 @@
           </a-col>
           <a-col :xs="12" :sm="12" :lg="6">
             <a-card class="stat-card">
-              <div v-if="mostImpactfulComponent" style="font-size:13px; color: var(--color-text-3);">影响最大组件</div>
-              <div v-if="mostImpactfulComponent" style="font-size:16px; font-weight:600;">{{ mostImpactfulComponent }}</div>
-              <div v-else style="color: var(--color-text-4);">-</div>
+              <a-statistic title="影响最大组件" :value="mostImpactfulComponent || '-'" />
             </a-card>
           </a-col>
           <a-col :xs="12" :sm="12" :lg="6">
             <a-card class="stat-card">
-              <div v-if="ablationReport.baseline" style="font-size:13px; color: var(--color-text-3);">测试用例数</div>
-              <div v-if="ablationReport.baseline" style="font-size:16px; font-weight:600;">{{ ablationReport.baseline.testCaseCount || '-' }}</div>
-              <div v-else style="color: var(--color-text-4);">-</div>
+              <a-statistic title="测试用例数" :value="ablationReport.baseline?.testCaseCount ?? '-'" />
             </a-card>
           </a-col>
         </a-row>
+
+        <!-- 实验总结 -->
+        <a-card v-if="ablationReport.runId" class="section-card">
+          <a-row :gutter="16" align="center">
+            <a-col :span="12">
+              <div style="font-size:13px; color: var(--color-text-3);">Run ID</div>
+              <div style="font-size:14px; font-family: monospace;">{{ ablationReport.runId?.slice(0, 8) }}...</div>
+            </a-col>
+            <a-col :span="6">
+              <div style="font-size:13px; color: var(--color-text-3);">状态</div>
+              <a-tag :color="ablationReport.runStatus === 'SUCCESS' ? 'green' : ablationReport.runStatus === 'RUNNING' ? 'blue' : 'red'" size="small">
+                {{ ablationReport.runStatus }}
+              </a-tag>
+            </a-col>
+            <a-col :span="6">
+              <div style="font-size:13px; color: var(--color-text-3);">完成时间</div>
+              <div style="font-size:13px;">{{ formatDate(ablationReport.runFinishedAt) || '-' }}</div>
+            </a-col>
+          </a-row>
+        </a-card>
 
         <!-- 实验总结 -->
         <a-card v-if="ablationReport.summary" title="实验总结" class="section-card">
@@ -424,10 +460,20 @@
           <a-col :xs="24" :md="16">
             <a-card :title="`实验结果对比（${ablationExperiments.length} 组）`" class="section-card">
               <div v-if="ablationExperiments.length > 0">
-                <a-table :data="ablationExperiments" :pagination="false" :bordered="false" size="small">
+                <a-table :data="ablationTableRows" :pagination="false" :bordered="false" size="small"
+                         :scroll="{ x: 1180 }"
+                         :row-class="(record: any) => record.isBaseline ? 'baseline-row' : ''">
                   <template #columns>
-                    <a-table-column title="编号" data-index="experimentId" :width="60" />
-                    <a-table-column title="实验名称" data-index="experimentName" :width="180" />
+                    <a-table-column title="编号" :width="60" fixed="left">
+                      <template #cell="{ record }">
+                        {{ record.isBaseline ? 'R-0' : record.experimentId }}
+                      </template>
+                    </a-table-column>
+                    <a-table-column title="实验名称" :width="170" fixed="left">
+                      <template #cell="{ record }">
+                        {{ record.isBaseline ? '完整流水线（基线）' : record.experimentName }}
+                      </template>
+                    </a-table-column>
                     <a-table-column title="综合得分" :width="90" align="center">
                       <template #cell="{ record }">
                         <span :style="{ color: (record.compositeScore || 0) < 0.5 ? 'var(--color-danger-6)' : 'var(--color-text-1)' }">
@@ -463,6 +509,31 @@
                         {{ record.contextRecall != null ? formatPercent(record.contextRecall) : '-' }}
                       </template>
                     </a-table-column>
+                    <a-table-column title="总耗时" :width="90" align="center">
+                      <template #cell="{ record }">
+                        {{ formatMs(record.avgLatencyMs) }}
+                      </template>
+                    </a-table-column>
+                    <a-table-column title="检索耗时" :width="90" align="center">
+                      <template #cell="{ record }">
+                        {{ formatMs(record.avgRetrievalLatencyMs) }}
+                      </template>
+                    </a-table-column>
+                    <a-table-column title="文档数" :width="80" align="center">
+                      <template #cell="{ record }">
+                        {{ record.avgDocCount != null ? record.avgDocCount.toFixed(1) : '-' }}
+                      </template>
+                    </a-table-column>
+                    <a-table-column title="QE Token" :width="90" align="center">
+                      <template #cell="{ record }">
+                        {{ record.avgQueryExpansionTokens != null ? record.avgQueryExpansionTokens : '-' }}
+                      </template>
+                    </a-table-column>
+                    <a-table-column title="生成Token" :width="90" align="center">
+                      <template #cell="{ record }">
+                        {{ record.avgGenerationTokens != null ? record.avgGenerationTokens : '-' }}
+                      </template>
+                    </a-table-column>
                     <a-table-column title="关键发现" data-index="keyFindings" :ellipsis="true" :min-width="200">
                       <template #cell="{ record }">
                         <a-tooltip :content="record.keyFindings || ''">
@@ -479,6 +550,111 @@
                 </a-button>
               </a-empty>
             </a-card>
+
+            <!-- TopK 参数实验结果（表格形式，参考消融实验表格） -->
+            <a-card v-if="topKResults.length > 0" title="TopK 参数实验结果" class="section-card">
+              <a-table :data="topKResults" :pagination="false" :bordered="false" size="small">
+                <template #columns>
+                  <a-table-column title="编号" data-index="experimentId" :width="70" />
+                  <a-table-column title="实验名称" data-index="experimentName" :width="140" />
+                  <a-table-column title="综合得分" :width="90" align="center">
+                    <template #cell="{ record }">
+                      {{ record.compositeScore != null ? (record.compositeScore * 100).toFixed(1) : '-' }}
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="Δ 得分" :width="90" align="center">
+                    <template #cell="{ record }">
+                  <span v-if="record.deltaScore != null" :style="{ color: record.deltaScore < -0.01 ? '#f53f3f' : record.deltaScore > 0.01 ? '#00b42a' : 'var(--color-text-1)', fontWeight: 600 }">
+                    {{ record.deltaScore > 0 ? '+' : '' }}{{ (record.deltaScore * 100).toFixed(1) }}%
+                  </span>
+                      <span v-else>-</span>
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="忠实度" :width="80" align="center">
+                    <template #cell="{ record }">{{ formatPercent(record.faithfulness) }}</template>
+                  </a-table-column>
+                  <a-table-column title="相关性" :width="80" align="center">
+                    <template #cell="{ record }">{{ formatPercent(record.answerRelevancy) }}</template>
+                  </a-table-column>
+                  <a-table-column title="精确度" :width="80" align="center">
+                    <template #cell="{ record }">{{ formatPercent(record.contextPrecision) }}</template>
+                  </a-table-column>
+                  <a-table-column title="召回率" :width="80" align="center">
+                    <template #cell="{ record }">
+                      {{ record.contextRecall != null ? formatPercent(record.contextRecall) : '-' }}
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="总耗时" :width="90" align="center">
+                    <template #cell="{ record }">{{ formatMs(record.avgLatencyMs) }}</template>
+                  </a-table-column>
+                  <a-table-column title="生成Token" :width="90" align="center">
+                    <template #cell="{ record }">
+                      {{ record.avgGenerationTokens != null ? record.avgGenerationTokens : '-' }}
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="关键发现" data-index="keyFindings" :ellipsis="true" :min-width="200">
+                    <template #cell="{ record }">
+                      <a-tooltip :content="record.keyFindings || ''">
+                        <span class="finding-text">{{ record.keyFindings || '-' }}</span>
+                      </a-tooltip>
+                    </template>
+                  </a-table-column>
+                </template>
+              </a-table>
+            </a-card>
+
+            <!-- RRF_K 参数实验结果（表格形式，参考消融实验表格） -->
+            <a-card v-if="rrfKResults.length > 0" title="RRF_K 参数实验结果" class="section-card">
+              <a-table :data="rrfKResults" :pagination="false" :bordered="false" size="small">
+                <template #columns>
+                  <a-table-column title="编号" data-index="experimentId" :width="70" />
+                  <a-table-column title="实验名称" data-index="experimentName" :width="140" />
+                  <a-table-column title="综合得分" :width="90" align="center">
+                    <template #cell="{ record }">
+                      {{ record.compositeScore != null ? (record.compositeScore * 100).toFixed(1) : '-' }}
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="Δ 得分" :width="90" align="center">
+                    <template #cell="{ record }">
+                  <span v-if="record.deltaScore != null" :style="{ color: record.deltaScore < -0.01 ? '#f53f3f' : record.deltaScore > 0.01 ? '#00b42a' : 'var(--color-text-1)', fontWeight: 600 }">
+                    {{ record.deltaScore > 0 ? '+' : '' }}{{ (record.deltaScore * 100).toFixed(1) }}%
+                  </span>
+                      <span v-else>-</span>
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="忠实度" :width="80" align="center">
+                    <template #cell="{ record }">{{ formatPercent(record.faithfulness) }}</template>
+                  </a-table-column>
+                  <a-table-column title="相关性" :width="80" align="center">
+                    <template #cell="{ record }">{{ formatPercent(record.answerRelevancy) }}</template>
+                  </a-table-column>
+                  <a-table-column title="精确度" :width="80" align="center">
+                    <template #cell="{ record }">{{ formatPercent(record.contextPrecision) }}</template>
+                  </a-table-column>
+                  <a-table-column title="召回率" :width="80" align="center">
+                    <template #cell="{ record }">
+                      {{ record.contextRecall != null ? formatPercent(record.contextRecall) : '-' }}
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="总耗时" :width="90" align="center">
+                    <template #cell="{ record }">{{ formatMs(record.avgLatencyMs) }}</template>
+                  </a-table-column>
+                  <a-table-column title="生成Token" :width="90" align="center">
+                    <template #cell="{ record }">
+                      {{ record.avgGenerationTokens != null ? record.avgGenerationTokens : '-' }}
+                    </template>
+                  </a-table-column>
+                  <a-table-column title="关键发现" data-index="keyFindings" :ellipsis="true" :min-width="200">
+                    <template #cell="{ record }">
+                      <a-tooltip :content="record.keyFindings || ''">
+                        <span class="finding-text">{{ record.keyFindings || '-' }}</span>
+                      </a-tooltip>
+                    </template>
+                  </a-table-column>
+                </template>
+              </a-table>
+            </a-card>
+
           </a-col>
 
           <!-- 右列 -->
@@ -532,9 +708,9 @@
             </a-card>
 
             <!-- 实验配置说明 -->
-            <a-card title="实验配置说明" class="section-card">
+            <a-card title="RAG Pipeline 消融实验" class="section-card">
               <div class="config-list">
-                <div v-for="cfg in ablationConfigs" :key="cfg.experimentId" class="config-item">
+                <div v-for="cfg in ragAblationConfigs" :key="cfg.experimentId" class="config-item">
                   <a-tag size="small" :color="cfg.experimentId === 'BASELINE' ? 'green' : 'arcoblue'">
                     {{ cfg.experimentId }}
                   </a-tag>
@@ -542,8 +718,25 @@
                   <span class="config-component">{{ cfg.ablationComponent }}</span>
                 </div>
               </div>
-              <div v-if="ablationConfigs.length === 0" style="color: var(--color-text-4); font-size: 13px;">
+              <div v-if="ragAblationConfigs.length === 0" style="color: var(--color-text-4); font-size: 13px;">
                 点击"执行全部消融实验"后查看配置
+              </div>
+            </a-card>
+
+            <!-- 索引参数实验（独立） -->
+            <a-card v-if="paramExperimentConfigs.length > 0" title="索引参数实验（独立）" class="section-card">
+              <template #extra>
+                <a-space>
+                  <a-button size="small" @click="handleRunTopK" :loading="topKRunning">跑 TopK</a-button>
+                  <a-button size="small" @click="handleRunRrfK" :loading="rrfKRunning">跑 RRF_K</a-button>
+                </a-space>
+              </template>
+              <div class="config-list">
+                <div v-for="cfg in paramExperimentConfigs" :key="cfg.experimentId" class="config-item">
+                  <a-tag size="small" color="purple">{{ cfg.experimentId }}</a-tag>
+                  <span class="config-name">{{ cfg.experimentName }}</span>
+                  <span class="config-component">{{ cfg.ablationComponent }}</span>
+                </div>
               </div>
             </a-card>
 
@@ -577,14 +770,47 @@
         </div>
       </div>
     </a-modal>
+
+    <!-- 测试用例新增/编辑弹窗 -->
+    <a-modal v-model:visible="testCaseModalVisible" :title="editingId ? '编辑测试用例' : '新增测试用例'" :width="560" @before-ok="handleSaveTestCase">
+      <a-form :model="tcForm" layout="vertical">
+        <a-form-item label="问题（Question）" required>
+          <a-textarea v-model="tcForm.question" :rows="3" placeholder="请输入测试问题" />
+        </a-form-item>
+        <a-form-item label="来源类型" required>
+          <a-radio-group v-model="tcForm.sourceType" type="button">
+            <a-radio value="doc">知识库文档</a-radio>
+            <a-radio value="note">笔记</a-radio>
+          </a-radio-group>
+        </a-form-item>
+        <a-form-item label="来源" required>
+          <a-select
+            v-if="tcForm.sourceType === 'doc'"
+            v-model="tcForm.docId"
+            :options="docOptions"
+            placeholder="请选择知识库文档"
+            allow-search
+            allow-clear
+          />
+          <a-select
+            v-else
+            v-model="tcForm.noteId"
+            :options="noteOptions"
+            placeholder="请选择笔记"
+            allow-search
+            allow-clear
+          />
+        </a-form-item>
+      </a-form>
+    </a-modal>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
-import { IconPlayArrow, IconPlus, IconRefresh, IconCommon } from '@arco-design/web-vue/es/icon'
-import { evaluationApi } from '@/api'
+import { IconPlayArrow, IconPlus, IconRefresh, IconCommon, IconDelete } from '@arco-design/web-vue/es/icon'
+import { evaluationApi, knowledgeApi, noteApi } from '@/api'
 import dayjs from 'dayjs'
 
 // ========== 标签切换 ==========
@@ -602,6 +828,8 @@ function onTabChange(key: string | number) {
   } else if (key === 'ablation') {
     fetchAblationReport()
     fetchAblationConfigs()
+    fetchTopKResults()
+    fetchRrfKResults()
   }
 }
 
@@ -626,6 +854,16 @@ const distribution = ref<any>({})
 const diagnosisStats = ref<any>({})
 const regressionResult = ref<any>(null)
 
+// 测试用例新增/编辑
+const testCaseModalVisible = ref(false)
+const editingId = ref<number | null>(null)
+const docOptions = ref<any[]>([])
+const noteOptions = ref<any[]>([])
+const tcForm = ref<{ question: string; sourceType: string; docId?: string; noteId?: string }>({
+  question: '',
+  sourceType: 'doc',
+})
+
 const detailVisible = ref(false)
 const selectedReport = ref<any>(null)
 
@@ -635,9 +873,31 @@ const ablationLoading = ref(false)
 const ablationReport = ref<any>({})
 const ablationConfigs = ref<any[]>([])
 
+// ========== 参数实验状态（TopK / RRF_K） ==========
+const topKRunning = ref(false)
+const rrfKRunning = ref(false)
+const topKResults = ref<any[]>([])
+const rrfKResults = ref<any[]>([])
+
 // ========== 消融计算属性 ==========
 const ablationExperiments = computed(() => {
   return ablationReport.value.experiments || []
+})
+
+// 表格展示用：基线 + 各实验行，基线固定在第一行方便对比
+const ablationTableRows = computed(() => {
+  const baseline = ablationReport.value.baseline
+  const rows = ablationExperiments.value
+  if (!baseline) return rows
+  return [{ ...baseline, isBaseline: true }, ...rows]
+})
+
+const ragAblationConfigs = computed(() => {
+  return ablationConfigs.value.filter((c: any) => c.category === 'RAG Pipeline 消融实验')
+})
+
+const paramExperimentConfigs = computed(() => {
+  return ablationConfigs.value.filter((c: any) => c.category === '索引参数实验')
 })
 
 const baselineScoreNum = computed(() => {
@@ -761,17 +1021,69 @@ async function fetchAblationConfigs() {
   }
 }
 
+async function fetchTopKResults() {
+  try {
+    const res: any = await evaluationApi.getTopKResults()
+    topKResults.value = res?.data || res || []
+  } catch (e) {
+    console.error('获取 TopK 参数实验结果失败', e)
+  }
+}
+
+async function fetchRrfKResults() {
+  try {
+    const res: any = await evaluationApi.getRrfKResults()
+    rrfKResults.value = res?.data || res || []
+  } catch (e) {
+    console.error('获取 RRF_K 参数实验结果失败', e)
+  }
+}
+
+async function handleRunTopK() {
+  topKRunning.value = true
+  try {
+    const res: any = await evaluationApi.runTopKExperiments()
+    const data = res?.data || res
+    Message.success(data.message || 'TopK 参数实验已在后台启动')
+    setTimeout(() => {
+      fetchTopKResults()
+    }, 5000)
+  } catch (e) {
+    Message.error('启动 TopK 参数实验失败')
+  } finally {
+    topKRunning.value = false
+  }
+}
+
+async function handleRunRrfK() {
+  rrfKRunning.value = true
+  try {
+    const res: any = await evaluationApi.runRrfKExperiments()
+    const data = res?.data || res
+    Message.success(data.message || 'RRF_K 参数实验已在后台启动')
+    setTimeout(() => {
+      fetchRrfKResults()
+    }, 5000)
+  } catch (e) {
+    Message.error('启动 RRF_K 参数实验失败')
+  } finally {
+    rrfKRunning.value = false
+  }
+}
+
 // ========== 操作 ==========
 async function handleRunBatch() {
   evaluating.value = true
   try {
     const res: any = await evaluationApi.runBatch(7)
     const data = res?.data || res
-    Message.success(`评估完成: ${data.evaluated}/${data.total}`)
-    await loadOverview()
-    await loadQuality()
+    Message.success(data.message || `评估已在后台启动: 共 ${data.total} 条`)
+    setTimeout(async () => {
+      await loadOverview()
+      await loadQuality()
+    }, 5000)
   } catch (e) {
-    Message.error('评估失败')
+    Message.error('启动批量评估失败')
   } finally {
     evaluating.value = false
   }
@@ -832,6 +1144,110 @@ async function handleDedupTestCases() {
   }
 }
 
+// ========== 低分样本清空 ==========
+async function handleClearLowScores() {
+  Modal.confirm({
+    title: '确认清空',
+    content: '确定要清空当前用户的低分样本吗？此操作不可恢复。清空后重新评估将得到最新流程的结果。',
+    okText: '确定',
+    cancelText: '取消',
+    onOk: async () => {
+      try {
+        const res: any = await evaluationApi.clearLowScores()
+        const data = res?.data || res
+        Message.success(`已清空 ${data.deleted || 0} 条低分样本`)
+        await fetchLowScores()
+        await fetchStats()
+      } catch (e) {
+        Message.error('清空失败')
+      }
+    },
+  })
+}
+
+// ========== 测试用例新增/编辑 ==========
+async function loadSourceOptions() {
+  try {
+    const docRes: any = await knowledgeApi.list()
+    const docs = docRes?.data?.documents || docRes?.documents || []
+    docOptions.value = docs.map((d: any) => ({
+      label: d.originalFilename || d.filename || d.id,
+      value: d.id,
+    }))
+  } catch (e) {
+    console.error('加载知识库文档失败', e)
+  }
+  try {
+    const noteRes: any = await noteApi.list({ page: 1, pageSize: 500 })
+    const notes = noteRes?.data?.notes || noteRes?.notes || []
+    noteOptions.value = notes.map((n: any) => ({
+      label: n.title || n.id,
+      value: n.id,
+    }))
+  } catch (e) {
+    console.error('加载笔记失败', e)
+  }
+}
+
+async function openCreateModal() {
+  editingId.value = null
+  tcForm.value = { question: '', sourceType: 'doc' }
+  await loadSourceOptions()
+  testCaseModalVisible.value = true
+}
+
+async function openEditModal(tc: any) {
+  editingId.value = tc.id
+  tcForm.value = {
+    question: tc.question || '',
+    sourceType: tc.sourceType === 'note' ? 'note' : 'doc',
+    docId: tc.docId || undefined,
+    noteId: tc.noteId || undefined,
+  }
+  await loadSourceOptions()
+  testCaseModalVisible.value = true
+}
+
+async function handleSaveTestCase() {
+  const form = tcForm.value
+  if (!form.question || !form.question.trim()) {
+    Message.warning('请输入问题')
+    return false
+  }
+  if (form.sourceType === 'doc' && !form.docId) {
+    Message.warning('请选择知识库文档')
+    return false
+  }
+  if (form.sourceType === 'note' && !form.noteId) {
+    Message.warning('请选择笔记')
+    return false
+  }
+  const payload = {
+    question: form.question.trim(),
+    sourceType: form.sourceType,
+    docId: form.sourceType === 'doc' ? form.docId : undefined,
+    noteId: form.sourceType === 'note' ? form.noteId : undefined,
+  }
+  try {
+    let res: any
+    if (editingId.value) {
+      res = await evaluationApi.updateTestCase(editingId.value, payload)
+    } else {
+      res = await evaluationApi.createTestCase(payload)
+    }
+    if (res && typeof res.code === 'number' && res.code !== 200) {
+      Message.error(res.message || '保存失败')
+      return false
+    }
+    Message.success(editingId.value ? '更新成功' : '创建成功')
+    await fetchTestCases()
+    return true
+  } catch (e) {
+    Message.error('保存失败')
+    return false
+  }
+}
+
 async function handleRegression() {
   regressing.value = true
   try {
@@ -875,6 +1291,13 @@ function formatPercent(val: number | null | undefined) {
   if (val == null) return '-'
   return (val * 100).toFixed(0) + '%'
 }
+
+function formatMs(val: number | null | undefined) {
+  if (val == null) return '-'
+  if (val >= 1000) return (val / 1000).toFixed(1) + 's'
+  return val + 'ms'
+}
+
 
 function formatDate(date: string) {
   if (!date) return '-'

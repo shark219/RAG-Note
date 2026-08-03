@@ -23,14 +23,17 @@ import java.util.stream.Collectors;
 @Service
 public class HybridRetriever {
 
-    /** RRF 公式中的常数 k，通常取 60 */
-    private static final int RRF_K = 30;
+    /** RRF 公式中的常数 k 默认值，通常取 60 */
+    private static final int DEFAULT_RRF_K = 30;
 
     private final VectorStoreService vectorStoreService;
     private final Bm25Service bm25Service;
     private final QueryExpander queryExpander;
     private final RerankerService rerankerService;
     private final ApplicationProperties props;
+
+    /** 最近一次检索的 Query Expansion Token 消耗 */
+    private volatile int lastQueryExpansionTokens = 0;
 
     public HybridRetriever(VectorStoreService vectorStoreService,
                            Bm25Service bm25Service,
@@ -42,6 +45,16 @@ public class HybridRetriever {
         this.queryExpander = queryExpander;
         this.rerankerService = rerankerService;
         this.props = props;
+    }
+
+    /** 获取最近一次检索中 Query Expansion 消耗的 Token 数 */
+    public int getLastQueryExpansionTokens() {
+        return lastQueryExpansionTokens;
+    }
+
+    /** 重置 Query Expansion Token 计数（每次检索前调用） */
+    public void resetQueryExpansionTokens() {
+        lastQueryExpansionTokens = 0;
     }
 
     // ==================== 公开接口（无消融配置，使用默认配置） ====================
@@ -82,14 +95,18 @@ public class HybridRetriever {
         boolean useRrf = isEnabled(config, c -> c.isRrfFusionEnabled(), props.getAblation().getRag().isRrfFusionEnabled());
         boolean useRerank = isEnabled(config, c -> c.isRerankEnabled(), props.getAblation().getRag().isRerankEnabled());
         int effectiveTopK = config != null && config.getTopK() != null ? config.getTopK() : topK;
+        int effectiveRrfK = config != null && config.getRrfK() != null ? config.getRrfK() : DEFAULT_RRF_K;
         Set<String> selectedKnowledgeDocs = normalizeIdentifiers(knowledgeDocIdentifiers);
 
         // 1. Query 扩展
         List<String> queries = expandQuery
                 ? queryExpander.expand(query)
                 : List.of(query);
-        log.info("知识库混合检索: query='{}', expand={}, vector={}, bm25={}, rrf={}, rerank={}, queries={}",
-                truncate(query, 30), expandQuery, useVector, useBm25, useRrf, useRerank, queries.size());
+        if (expandQuery) {
+            lastQueryExpansionTokens += queryExpander.getLastExpansionTokens();
+        }
+        log.info("知识库混合检索: query='{}', expand={}, vector={}, bm25={}, rrf={}, rerank={}, queries={}, qeTokens={}",
+                truncate(query, 30), expandQuery, useVector, useBm25, useRrf, useRerank, queries.size(), lastQueryExpansionTokens);
 
         // 2. 收集各路检索结果
         if (!selectedKnowledgeDocs.isEmpty()) {
@@ -119,7 +136,7 @@ public class HybridRetriever {
         // 3. 融合（RRF 或简单拼接）
         List<Map<String, Object>> fused;
         if (useRrf && allRankings.size() > 1) {
-            fused = rrfFusion(allRankings, effectiveTopK * 2);
+            fused = rrfFusion(allRankings, effectiveTopK * 2, effectiveRrfK);
         } else {
             fused = simpleMerge(allRankings, effectiveTopK * 2);
         }
@@ -151,8 +168,11 @@ public class HybridRetriever {
         List<String> queries = expandQuery
                 ? queryExpander.expand(query)
                 : List.of(query);
-        log.info("笔记混合检索: query='{}', expand={}, vector={}, bm25={}, rrf={}, rerank={}, queries={}",
-                truncate(query, 30), expandQuery, useVector, useBm25, useRrf, useRerank, queries.size());
+        if (expandQuery) {
+            lastQueryExpansionTokens += queryExpander.getLastExpansionTokens();
+        }
+        log.info("笔记混合检索: query='{}', expand={}, vector={}, bm25={}, rrf={}, rerank={}, queries={}, qeTokens={}",
+                truncate(query, 30), expandQuery, useVector, useBm25, useRrf, useRerank, queries.size(), lastQueryExpansionTokens);
 
         List<List<Map<String, Object>>> allRankings = new ArrayList<>();
 
@@ -176,7 +196,7 @@ public class HybridRetriever {
 
         List<Map<String, Object>> fused;
         if (useRrf && allRankings.size() > 1) {
-            fused = rrfFusion(allRankings, effectiveTopK * 2);
+            fused = rrfFusion(allRankings, effectiveTopK * 2, DEFAULT_RRF_K);
         } else {
             fused = simpleMerge(allRankings, effectiveTopK * 2);
         }
@@ -196,8 +216,10 @@ public class HybridRetriever {
 
     /**
      * RRF (Reciprocal Rank Fusion) 融合算法
+     *
+     * @param rrfK RRF 公式中的常数 k，用于控制排名靠后结果的分数衰减速度（支持消融/参数实验）
      */
-    private List<Map<String, Object>> rrfFusion(List<List<Map<String, Object>>> allRankings, int topK) {
+    private List<Map<String, Object>> rrfFusion(List<List<Map<String, Object>>> allRankings, int topK, int rrfK) {
         Map<String, Double> rrfScores = new HashMap<>();
         Map<String, Map<String, Object>> docCache = new HashMap<>();
 
@@ -205,7 +227,7 @@ public class HybridRetriever {
             for (int rank = 0; rank < ranking.size(); rank++) {
                 Map<String, Object> doc = ranking.get(rank);
                 String docKey = getDocKey(doc);
-                double rrfScore = 1.0 / (RRF_K + rank + 1);
+                double rrfScore = 1.0 / (rrfK + rank + 1);
                 rrfScores.merge(docKey, rrfScore, Double::sum);
                 docCache.putIfAbsent(docKey, doc);
             }

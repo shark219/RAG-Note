@@ -12,8 +12,6 @@ public class RagChunk {
     private String sectionPath = "";
     private Integer pageStart;
     private Integer pageEnd;
-    private Integer parentIndex;
-    private String parentId;
     private String previousChunkId;
     private String nextChunkId;
 
@@ -73,22 +71,6 @@ public class RagChunk {
         this.pageEnd = pageEnd;
     }
 
-    public Integer getParentIndex() {
-        return parentIndex;
-    }
-
-    public void setParentIndex(Integer parentIndex) {
-        this.parentIndex = parentIndex;
-    }
-
-    public String getParentId() {
-        return parentId;
-    }
-
-    public void setParentId(String parentId) {
-        this.parentId = parentId;
-    }
-
     public String getPreviousChunkId() {
         return previousChunkId;
     }
@@ -112,8 +94,6 @@ public class RagChunk {
         metadata.put("chunk_index", chunkIndex);
         if (pageStart != null) metadata.put("page_start", pageStart);
         if (pageEnd != null) metadata.put("page_end", pageEnd);
-        if (parentIndex != null) metadata.put("parent_index", parentIndex);
-        if (parentId != null) metadata.put("parent_id", parentId);
         if (previousChunkId != null) metadata.put("previous_chunk_id", previousChunkId);
         if (nextChunkId != null) metadata.put("next_chunk_id", nextChunkId);
         return metadata;
