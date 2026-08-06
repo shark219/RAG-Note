@@ -1,6 +1,7 @@
 package com.rag.notebook.rag;
 
 import com.rag.notebook.config.ApplicationProperties;
+import com.rag.notebook.knowledge.repository.KnowledgeDocumentRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
@@ -26,15 +27,15 @@ public class DocumentProcessor {
 
     private final ApplicationProperties props;
     private final VectorStoreService vectorStoreService;
-    private final Md5Store md5Store;
+    private final KnowledgeDocumentRepository documentRepository;
     private final DocumentTaskExecutor documentTaskExecutor;
     private final Tika tika = new Tika();
 
     public DocumentProcessor(ApplicationProperties props, VectorStoreService vectorStoreService,
-                             Md5Store md5Store, DocumentTaskExecutor documentTaskExecutor) {
+                             KnowledgeDocumentRepository documentRepository, DocumentTaskExecutor documentTaskExecutor) {
         this.props = props;
         this.vectorStoreService = vectorStoreService;
-        this.md5Store = md5Store;
+        this.documentRepository = documentRepository;
         this.documentTaskExecutor = documentTaskExecutor;
         this.tika.setMaxStringLength(MAX_EXTRACTED_TEXT_LENGTH);
     }
@@ -45,13 +46,9 @@ public class DocumentProcessor {
             progressCallback.accept("loading", originalFilename);
 
             String md5 = computeMd5(file);
-            if (md5Store.exists(md5, userId) && vectorStoreService.hasKnowledgeDocument(userId, md5)) {
+            if (documentRepository.existsByUserIdAndMd5(userId, md5)) {
                 progressCallback.accept("skipping", originalFilename);
                 return CompletableFuture.completedFuture(null);
-            }
-            if (md5Store.exists(md5, userId)) {
-                md5Store.deleteByMd5(md5, userId);
-                log.info("MD5 记录存在但向量数据丢失，清理后重新处理: {}", originalFilename);
             }
 
             progressCallback.accept("splitting", originalFilename);
@@ -80,10 +77,7 @@ public class DocumentProcessor {
                 return CompletableFuture.completedFuture(null);
             }
 
-            // 2. 保存MD5记录（同步，快速）
-            md5Store.save(md5, originalFilename, originalFilename, userId);
-
-            // 3. 异步 ChromaDB 写入（documentExecutor线程池，不占用事务连接）
+            // 2. 异步 ChromaDB 写入（documentExecutor线程池，不占用事务连接）
             //    完成后自动回调"completed"/"error"事件
             return documentTaskExecutor.writeToChromaAsync(userId, originalFilename, md5, docId, chunks, progressCallback);
 

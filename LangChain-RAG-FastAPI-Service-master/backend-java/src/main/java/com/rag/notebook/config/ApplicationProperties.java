@@ -15,7 +15,6 @@ public class ApplicationProperties {
     private Vision vision = new Vision();
     private Chroma chroma = new Chroma();
     private Reranker reranker = new Reranker();
-    private Md5 md5 = new Md5();
     private String extractedImagesDir = "data/extracted_images";
     private RateLimit rateLimit = new RateLimit();
     private Evaluation evaluation = new Evaluation();
@@ -131,11 +130,6 @@ public class ApplicationProperties {
         private String model = "rerank";
         private double scoreThreshold = 0.5;
         private int topN = 5;
-    }
-
-    @Data
-    public static class Md5 {
-        private String storeDir = "data/md5_hex_store";
     }
 
     @Data

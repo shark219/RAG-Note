@@ -5,8 +5,8 @@ import com.rag.notebook.knowledge.dto.KnowledgeDocument;
 import com.rag.notebook.knowledge.dto.KnowledgeListResponse;
 import com.rag.notebook.knowledge.dto.MD5ListResponse;
 import com.rag.notebook.knowledge.dto.MD5Record;
+import com.rag.notebook.knowledge.repository.KnowledgeDocumentRepository;
 import com.rag.notebook.rag.DocumentProcessor;
-import com.rag.notebook.rag.Md5Store;
 import com.rag.notebook.rag.VectorStoreService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -29,15 +29,16 @@ public class KnowledgeService {
 
     private final VectorStoreService vectorStoreService;
     private final DocumentProcessor documentProcessor;
-    private final Md5Store md5Store;
+    private final KnowledgeDocumentRepository documentRepository;
     private final Executor taskExecutor;
 
     public KnowledgeService(VectorStoreService vectorStoreService,
-                            DocumentProcessor documentProcessor, Md5Store md5Store,
+                            DocumentProcessor documentProcessor,
+                            KnowledgeDocumentRepository documentRepository,
                             @Qualifier("taskExecutor") Executor taskExecutor) {
         this.vectorStoreService = vectorStoreService;
         this.documentProcessor = documentProcessor;
-        this.md5Store = md5Store;
+        this.documentRepository = documentRepository;
         this.taskExecutor = taskExecutor;
     }
 
@@ -215,25 +216,20 @@ public class KnowledgeService {
 
     public void cleanUserDocuments(String userId) {
         vectorStoreService.deleteUserKnowledge(userId);
-        md5Store.deleteByUser(userId);  // 同时删除MD5记录
     }
 
     public void clearMd5Records(String userId, boolean deleteDocuments) {
         if (deleteDocuments) {
             vectorStoreService.deleteUserKnowledge(userId);
         }
-        md5Store.deleteByUser(userId);
     }
 
     public void deleteMd5Record(String userId, String md5, boolean deleteDocuments) {
-        Map<String, String> record = md5Store.getRecord(md5, userId);
-        if (record == null) {
-            throw new BusinessException("MD5记录不存在");
-        }
+        com.rag.notebook.knowledge.entity.KnowledgeDocument doc = documentRepository.findByUserIdAndMd5(userId, md5)
+                .orElseThrow(() -> new BusinessException("MD5记录不存在"));
         if (deleteDocuments) {
-            vectorStoreService.deleteKnowledgeByFilename(userId, record.get("filename"));
+            vectorStoreService.deleteKnowledgeByFilename(userId, doc.getFilename());
         }
-        md5Store.deleteByMd5(md5, userId);
     }
 
     public void deleteByFilename(String userId, String filename, boolean deleteDocuments) {
@@ -243,17 +239,17 @@ public class KnowledgeService {
     }
 
     public MD5ListResponse listMd5Records(String userId) {
-        List<Map<String, String>> records = md5Store.getUserRecords(userId);
-        List<MD5Record> md5Records = records.stream()
-                .map(r -> new MD5Record(r.get("md5"), r.get("filename"), r.get("original_filename"), null))
+        List<com.rag.notebook.knowledge.entity.KnowledgeDocument> documents = documentRepository.findByUserIdOrderByCreatedAtDesc(userId);
+        List<MD5Record> md5Records = documents.stream()
+                .map(d -> new MD5Record(d.getMd5(), d.getFilename(), d.getOriginalFilename(), null))
                 .toList();
         return new MD5ListResponse(md5Records, md5Records.size());
     }
 
     public MD5Record getMd5Info(String userId, String md5) {
-        Map<String, String> record = md5Store.getRecord(md5, userId);
-        if (record == null) return null;
-        return new MD5Record(record.get("md5"), record.get("filename"), record.get("original_filename"), null);
+        return documentRepository.findByUserIdAndMd5(userId, md5)
+                .map(d -> new MD5Record(d.getMd5(), d.getFilename(), d.getOriginalFilename(), null))
+                .orElse(null);
     }
 
     public KnowledgeListResponse listDocuments(String userId) {

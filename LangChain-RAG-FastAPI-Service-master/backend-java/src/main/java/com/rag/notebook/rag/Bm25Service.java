@@ -96,7 +96,8 @@ public class Bm25Service {
 
             log.debug("BM25 indexed doc {} for user {}", docId, userId);
         } catch (IOException e) {
-            log.warn("BM25 failed to index doc: {}", e.getMessage());
+            log.error("BM25 failed to index doc, throwing to rollback transaction: {}", e.getMessage());
+            throw new RuntimeException("BM25 index write failed for doc " + docId, e);
         }
     }
 
@@ -176,6 +177,7 @@ public class Bm25Service {
             }
         } catch (IOException e) {
             log.warn("BM25 failed to delete docs: {}", e.getMessage());
+            // Delete failures are non-critical — data still exists, just stale index entries remain
         }
     }
 

@@ -59,7 +59,6 @@ public class VectorStoreService {
     private final KnowledgeDocumentChunkRepository chunkRepository;
     private final ChromaCleanupTaskRepository cleanupTaskRepository;
     private final StringRedisTemplate redisTemplate;
-    private final Md5Store md5Store;
     private final NoteChunkRepository noteChunkRepository;
     private final DocumentTaskExecutor documentTaskExecutor;
 
@@ -73,7 +72,6 @@ public class VectorStoreService {
                               KnowledgeDocumentChunkRepository chunkRepository,
                               ChromaCleanupTaskRepository cleanupTaskRepository,
                               StringRedisTemplate redisTemplate,
-                              Md5Store md5Store,
                               NoteChunkRepository noteChunkRepository,
                               DocumentTaskExecutor documentTaskExecutor) {
         this.props = props;
@@ -83,7 +81,6 @@ public class VectorStoreService {
         this.chunkRepository = chunkRepository;
         this.cleanupTaskRepository = cleanupTaskRepository;
         this.redisTemplate = redisTemplate;
-        this.md5Store = md5Store;
         this.noteChunkRepository = noteChunkRepository;
         this.documentTaskExecutor = documentTaskExecutor;
 
@@ -491,12 +488,10 @@ public class VectorStoreService {
      */
     @Transactional
     public void deleteKnowledgeByFilename(String userId, String filename) {
-        // 1. 先查找文档
+        // 1. 先查找文档（行级锁，防止并发删除）
         Optional<KnowledgeDocument> docOpt = documentRepository.findByUserIdAndFilenameForUpdate(userId, filename);
         if (docOpt.isEmpty()) {
-            log.warn("MySQL文档不存在，尝试清理MD5记录: userId={}, filename={}", userId, filename);
-            // 即使MySQL记录不存在，也要清理MD5记录（防止残留）
-            cleanMd5ByFilename(userId, filename);
+            log.warn("MySQL文档不存在: userId={}, filename={}", userId, filename);
             return;
         }
 
@@ -504,41 +499,25 @@ public class VectorStoreService {
         String docId = doc.getId();
         String md5 = doc.getMd5();
 
-        // 2. 尝试删除ChromaDB，失败则记录待清理任务
-        boolean chromaDeleted = deleteFromChromaByDocId(docId);
-        if (!chromaDeleted) {
-            log.error("ChromaDB删除失败，记录待清理任务: docId={}", docId);
-            saveCleanupTask(docId, userId, props.getChroma().getCollection());
-        }
-
-        // 3. 删除当前文档的BM25索引
+        // 2. 先删 BM25 + MySQL（事务内，任意失败都回滚）
         List<KnowledgeDocumentChunk> chunks = chunkRepository.findByDocumentIdOrderByChunkIndexAsc(docId);
         List<String> chunkKeys = new ArrayList<>();
         for (KnowledgeDocumentChunk chunk : chunks) {
             chunkKeys.add(md5 + "_" + chunk.getChunkIndex());
         }
         bm25Service.deleteDocuments(userId, chunkKeys);
-
-        // 4. 删除MySQL（无论ChromaDB是否成功）
         documentRepository.delete(doc);
 
-        // 5. 删除MD5记录
-        md5Store.deleteByMd5(md5, userId);
+        log.info("MySQL+BM25删除成功: userId={}, filename={}, docId={}", userId, filename, docId);
 
-        log.info("文档删除成功: userId={}, filename={}, docId={}, md5={}, chromaDeleted={}", userId, filename, docId, md5, chromaDeleted);
-    }
-
-    /**
-     * 根据文件名清理 MD5 记录（用于 MySQL 记录已不存在的情况）
-     */
-    private void cleanMd5ByFilename(String userId, String filename) {
-        List<Map<String, String>> records = md5Store.getUserRecords(userId);
-        for (Map<String, String> record : records) {
-            if (filename.equals(record.get("filename")) || filename.equals(record.get("original_filename"))) {
-                md5Store.deleteByMd5(record.get("md5"), userId);
-                log.info("已清理残留MD5记录: filename={}, md5={}", filename, record.get("md5"));
-            }
+        // 3. 最后删 ChromaDB（不在事务内，失败记清理任务，定时重试）
+        boolean chromaDeleted = deleteFromChromaByDocId(docId);
+        if (!chromaDeleted) {
+            log.error("ChromaDB删除失败，记录待清理任务: docId={}", docId);
+            saveCleanupTask(docId, userId, props.getChroma().getCollection());
         }
+
+        log.info("文档删除完成: userId={}, filename={}, docId={}, chromaDeleted={}", userId, filename, docId, chromaDeleted);
     }
 
     /**
@@ -563,9 +542,6 @@ public class VectorStoreService {
 
         // 4. 清除BM25索引
         bm25Service.clearUserIndex(userId);
-
-        // 5. 清除MD5记录
-        md5Store.deleteByUser(userId);
 
         log.info("用户所有知识库删除成功: userId={}", userId);
     }
@@ -843,12 +819,6 @@ public class VectorStoreService {
     public List<Map<String, Object>> getUserDocuments(String userId) {
         List<KnowledgeDocument> documents = documentRepository.findByUserIdOrderByCreatedAtDesc(userId);
 
-        // 同时检查 MD5 store，补充可能遗漏的文档
-        List<Map<String, String>> md5Records = md5Store.getUserRecords(userId);
-        Set<String> existingMd5s = documents.stream()
-                .map(KnowledgeDocument::getMd5)
-                .collect(java.util.stream.Collectors.toSet());
-
         List<Map<String, Object>> result = new ArrayList<>(documents.stream().map(doc -> {
             Map<String, Object> docMap = new HashMap<>();
             docMap.put("id", doc.getId());
@@ -863,25 +833,6 @@ public class VectorStoreService {
             docMap.put("createdAt", doc.getCreatedAt());
             return docMap;
         }).toList());
-
-        // 补充 MD5 store 中存在但 MySQL 中不存在的文档
-        for (Map<String, String> md5Record : md5Records) {
-            String md5 = md5Record.get("md5");
-            if (!existingMd5s.contains(md5)) {
-                Map<String, Object> docMap = new HashMap<>();
-                docMap.put("id", md5);
-                docMap.put("md5", md5);
-                docMap.put("filename", md5Record.get("filename"));
-                docMap.put("originalFilename", md5Record.get("original_filename"));
-                docMap.put("userId", userId);
-                docMap.put("chunkCount", 0);
-                docMap.put("preview", null);
-                docMap.put("fileSize", 0L);
-                docMap.put("status", "unknown");
-                docMap.put("createdAt", null);
-                result.add(docMap);
-            }
-        }
 
         return result;
     }
