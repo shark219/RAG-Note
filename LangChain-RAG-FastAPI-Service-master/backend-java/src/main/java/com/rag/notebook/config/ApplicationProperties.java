@@ -20,6 +20,7 @@ public class ApplicationProperties {
     private RateLimit rateLimit = new RateLimit();
     private Evaluation evaluation = new Evaluation();
     private Ablation ablation = new Ablation();
+    private Skills skills = new Skills();
 
     @Data
     public static class Jwt {
@@ -177,6 +178,18 @@ public class ApplicationProperties {
             private Integer chunkOverlap;
             /** Top-K 返回数量（消融实验可覆盖默认值） */
             private Integer topK;
+        }
+    }
+
+    @Data
+    public static class Skills {
+        private String storeDir = "data/skills";
+        private SkillsStore store = new SkillsStore();
+
+        @Data
+        public static class SkillsStore {
+            private String name = "RAG Note 官方 Skill 中心";
+            private String baseUrl = "https://raw.githubusercontent.com/MGdaasLab/WHartTest/master/WHartTest_Skills/";
         }
     }
 }

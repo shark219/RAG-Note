@@ -45,8 +45,8 @@ const systemInfo = [
   { label: '技术栈', value: 'Vue 3 + Arco Design + Spring Boot' },
 ]
 
-function handleThemeChange(value: string) {
-  appStore.setTheme(value as 'light' | 'dark')
+function handleThemeChange(value: string | number | boolean) {
+  appStore.setTheme(value === 'dark' ? 'dark' : 'light')
 }
 
 onMounted(() => {

@@ -6,6 +6,7 @@ import com.rag.notebook.config.ApplicationProperties;
 import com.rag.notebook.evaluation.entity.RagTrace;
 import com.rag.notebook.evaluation.repository.RagTraceRepository;
 import com.rag.notebook.rag.QualityReviewer;
+import com.rag.notebook.skill.service.SkillContextResolver;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.agent.tool.ToolSpecifications;
@@ -50,6 +51,7 @@ public class AgentService {
     private final ResponseComposer responseComposer;
     private final ConversationContextManager convCtxManager;
     private final List<ToolSpecification> toolSpecifications;
+    private final SkillContextResolver skillContextResolver;
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
                         ChatService chatService, ApplicationProperties props,
@@ -62,7 +64,8 @@ public class AgentService {
                         TokenCounter tokenCounter,
                         AgentLoop agentLoop,
                         ResponseComposer responseComposer,
-                        ConversationContextManager ctxManager) {
+                        ConversationContextManager ctxManager,
+                        SkillContextResolver skillContextResolver) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
         this.chatService = chatService;
@@ -77,6 +80,7 @@ public class AgentService {
         this.agentLoop = agentLoop;
         this.responseComposer = responseComposer;
         this.convCtxManager = ctxManager;
+        this.skillContextResolver = skillContextResolver;
         // 从 @Tool 注解自动提取工具定义
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
@@ -95,16 +99,17 @@ public class AgentService {
     /**
      * 根据用户开关过滤工具列表
      */
-    private List<ToolSpecification> filterTools(boolean enableKnowledge, boolean enableNotes) {
+    private List<ToolSpecification> filterTools(boolean enableKnowledge, boolean enableNotes,
+                                                SkillContextResolver.Context skillContext) {
         return toolSpecifications.stream()
                 .filter(tool -> {
                     String name = tool.name();
-                    // ragSummary 在知识库或笔记任一开启时可用
                     if ("ragSummary".equals(name)) return enableKnowledge || enableNotes;
                     if (KNOWLEDGE_TOOLS.contains(name)) return enableKnowledge;
                     if (NOTE_TOOLS.contains(name)) return enableNotes;
-                    return true; // 通用工具（如 whatTimeIsNow）始终可用
+                    return true;
                 })
+                .filter(tool -> !skillContext.restricted() || skillContext.allowedTools().contains(tool.name()))
                 .toList();
     }
 
@@ -139,7 +144,8 @@ public class AgentService {
             agentTools.setSearchFilters(enableKnowledge, enableNotes,
                     selectedKnowledgeDocs, selectedNotes);
             try {
-                // 先保存用户消息（重新生成时跳过，因为用户消息已存在）
+                SkillContextResolver.Context skillContext = skillContextResolver.resolve(userId);
+                List<ToolSpecification> activeTools = filterTools(enableKnowledge, enableNotes, skillContext);
                 if (!regenerate) {
                     chatService.addMessage(sessionId, userId, "human", query);
                 }
@@ -150,10 +156,9 @@ public class AgentService {
                 List<dev.langchain4j.data.message.ChatMessage> historyMessages =
                         contextManager.buildMessages(history, chatModel);
 
-                // 根据用户开关过滤工具列表
-                List<ToolSpecification> activeTools = filterTools(enableKnowledge, enableNotes);
-                log.info("工具过滤: enableKnowledge={}, enableNotes={}, selectedKnowledgeDocs={}, selectedNotes={}, 可用工具数={}, tools={}",
-                        enableKnowledge, enableNotes, selectedKnowledgeDocs, selectedNotes,
+                // 根据用户开关和 Skill 白名单过滤工具
+                log.info("工具过滤: enableKnowledge={}, enableNotes={}, skills={}, selectedKnowledgeDocs={}, selectedNotes={}, 可用工具数={}, tools={}",
+                        enableKnowledge, enableNotes, skillContext.version(), selectedKnowledgeDocs, selectedNotes,
                         activeTools.size(), activeTools.stream().map(ToolSpecification::name).toList());
 
                 // 构建附件上下文（注入给执行层，不传给 Supervisor）
@@ -174,7 +179,7 @@ public class AgentService {
 
                 String response;
                 AgentState finalAgentState = null;
-                String systemPrompt = loadSystemPrompt();
+                String systemPrompt = loadSystemPrompt() + skillContext.prompt();
 
                 if (subTasks.isEmpty()) {
                     String resolvedQuery = convCtxManager.resolveReferences(queryWithContext, sessionId);

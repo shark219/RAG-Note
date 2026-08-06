@@ -41,6 +41,16 @@ public class Bm25Service {
 
     private static final String INDEX_BASE_DIR = "data/bm25_index";
 
+    public record SearchOutcome(boolean success, List<Map<String, Object>> results, String error) {
+        public static SearchOutcome success(List<Map<String, Object>> results) {
+            return new SearchOutcome(true, results, null);
+        }
+
+        public static SearchOutcome failure(String error) {
+            return new SearchOutcome(false, List.of(), error);
+        }
+    }
+
     private final Map<String, Directory> userIndexes = new ConcurrentHashMap<>();
     private final Map<String, Map<String, Map<String, Object>>> userDocMetadata = new ConcurrentHashMap<>();
     private final Analyzer analyzer = new StandardAnalyzer();
@@ -94,47 +104,51 @@ public class Bm25Service {
         return search(userId, query, topK, null);
     }
 
-    public List<Map<String, Object>> search(String userId, String query, int topK,
-                                            Predicate<Map<String, Object>> resultFilter) {
-        Directory indexDir = getOrCreateIndex(userId);
-
-        try (DirectoryReader reader = DirectoryReader.open(indexDir)) {
-            IndexSearcher searcher = new IndexSearcher(reader);
-            QueryParser parser = new QueryParser("content", analyzer);
-            Query luceneQuery = parser.parse(QueryParser.escape(query));
-            int candidateLimit = resultFilter == null ? topK : Math.max(topK, reader.maxDoc());
-            TopDocs topDocs = searcher.search(luceneQuery, candidateLimit);
-            List<Map<String, Object>> results = new ArrayList<>();
-
-            Map<String, Map<String, Object>> metadata = userDocMetadata
-                    .getOrDefault(userId, Map.of());
-
-            for (ScoreDoc scoreDoc : topDocs.scoreDocs) {
-                Document doc = searcher.doc(scoreDoc.doc);
-                String docId = doc.get("docId");
-                String content = doc.get("content");
-
-                Map<String, Object> result = new HashMap<>();
-                result.put("docId", docId);
-                result.put("content", content);
-                result.put("bm25_score", scoreDoc.score);
-                putStoredMetadata(result, doc,
-                        "user_id", "source", "chunk_id", "doc_id", "note_id",
-                        "title", "filename", "original_filename", "md5");
-                result.putAll(metadata.getOrDefault(docId, Map.of()));
-                if (resultFilter == null || resultFilter.test(result)) {
-                    results.add(result);
-                    if (results.size() >= topK) {
-                        break;
+    public SearchOutcome searchWithStatus(String userId, String query, int topK,
+                                           Predicate<Map<String, Object>> resultFilter) {
+        if (!isAvailable()) {
+            return SearchOutcome.failure("BM25 index base directory unavailable");
+        }
+        try {
+            Directory indexDir = getOrCreateIndex(userId);
+            try (DirectoryReader reader = DirectoryReader.open(indexDir)) {
+                IndexSearcher searcher = new IndexSearcher(reader);
+                QueryParser parser = new QueryParser("content", analyzer);
+                Query luceneQuery = parser.parse(QueryParser.escape(query));
+                int candidateLimit = resultFilter == null ? topK : Math.max(topK, reader.maxDoc());
+                TopDocs topDocs = searcher.search(luceneQuery, candidateLimit);
+                List<Map<String, Object>> results = new ArrayList<>();
+                Map<String, Map<String, Object>> metadata = userDocMetadata.getOrDefault(userId, Map.of());
+                for (ScoreDoc scoreDoc : topDocs.scoreDocs) {
+                    Document doc = searcher.doc(scoreDoc.doc);
+                    String docId = doc.get("docId");
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("docId", docId);
+                    result.put("content", doc.get("content"));
+                    result.put("bm25_score", scoreDoc.score);
+                    putStoredMetadata(result, doc, "user_id", "source", "chunk_id", "doc_id", "note_id",
+                            "title", "filename", "original_filename", "md5");
+                    result.putAll(metadata.getOrDefault(docId, Map.of()));
+                    if (resultFilter == null || resultFilter.test(result)) {
+                        results.add(result);
+                        if (results.size() >= topK) break;
                     }
                 }
+                return SearchOutcome.success(results);
             }
-
-            return results;
         } catch (Exception e) {
-            log.warn("BM25 search failed: {}", e.getMessage());
-            return List.of();
+            log.warn("BM25 search failed: userId={}, error={}", userId, e.getMessage());
+            return SearchOutcome.failure(e.getMessage());
         }
+    }
+
+    public SearchOutcome searchWithStatus(String userId, String query, int topK) {
+        return searchWithStatus(userId, query, topK, null);
+    }
+
+    public List<Map<String, Object>> search(String userId, String query, int topK,
+                                            Predicate<Map<String, Object>> resultFilter) {
+        return searchWithStatus(userId, query, topK, resultFilter).results();
     }
 
     public void deleteDocument(String userId, String docId) {
@@ -215,6 +229,16 @@ public class Bm25Service {
                 throw new RuntimeException("Failed to create BM25 index directory", e);
             }
         });
+    }
+
+    public boolean isAvailable() {
+        try {
+            Path basePath = Paths.get(INDEX_BASE_DIR);
+            return Files.exists(basePath) && Files.isDirectory(basePath);
+        } catch (Exception e) {
+            log.warn("BM25 availability check failed: {}", e.getMessage());
+            return false;
+        }
     }
 
     public Set<String> getLoadedUserIndexes() {

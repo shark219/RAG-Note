@@ -1,5 +1,6 @@
 package com.rag.notebook.agent;
 
+import com.rag.notebook.cache.QueryCacheService;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.config.ApplicationProperties;
 import com.rag.notebook.evaluation.repository.RagTraceRepository;
@@ -37,7 +38,7 @@ class TaskPlanningTest extends TestBase {
                     new String[]{"检索知识库", "从知识库中检索 AI 相关文档", "ragSummary"}
             ));
             ChatLanguageModel llm = mockLlm(response);
-            SupervisorService supervisor = new SupervisorService(mockModelFactory(llm));
+            SupervisorService supervisor = new SupervisorService(mockModelFactory(llm), mock(QueryCacheService.class));
 
             List<SubTask> tasks = supervisor.plan("帮我整理AI学习笔记并总结知识库内容");
 
@@ -66,7 +67,7 @@ class TaskPlanningTest extends TestBase {
                     new String[]{"查看统计", "获取笔记统计", "getNoteStats"}
             ));
             ChatLanguageModel llm = mockLlm(response);
-            SupervisorService supervisor = new SupervisorService(mockModelFactory(llm));
+            SupervisorService supervisor = new SupervisorService(mockModelFactory(llm), mock(QueryCacheService.class));
 
             List<SubTask> tasks = supervisor.plan("整理AI笔记，总结知识库，看看有多少笔记");
 
@@ -83,7 +84,7 @@ class TaskPlanningTest extends TestBase {
         @DisplayName("简单查询不应拆分")
         void simpleQuery_shouldNotDecompose() {
             ChatLanguageModel llm = mockLlm("[]");
-            SupervisorService supervisor = new SupervisorService(mockModelFactory(llm));
+            SupervisorService supervisor = new SupervisorService(mockModelFactory(llm), mock(QueryCacheService.class));
 
             List<SubTask> tasks = supervisor.plan("搜索笔记 BM25");
 
@@ -103,8 +104,8 @@ class TaskPlanningTest extends TestBase {
             WriterService writer = new WriterService(mockModelFactory(llm));
 
             List<SubTask> tasks = List.of(
-                    new SubTask("R-1", "搜索笔记", "搜索AI笔记", "searchNotes"),
-                    new SubTask("R-2", "检索知识库", "检索AI文档", "ragSummary")
+                    makeSubTask("R-1", "搜索笔记", "搜索AI笔记", "searchNotes"),
+                    makeSubTask("R-2", "检索知识库", "检索AI文档", "ragSummary")
             );
             Map<String, String> results = new LinkedHashMap<>();
             results.put("R-1", "找到 5 篇 AI 相关笔记");
@@ -122,11 +123,11 @@ class TaskPlanningTest extends TestBase {
         @DisplayName("LLM 合成失败时应使用拼接兜底")
         void synthesisFailure_shouldFallbackToConcatenation() {
             ChatLanguageModel llm = mock(ChatLanguageModel.class);
-            when(llm.generate(any())).thenThrow(new RuntimeException("API 超时"));
+            when(llm.generate(any(List.class))).thenThrow(new RuntimeException("API 超时"));
             WriterService writer = new WriterService(mockModelFactory(llm));
 
             List<SubTask> tasks = List.of(
-                    new SubTask("R-1", "搜索笔记", "搜索AI笔记", "searchNotes")
+                    makeSubTask("R-1", "搜索笔记", "搜索AI笔记", "searchNotes")
             );
             Map<String, String> results = Map.of("R-1", "找到 5 篇笔记");
 
@@ -144,7 +145,7 @@ class TaskPlanningTest extends TestBase {
             WriterService writer = new WriterService(mockModelFactory(llm));
 
             List<SubTask> tasks = List.of(
-                    new SubTask("R-1", "搜索笔记", "搜索AI笔记", "searchNotes")
+                    makeSubTask("R-1", "搜索笔记", "搜索AI笔记", "searchNotes")
             );
             Map<String, String> results = Map.of();
 
@@ -178,9 +179,9 @@ class TaskPlanningTest extends TestBase {
         @DisplayName("子任务应支持并行执行")
         void subTasks_shouldSupportParallelExecution() {
             List<SubTask> tasks = List.of(
-                    new SubTask("R-1", "搜索笔记", "搜索AI笔记", "searchNotes"),
-                    new SubTask("R-2", "检索知识库", "检索AI文档", "ragSummary"),
-                    new SubTask("R-3", "查看统计", "获取统计", "getNoteStats")
+                    makeSubTask("R-1", "搜索笔记", "搜索AI笔记", "searchNotes"),
+                    makeSubTask("R-2", "检索知识库", "检索AI文档", "ragSummary"),
+                    makeSubTask("R-3", "查看统计", "获取统计", "getNoteStats")
             );
 
             // 验证所有子任务可以并发执行
@@ -203,5 +204,14 @@ class TaskPlanningTest extends TestBase {
 
             assertEquals(3, results.size(), "所有子任务应完成");
         }
+    }
+
+    private SubTask makeSubTask(String id, String label, String description, String toolHint) {
+        SubTask task = new SubTask();
+        task.setId(id);
+        task.setLabel(label);
+        task.setDescription(description);
+        task.setToolHint(toolHint);
+        return task;
     }
 }

@@ -18,7 +18,13 @@ api.interceptors.request.use((config) => {
 
 // 响应拦截器
 api.interceptors.response.use(
-  (response) => response.data,
+  (response) => {
+    const body = response.data
+    if (body && typeof body === 'object' && 'code' in body && body.code !== 200) {
+      return Promise.reject({ response, message: body.message || '请求失败', code: body.code })
+    }
+    return body
+  },
   (error) => {
     const status = error.response?.status
     if (status === 401 || status === 403) {
@@ -159,6 +165,39 @@ export const reviewApi = {
   getToday: () => api.get('/review/today'),
   markDone: (noteId: string) => api.post(`/review/done/${noteId}`),
   getQuestion: (noteId: string) => api.get(`/review/question/${noteId}`),
+}
+
+export const llmConfigApi = {
+  list: () => api.get('/system/llm/configs'),
+  get: (id: number) => api.get(`/system/llm/configs/${id}`),
+  create: (data: any) => api.post('/system/llm/configs', data),
+  update: (id: number, data: any) => api.put(`/system/llm/configs/${id}`, data),
+  delete: (id: number) => api.delete(`/system/llm/configs/${id}`),
+  activate: (id: number) => api.put(`/system/llm/configs/${id}/activate`),
+  test: (data: any) => api.post('/system/llm/configs/test', data),
+  testById: (id: number) => api.post(`/system/llm/configs/${id}/test`),
+  getActive: () => api.get('/system/llm/configs/active'),
+}
+
+export const skillApi = {
+  list: () => api.get('/system/skills'),
+  get: (id: number) => api.get(`/system/skills/${id}`),
+  create: (data: any) => api.post('/system/skills', data),
+  update: (id: number, data: any) => api.put(`/system/skills/${id}`, data),
+  enable: (id: number) => api.put(`/system/skills/${id}/enable`),
+  disable: (id: number) => api.put(`/system/skills/${id}/disable`),
+  delete: (id: number) => api.delete(`/system/skills/${id}`),
+  upload: (file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return api.post('/system/skills/upload', form, { headers: { 'Content-Type': 'multipart/form-data' } })
+  },
+  importGit: (data: { url: string; branch?: string }) => api.post('/system/skills/import-git', data),
+  getContent: (id: number) => api.get(`/system/skills/${id}/content`),
+  storeManifest: (url: string) => api.get('/system/skills/store/manifest', { params: { url } }),
+  storeImport: (data: { baseUrl: string; zipPath: string; sha256?: string }) => api.post('/system/skills/store/import', data),
+  storeConfig: () => api.get('/system/skills/store/config'),
+  storeReadme: (url: string, path: string) => api.get('/system/skills/store/readme', { params: { url, path } }),
 }
 
 export const evaluationApi = {

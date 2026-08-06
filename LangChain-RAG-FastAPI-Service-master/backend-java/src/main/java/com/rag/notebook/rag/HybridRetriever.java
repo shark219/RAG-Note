@@ -31,6 +31,7 @@ public class HybridRetriever {
     private final QueryExpander queryExpander;
     private final RerankerService rerankerService;
     private final ApplicationProperties props;
+    private final KeywordSearchService keywordSearchService;
 
     /** 最近一次检索的 Query Expansion Token 消耗 */
     private volatile int lastQueryExpansionTokens = 0;
@@ -39,12 +40,14 @@ public class HybridRetriever {
                            Bm25Service bm25Service,
                            QueryExpander queryExpander,
                            RerankerService rerankerService,
-                           ApplicationProperties props) {
+                           ApplicationProperties props,
+                           KeywordSearchService keywordSearchService) {
         this.vectorStoreService = vectorStoreService;
         this.bm25Service = bm25Service;
         this.queryExpander = queryExpander;
         this.rerankerService = rerankerService;
         this.props = props;
+        this.keywordSearchService = keywordSearchService;
     }
 
     /** 获取最近一次检索中 Query Expansion 消耗的 Token 数 */
@@ -94,6 +97,16 @@ public class HybridRetriever {
         boolean useBm25 = isEnabled(config, c -> c.isBm25SearchEnabled(), props.getAblation().getRag().isBm25SearchEnabled());
         boolean useRrf = isEnabled(config, c -> c.isRrfFusionEnabled(), props.getAblation().getRag().isRrfFusionEnabled());
         boolean useRerank = isEnabled(config, c -> c.isRerankEnabled(), props.getAblation().getRag().isRerankEnabled());
+        boolean chromaUp = vectorStoreService.isChromaAvailable();
+        if (!chromaUp) {
+            useVector = false;
+            if (!useBm25) {
+                log.info("知识库降级到关键词检索: vector unavailable and bm25 disabled");
+            }
+        }
+        if (!bm25Service.isAvailable()) {
+            useBm25 = false;
+        }
         int effectiveTopK = config != null && config.getTopK() != null ? config.getTopK() : topK;
         int effectiveRrfK = config != null && config.getRrfK() != null ? config.getRrfK() : DEFAULT_RRF_K;
         Set<String> selectedKnowledgeDocs = normalizeIdentifiers(knowledgeDocIdentifiers);
@@ -121,19 +134,23 @@ public class HybridRetriever {
                 allRankings.add(vectorResults);
             }
             if (useBm25) {
-                List<Map<String, Object>> bm25Results = bm25Service.search(userId, q, effectiveTopK * 2,
+                Bm25Service.SearchOutcome outcome = bm25Service.searchWithStatus(userId, q, effectiveTopK * 2,
                         r -> matchesKnowledgeSource(r, selectedKnowledgeDocs)
                                 && matchesKnowledgeIdentifiers(r, selectedKnowledgeDocs));
-                allRankings.add(bm25Results);
+                if (outcome.success()) {
+                    allRankings.add(outcome.results());
+                } else {
+                    log.warn("知识库 BM25 检索异常，降级到 MySQL 关键词: {}", outcome.error());
+                    allRankings.add(keywordFallbackKnowledge(userId, q, effectiveTopK * 2, selectedKnowledgeDocs));
+                }
             }
         }
 
         if (allRankings.isEmpty()) {
-            log.info("知识库混合检索: 无可用检索路径，返回空结果");
-            return List.of();
+            log.info("知识库混合检索降级到纯关键词检索");
+            return keywordFallbackKnowledge(userId, query, effectiveTopK, selectedKnowledgeDocs);
         }
 
-        // 3. 融合（RRF 或简单拼接）
         List<Map<String, Object>> fused;
         if (useRrf && allRankings.size() > 1) {
             fused = rrfFusion(allRankings, effectiveTopK * 2, effectiveRrfK);
@@ -141,7 +158,6 @@ public class HybridRetriever {
             fused = simpleMerge(allRankings, effectiveTopK * 2);
         }
 
-        // 4. Cross-Encoder 精排
         if (useRerank) {
             fused = rerankerService.rerank(query, fused);
         } else {
@@ -153,7 +169,6 @@ public class HybridRetriever {
 
         return fused;
     }
-
     /**
      * 混合检索笔记（支持消融实验）
      */
@@ -163,6 +178,16 @@ public class HybridRetriever {
         boolean useBm25 = isEnabled(config, c -> c.isBm25SearchEnabled(), props.getAblation().getRag().isBm25SearchEnabled());
         boolean useRrf = isEnabled(config, c -> c.isRrfFusionEnabled(), props.getAblation().getRag().isRrfFusionEnabled());
         boolean useRerank = isEnabled(config, c -> c.isRerankEnabled(), props.getAblation().getRag().isRerankEnabled());
+        boolean chromaUp = vectorStoreService.isChromaAvailable();
+        if (!chromaUp) {
+            useVector = false;
+            if (!useBm25) {
+                log.info("笔记降级到关键词检索: vector unavailable and bm25 disabled");
+            }
+        }
+        if (!bm25Service.isAvailable()) {
+            useBm25 = false;
+        }
         int effectiveTopK = config != null && config.getTopK() != null ? config.getTopK() : topK;
 
         List<String> queries = expandQuery
@@ -182,16 +207,20 @@ public class HybridRetriever {
                 allRankings.add(vectorResults);
             }
             if (useBm25) {
-                List<Map<String, Object>> bm25Results = bm25Service.search(userId, q, effectiveTopK * 2);
-                bm25Results = bm25Results.stream()
-                        .filter(r -> "note".equals(r.get("source")))
-                        .collect(Collectors.toList());
-                allRankings.add(bm25Results);
+                Bm25Service.SearchOutcome outcome = bm25Service.searchWithStatus(userId, q, effectiveTopK * 2,
+                        r -> "note".equals(r.get("source")));
+                if (outcome.success()) {
+                    allRankings.add(outcome.results());
+                } else {
+                    log.warn("笔记 BM25 检索异常，降级到 MySQL 关键词: {}", outcome.error());
+                    allRankings.add(keywordFallbackNotes(userId, q, effectiveTopK * 2));
+                }
             }
         }
 
         if (allRankings.isEmpty()) {
-            return List.of();
+            log.info("笔记混合检索降级到纯关键词检索");
+            return keywordFallbackNotes(userId, query, effectiveTopK);
         }
 
         List<Map<String, Object>> fused;
@@ -261,6 +290,15 @@ public class HybridRetriever {
                         (double) a.getOrDefault("similarity", 0.0)))
                 .limit(topK)
                 .collect(Collectors.toList());
+    }
+
+    private List<Map<String, Object>> keywordFallbackKnowledge(String userId, String query, int topK,
+                                                               Set<String> selectedKnowledgeDocs) {
+        return keywordSearchService.searchKnowledge(userId, query, topK, selectedKnowledgeDocs);
+    }
+
+    private List<Map<String, Object>> keywordFallbackNotes(String userId, String query, int topK) {
+        return keywordSearchService.searchNotes(userId, query, topK);
     }
 
     private String getDocKey(Map<String, Object> doc) {

@@ -13,6 +13,8 @@ public interface NoteChunkRepository extends JpaRepository<NoteChunk, String> {
 
     List<NoteChunk> findByNoteIdOrderByChunkIndexAsc(String noteId);
 
+    List<NoteChunk> findByNoteIdInOrderByNoteIdAscChunkIndexAsc(List<String> noteIds);
+
     @Query("SELECT c FROM NoteChunk c WHERE c.noteId = :noteId AND c.chunkIndex BETWEEN :startIndex AND :endIndex ORDER BY c.chunkIndex ASC")
     List<NoteChunk> findNeighborhood(@Param("noteId") String noteId,
                                      @Param("startIndex") int startIndex,

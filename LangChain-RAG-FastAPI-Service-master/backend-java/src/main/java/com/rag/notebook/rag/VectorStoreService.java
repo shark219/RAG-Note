@@ -723,6 +723,10 @@ public class VectorStoreService {
         return documentRepository.existsByUserIdAndMd5(userId, md5);
     }
 
+    public boolean isChromaAvailable() {
+        return chromaAvailable;
+    }
+
     /**
      * 重试向量化（异步版本，前端轮询状态）
      */

@@ -1,6 +1,7 @@
 package com.rag.notebook.rag;
 
 import com.rag.notebook.agent.ModelFactory;
+import com.rag.notebook.cache.QueryCacheService;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
@@ -60,12 +61,14 @@ public class QueryExpander {
 */
 
     private final ModelFactory modelFactory;
+    private final QueryCacheService queryCacheService;
 
     /** 最近一次扩展的 Token 消耗 */
     private volatile int lastExpansionTokens = 0;
 
-    public QueryExpander(ModelFactory modelFactory) {
+    public QueryExpander(ModelFactory modelFactory, QueryCacheService queryCacheService) {
         this.modelFactory = modelFactory;
+        this.queryCacheService = queryCacheService;
     }
 
     /** 获取最近一次扩展消耗的 Token 数 */
@@ -80,6 +83,15 @@ public class QueryExpander {
      * @return 包含原始查询和扩展查询的列表（最多 1+3=4 个）
      */
     public List<String> expand(String query) {
+        String key = queryCacheService.hashKey("query-cache:query-expansion", query);
+        List<String> cached = queryCacheService.get(key, new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+        if (cached != null) return cached;
+        List<String> result = expandUncached(query);
+        queryCacheService.put(key, result, java.time.Duration.ofMinutes(30));
+        return result;
+    }
+
+    private List<String> expandUncached(String query) {
         List<String> queries = new ArrayList<>();
         queries.add(query);  // 原始查询始终包含
 

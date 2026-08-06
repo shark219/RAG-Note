@@ -1,6 +1,8 @@
 package com.rag.notebook.agent;
 
 import com.rag.notebook.config.ApplicationProperties;
+import com.rag.notebook.system.entity.LlmConfig;
+import com.rag.notebook.system.service.LlmConfigService;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.dashscope.QwenChatModel;
 import dev.langchain4j.model.dashscope.QwenEmbeddingModel;
@@ -19,6 +21,7 @@ import java.time.Duration;
 public class ModelFactory {
 
     private final ApplicationProperties props;
+    private final LlmConfigService llmConfigService;
 
     /** 温度预设：精确推理（工具选择、逻辑判断） */
     public static final double TEMP_PRECISE = 0.1;
@@ -27,8 +30,9 @@ public class ModelFactory {
     /** 温度预设：创意模式（写作、头脑风暴） */
     public static final double TEMP_CREATIVE = 0.8;
 
-    public ModelFactory(ApplicationProperties props) {
+    public ModelFactory(ApplicationProperties props, LlmConfigService llmConfigService) {
         this.props = props;
+        this.llmConfigService = llmConfigService;
     }
 
     /**
@@ -51,6 +55,11 @@ public class ModelFactory {
      * 使用指定温度和超时创建聊天模型
      */
     public ChatLanguageModel createChatModel(double temperature, Duration timeout) {
+        LlmConfig activeConfig = llmConfigService.getActive();
+        if (activeConfig != null) {
+            return createChatModel(activeConfig, temperature, timeout);
+        }
+
         String type = props.getLlm().getType();
         if ("ZHIPU".equalsIgnoreCase(type)) {
             return OpenAiChatModel.builder()
@@ -85,6 +94,39 @@ public class ModelFactory {
     }
 
     /**
+     * 根据数据库配置动态创建聊天模型（用于用户在页面上切换 LLM 配置后即时生效）
+     */
+    public ChatLanguageModel createChatModel(LlmConfig config, double temperature, Duration timeout) {
+        String provider = config.getProvider();
+        String modelName = config.getActualModel() != null && !config.getActualModel().isBlank()
+                ? config.getActualModel() : config.getModel();
+        if ("OLLAMA".equalsIgnoreCase(provider)) {
+            return OllamaChatModel.builder()
+                    .baseUrl(config.getApiUrl())
+                    .modelName(modelName)
+                    .temperature(temperature)
+                    .timeout(timeout)
+                    .build();
+        }
+        // openai-compatible / openai / zhipu / deepseek / qwen 都用 OpenAI 兼容接口
+        // 规范化 baseUrl：去掉末尾的 /chat/completions，避免 LangChain4j 拼成 .../chat/completions/chat/completions
+        String baseUrl = config.getApiUrl().replaceAll("/+$", "");
+        baseUrl = baseUrl.replaceAll("/chat/completions$", "");
+        String chatUrl = baseUrl + "/chat/completions";
+        log.info("创建 LLM 模型: name={}, provider={}, model={}, chatUrl={}, apiKey={}...",
+                config.getName(), config.getProvider(), modelName, chatUrl,
+                config.getApiKey() != null && config.getApiKey().length() > 8
+                        ? config.getApiKey().substring(0, 8) : "***");
+        return OpenAiChatModel.builder()
+                .apiKey(config.getApiKey())
+                .baseUrl(baseUrl)
+                .modelName(modelName)
+                .temperature(temperature)
+                .timeout(timeout)
+                .build();
+    }
+
+    /**
      * 创建精确推理模型（工具选择、质量审查等）
      */
     public ChatLanguageModel createPreciseModel() {
@@ -110,6 +152,11 @@ public class ModelFactory {
      * 用于 RAGAS 质量评估，保证同一输入多次评估结果一致
      */
     public ChatLanguageModel createEvaluationModel() {
+        LlmConfig activeConfig = llmConfigService.getActive();
+        if (activeConfig != null) {
+            return createChatModel(activeConfig, 0.0, Duration.ofSeconds(120));
+        }
+
         String type = props.getLlm().getType();
         if ("ZHIPU".equalsIgnoreCase(type)) {
             return OpenAiChatModel.builder()

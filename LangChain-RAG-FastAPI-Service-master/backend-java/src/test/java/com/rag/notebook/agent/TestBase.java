@@ -18,25 +18,27 @@ public class TestBase {
     /**
      * 创建返回固定文本的 ChatLanguageModel Mock
      */
+    @SuppressWarnings("unchecked")
     protected ChatLanguageModel mockLlm(String fixedResponse) {
         ChatLanguageModel llm = mock(ChatLanguageModel.class);
         AiMessage aiMessage = AiMessage.from(fixedResponse);
         Response<AiMessage> response = Response.from(aiMessage);
-        when(llm.generate(any())).thenReturn(response);
-        when(llm.generate(any(), any())).thenReturn(response);
+        when(llm.generate(any(List.class))).thenReturn(response);
+        when(llm.generate(any(List.class), any(List.class))).thenReturn(response);
         return llm;
     }
 
     /**
      * 创建按顺序返回不同响应的 ChatLanguageModel Mock
      */
+    @SuppressWarnings("unchecked")
     protected ChatLanguageModel mockLlmSequential(String... responses) {
         ChatLanguageModel llm = mock(ChatLanguageModel.class);
         Response<AiMessage>[] responseArray = new Response[responses.length];
         for (int i = 0; i < responses.length; i++) {
             responseArray[i] = Response.from(AiMessage.from(responses[i]));
         }
-        var stubbing = when(llm.generate(any()));
+        var stubbing = when(llm.generate(any(List.class)));
         for (int i = 0; i < responseArray.length; i++) {
             if (i == 0) {
                 stubbing.thenReturn(responseArray[i]);

@@ -2,6 +2,7 @@ package com.rag.notebook.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rag.notebook.cache.QueryCacheService;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -32,9 +33,11 @@ public class SupervisorService {
 
     private final ModelFactory modelFactory;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final QueryCacheService queryCacheService;
 
-    public SupervisorService(ModelFactory modelFactory) {
+    public SupervisorService(ModelFactory modelFactory, QueryCacheService queryCacheService) {
         this.modelFactory = modelFactory;
+        this.queryCacheService = queryCacheService;
     }
 
     /**
@@ -44,6 +47,15 @@ public class SupervisorService {
      * @return 子任务列表。空列表表示查询简单，应走单 Agent。
      */
     public List<SubTask> plan(String query) {
+        String key = queryCacheService.hashKey("query-cache:supervisor", query);
+        List<SubTask> cached = queryCacheService.get(key, new com.fasterxml.jackson.core.type.TypeReference<List<SubTask>>() {});
+        if (cached != null) return cached;
+        List<SubTask> result = planUncached(query);
+        if (result != null) queryCacheService.put(key, result, java.time.Duration.ofMinutes(10));
+        return result;
+    }
+
+    private List<SubTask> planUncached(String query) {
         try {
             String template = loadPrompt("prompt/supervisor_plan.txt");
             String prompt = template.replace("{query}", query);
