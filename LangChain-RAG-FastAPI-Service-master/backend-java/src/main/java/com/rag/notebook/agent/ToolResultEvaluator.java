@@ -55,6 +55,11 @@ public class ToolResultEvaluator {
      */
     private String buildErrorReason(String errorCode) {
         return switch (errorCode) {
+            case "FETCH_URL_BAD_CONTENT" -> "网页抓取成功但正文质量不足或命中了站点拦截页";
+            case "FETCH_URL_ERROR" -> "网页抓取失败";
+            case "URL_INVALID" -> "URL格式无效";
+            case "CREATE_NOTE_ERROR" -> "创建笔记失败";
+            case "APPEND_NOTE_ERROR" -> "追加笔记失败";
             case "NOTE_NOT_FOUND" -> "提供的 noteId 无效，该笔记不存在";
             case "RAG_ERROR" -> "知识库检索失败";
             case "SEARCH_ERROR" -> "笔记搜索执行失败";
@@ -70,6 +75,11 @@ public class ToolResultEvaluator {
      */
     public String suggestFixByErrorCode(String toolName, String args, String errorCode) {
         return switch (errorCode) {
+            case "FETCH_URL_BAD_CONTENT" -> "网页正文抓取质量不足，请尝试备用网址、移动页，或让用户直接提供正文内容。";
+            case "FETCH_URL_ERROR" -> "网页抓取失败，请尝试备用网址或让用户提供正文内容。";
+            case "URL_INVALID" -> "URL不合法，请检查链接格式。";
+            case "CREATE_NOTE_ERROR" -> "笔记创建失败，请不要重复创建，先检查是否已经创建成功。";
+            case "APPEND_NOTE_ERROR" -> "追加失败，请确认 noteId 和追加内容是否正确。";
             case "NOTE_NOT_FOUND" -> {
                 if ("getNote".equals(toolName)) {
                     yield "提供的参数可能不是有效的 noteId（标题/关键词≠noteId）。"

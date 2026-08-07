@@ -64,6 +64,19 @@ public class AgentState {
     // ========== 操作确认 ==========
     private String writeConfirmation;
     private String bestAnswer;
+    private String taskId;
+    private String stepId;
+    private int iteration;
+    private final List<String> candidateStrategies = new ArrayList<>();
+    private String lastReflectionSummary;
+    private String lastFailureType;
+    private final Set<String> completedActionKeys = new LinkedHashSet<>();
+    private final List<String> toolAllowedNames = new ArrayList<>();
+    private String currentTaskType;
+    private String sharedNoteId;
+    private String sharedNoteTitle;
+    private String sharedFetchedContent;
+    private String sharedMindMap;
 
     public AgentState(String originalQuery) {
         this.originalQuery = originalQuery;
@@ -134,6 +147,12 @@ public class AgentState {
      */
     public void addArtifact(Artifact artifact) {
         if (artifact == null) return;
+        boolean exists = artifacts.stream().anyMatch(existing ->
+                existing.type().equals(artifact.type())
+                        && java.util.Objects.equals(existing.label(), artifact.label())
+                        && java.util.Objects.equals(existing.metadata() != null ? existing.metadata().get("content") : null,
+                        artifact.metadata() != null ? artifact.metadata().get("content") : null));
+        if (exists) return;
         artifacts.add(artifact);
         addKnownFact("已产出: " + artifact.type() + (artifact.label() != null ? " — " + artifact.label() : ""));
         markStepCompleted(artifact.type());
@@ -171,6 +190,87 @@ public class AgentState {
     public String getBestAnswer() { return bestAnswer; }
 
     public void setBestAnswer(String bestAnswer) { this.bestAnswer = bestAnswer; }
+
+    public String getTaskId() { return taskId; }
+
+    public void setTaskId(String taskId) { this.taskId = taskId; }
+
+    public String getStepId() { return stepId; }
+
+    public void setStepId(String stepId) { this.stepId = stepId; }
+
+    public int getIteration() { return iteration; }
+
+    public void setIteration(int iteration) { this.iteration = iteration; }
+
+    public List<String> getCandidateStrategies() { return candidateStrategies; }
+
+    public void addCandidateStrategy(String strategy) {
+        if (strategy != null && !strategy.isBlank() && !candidateStrategies.contains(strategy)) {
+            candidateStrategies.add(strategy);
+        }
+    }
+
+    public String getLastReflectionSummary() { return lastReflectionSummary; }
+
+    public void setLastReflectionSummary(String lastReflectionSummary) { this.lastReflectionSummary = lastReflectionSummary; }
+
+    public String getLastFailureType() { return lastFailureType; }
+
+    public void setLastFailureType(String lastFailureType) { this.lastFailureType = lastFailureType; }
+
+    public Set<String> getCompletedActionKeys() { return completedActionKeys; }
+
+    public boolean hasCompletedActionKey(String key) { return key != null && completedActionKeys.contains(key); }
+
+    public void addCompletedActionKey(String key) {
+        if (key != null && !key.isBlank()) completedActionKeys.add(key);
+    }
+
+    public List<String> getToolAllowedNames() { return toolAllowedNames; }
+
+    public void setToolAllowedNames(List<String> names) {
+        toolAllowedNames.clear();
+        if (names != null) {
+            for (String name : names) {
+                if (name != null && !name.isBlank() && !toolAllowedNames.contains(name)) {
+                    toolAllowedNames.add(name);
+                }
+            }
+        }
+    }
+
+    public boolean isToolAllowed(String toolName) {
+        return toolAllowedNames.isEmpty() || toolAllowedNames.contains(toolName);
+    }
+
+    public String getCurrentTaskType() { return currentTaskType; }
+
+    public void setCurrentTaskType(String currentTaskType) { this.currentTaskType = currentTaskType; }
+
+    public String getSharedNoteId() { return sharedNoteId; }
+
+    public void setSharedNoteId(String sharedNoteId) { this.sharedNoteId = sharedNoteId; }
+
+    public String getSharedNoteTitle() { return sharedNoteTitle; }
+
+    public void setSharedNoteTitle(String sharedNoteTitle) { this.sharedNoteTitle = sharedNoteTitle; }
+
+    public String getSharedFetchedContent() { return sharedFetchedContent; }
+
+    public void setSharedFetchedContent(String sharedFetchedContent) { this.sharedFetchedContent = sharedFetchedContent; }
+
+    public String getSharedMindMap() { return sharedMindMap; }
+
+    public void setSharedMindMap(String sharedMindMap) { this.sharedMindMap = sharedMindMap; }
+
+    public String getBlockedReason() { return lastFailureType; }
+
+    public void setBlockedReason(String blockedReason) { this.lastFailureType = blockedReason; }
+
+    public boolean isApprovalRequired() { return false; }
+
+    public void setApprovalRequired(boolean approvalRequired) { }
 
     // ============================================================
     // 工作记忆

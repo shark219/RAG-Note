@@ -200,6 +200,13 @@ export const skillApi = {
   storeReadme: (url: string, path: string) => api.get('/system/skills/store/readme', { params: { url, path } }),
 }
 
+export const agentTaskApi = {
+  list: () => api.get('/agent/tasks'),
+  detail: (taskId: string) => api.get(`/agent/tasks/${taskId}`),
+  resume: (taskId: string, data?: { userMessage?: string }) =>
+    api.post(`/agent/tasks/${taskId}/resume`, data || {}),
+}
+
 export const evaluationApi = {
   getStats: () => api.get('/evaluation/stats'),
   getReports: (params?: { page?: number; size?: number }) =>

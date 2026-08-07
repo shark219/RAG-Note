@@ -91,6 +91,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: 'Skills 管理' }
       },
       {
+        path: 'system/agent-tasks',
+        name: 'AgentTasks',
+        component: () => import('@/views/system/AgentTasks.vue'),
+        meta: { title: 'Agent 任务' }
+      },
+      {
         path: 'system/debug',
         name: 'DebugEvaluation',
         component: () => import('@/views/system/DebugEvaluation.vue'),

@@ -1,5 +1,9 @@
 package com.rag.notebook.agent;
 
+import com.rag.notebook.agent.runtime.AgentResumeContext;
+import com.rag.notebook.agent.runtime.AgentRuntime;
+import com.rag.notebook.agent.runtime.AgentTaskService;
+import com.rag.notebook.agent.runtime.AgentTaskStatus;
 import com.rag.notebook.chat.entity.ChatMessage;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.config.ApplicationProperties;
@@ -50,6 +54,8 @@ public class AgentService {
     private final AgentLoop agentLoop;
     private final ResponseComposer responseComposer;
     private final ConversationContextManager convCtxManager;
+    private final AgentRuntime agentRuntime;
+    private final AgentTaskService agentTaskService;
     private final List<ToolSpecification> toolSpecifications;
     private final SkillContextResolver skillContextResolver;
 
@@ -65,6 +71,8 @@ public class AgentService {
                         AgentLoop agentLoop,
                         ResponseComposer responseComposer,
                         ConversationContextManager ctxManager,
+                        AgentRuntime agentRuntime,
+                        AgentTaskService agentTaskService,
                         SkillContextResolver skillContextResolver) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
@@ -80,6 +88,8 @@ public class AgentService {
         this.agentLoop = agentLoop;
         this.responseComposer = responseComposer;
         this.convCtxManager = ctxManager;
+        this.agentRuntime = agentRuntime;
+        this.agentTaskService = agentTaskService;
         this.skillContextResolver = skillContextResolver;
         // 从 @Tool 注解自动提取工具定义
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
@@ -113,115 +123,47 @@ public class AgentService {
                 .toList();
     }
 
-    public SseEmitter streamAgentResponse(String query, String sessionId, String userId) {
-        return streamAgentResponse(query, sessionId, userId, false, true, true, null, null, null);
-    }
-
-    public SseEmitter streamAgentResponse(String query, String sessionId, String userId,
-                                          boolean regenerate,
-                                          boolean enableKnowledge, boolean enableNotes,
-                                          List<String> fileIds) {
-        return streamAgentResponse(query, sessionId, userId, regenerate,
-                enableKnowledge, enableNotes, null, null, fileIds);
-    }
-
-    public SseEmitter streamAgentResponse(String query, String sessionId, String userId,
-                                          boolean regenerate,
-                                          boolean enableKnowledge, boolean enableNotes,
-                                          List<String> selectedKnowledgeDocs, List<String> selectedNotes,
-                                          List<String> fileIds) {
-        // 多 Agent 流水线可能耗时较长，超时设为 5 分钟
+    public SseEmitter resumeAgentTask(AgentResumeContext resumeContext, String userMessage) {
         SseEmitter emitter = new SseEmitter(300000L);
-
         SecurityContext securityContext = SecurityContextHolder.getContext();
         String traceId = UUID.randomUUID().toString().replace("-", "");
 
         CompletableFuture.runAsync(() -> {
             SecurityContextHolder.setContext(securityContext);
             long startTime = System.currentTimeMillis();
-
-            // 设置 agent 工具的检索范围配置
-            agentTools.setSearchFilters(enableKnowledge, enableNotes,
-                    selectedKnowledgeDocs, selectedNotes);
             try {
-                SkillContextResolver.Context skillContext = skillContextResolver.resolve(userId);
-                List<ToolSpecification> activeTools = filterTools(enableKnowledge, enableNotes, skillContext);
-                if (!regenerate) {
-                    chatService.addMessage(sessionId, userId, "human", query);
-                }
-
-                // 加载会话历史，滑动窗口 + 摘要压缩
-                List<ChatMessage> history = chatService.getSessionMessages(sessionId);
-                ChatLanguageModel chatModel = modelFactory.createBalancedModel();
-                List<dev.langchain4j.data.message.ChatMessage> historyMessages =
-                        contextManager.buildMessages(history, chatModel);
-
-                // 根据用户开关和 Skill 白名单过滤工具
-                log.info("工具过滤: enableKnowledge={}, enableNotes={}, skills={}, selectedKnowledgeDocs={}, selectedNotes={}, 可用工具数={}, tools={}",
-                        enableKnowledge, enableNotes, skillContext.version(), selectedKnowledgeDocs, selectedNotes,
-                        activeTools.size(), activeTools.stream().map(ToolSpecification::name).toList());
-
-                // 构建附件上下文（注入给执行层，不传给 Supervisor）
-                String attachmentContext = chatService.buildAttachmentContext(fileIds, userId);
-                String queryWithContext = attachmentContext != null
-                        ? attachmentContext + "用户问题：" + query
-                        : query;
-
-                // 所有请求先交给 Supervisor 做语义分诊；简单任务返回空数组后降级为单 Agent。
-                List<SubTask> subTasks = supervisorService.plan(query);
-                if (subTasks.size() == 1 && !isArtifactWriteBackTask(query.trim().toLowerCase(Locale.ROOT))) {
-                    log.info("Supervisor 返回单一子任务，降级为单 Agent 执行: {}", subTasks.get(0).getGoal());
-                    subTasks = Collections.emptyList();
-                }
-                if (subTasks.isEmpty()) {
-                    log.info("Supervisor 判断为简单任务或规划降级：使用单 Agent 执行");
-                }
-
-                String response;
-                AgentState finalAgentState = null;
+                SkillContextResolver.Context skillContext = skillContextResolver.resolve(resumeContext.userId());
+                List<ToolSpecification> activeTools = filterTools(true, true, skillContext);
                 String systemPrompt = loadSystemPrompt() + skillContext.prompt();
+                ChatLanguageModel chatModel = modelFactory.createBalancedModel();
 
-                if (subTasks.isEmpty()) {
-                    String resolvedQuery = convCtxManager.resolveReferences(queryWithContext, sessionId);
+                AgentRuntime.RuntimeResult runtimeResult = agentRuntime.resume(
+                        resumeContext,
+                        systemPrompt,
+                        activeTools,
+                        emitter,
+                        chatModel
+                );
 
-                    AgentLoopResult loopResult = agentLoop.run(systemPrompt, resolvedQuery,
-                            historyMessages, userId, sessionId, activeTools, emitter,
-                            buildSingleGoal(query), null);
-                    finalAgentState = loopResult.state();
-
-                    // 反问澄清：直接输出反问，跳过 Compose/Review
-                    if (loopResult.outcome() == AgentLoopResult.Outcome.NEED_CLARIFICATION) {
-                        response = loopResult.clarificationQuestion();
-                    } else {
-                        response = composeAndReview(loopResult, query, emitter);
-                    }
+                AgentLoopResult loopResult = runtimeResult.loopResult();
+                AgentState finalAgentState = loopResult.state();
+                String response;
+                if (loopResult.outcome() == AgentLoopResult.Outcome.NEED_CLARIFICATION) {
+                    response = loopResult.clarificationQuestion();
+                    agentTaskService.updateStatus(resumeContext.taskId(), AgentTaskStatus.WAITING_USER);
                 } else {
-                    String mode = subTasks.get(0).getExecutionMode();
-
-                    if ("SEQUENTIAL".equals(mode)) {
-                        log.info("执行模式: SEQUENTIAL, {} 个子任务", subTasks.size());
-                        PipeResult pr = runSequentialPipeline(systemPrompt, queryWithContext,
-                                historyMessages, userId, sessionId, activeTools, emitter,
-                                subTasks);
-                        response = pr.response();
-                        finalAgentState = pr.state();
-                    } else {
-                        log.info("执行模式: PARALLEL, {} 个子任务", subTasks.size());
-                        PipeResult pr = runParallelPipeline(systemPrompt, queryWithContext,
-                                historyMessages, userId, sessionId, activeTools, emitter,
-                                subTasks);
-                        response = pr.response();
-                        finalAgentState = pr.state();
-                    }
+                    response = composeAndReview(loopResult, resumeContext.resumedQuery(), emitter);
+                    agentTaskService.saveFinalResult(resumeContext.taskId(), AgentTaskStatus.COMPLETED, response, null);
                 }
 
-                // 保存 AI 回复
-                chatService.addMessage(sessionId, userId, "ai", response);
+                if (userMessage != null && !userMessage.isBlank()) {
+                    chatService.addMessage(resumeContext.sessionId(), resumeContext.userId(), "human", userMessage);
+                }
+                chatService.addMessage(resumeContext.sessionId(), resumeContext.userId(), "ai", response);
 
-                // 发送最终回复（流式分块）
                 sendSseEvent(emitter, "thinking", Map.of(
                         "stage", "complete",
-                        "content", "已处理完成"
+                        "content", "恢复执行完成"
                 ));
 
                 int chunkSize = 50;
@@ -229,28 +171,23 @@ public class AgentService {
                     int end = Math.min(i + chunkSize, response.length());
                     sendSseEvent(emitter, "response", Map.of(
                             "content", response.substring(i, end),
-                            "session_id", sessionId
+                            "session_id", resumeContext.sessionId()
                     ));
                     Thread.sleep(50);
                 }
 
-                // 获取 RAG 的 traceId，如果没有则使用 Agent 自己生成的
                 String ragTraceId = agentTools.getLatestTraceId();
                 String finalTraceId = ragTraceId != null ? ragTraceId : traceId;
-                log.info("Agent done - ragTraceId={}, finalTraceId={}, sessionId={}", ragTraceId, finalTraceId, sessionId);
-
-                // 计算 token 使用量
-                List<ChatMessage> allHistory = chatService.getSessionMessages(sessionId);
+                List<ChatMessage> allHistory = chatService.getSessionMessages(resumeContext.sessionId());
                 int usedTokens = tokenCounter.estimateEntityTokens(allHistory);
-                int maxTokens = 32000; // 与 ContextManager.MAX_CONTEXT_TOKENS 一致
 
                 Map<String, Object> doneData = new HashMap<>();
-                doneData.put("session_id", sessionId);
+                doneData.put("session_id", resumeContext.sessionId());
+                doneData.put("task_id", resumeContext.taskId());
                 doneData.put("trace_id", finalTraceId);
                 doneData.put("token_used", usedTokens);
-                doneData.put("token_max", maxTokens);
+                doneData.put("token_max", 32000);
 
-                // 产物数据（思维导图、图表等）
                 if (finalAgentState != null) {
                     List<Artifact> artifacts = finalAgentState.getArtifacts();
                     if (artifacts != null && !artifacts.isEmpty()) {
@@ -271,7 +208,178 @@ public class AgentService {
 
                 sendSseEvent(emitter, "done", doneData);
 
-                // 如果没有 RAG trace，保存一个基础 trace（用于用户反馈）
+                if (ragTraceId == null) {
+                    try {
+                        RagTrace basicTrace = new RagTrace();
+                        basicTrace.setTraceId(traceId);
+                        basicTrace.setUserId(resumeContext.userId());
+                        basicTrace.setQuery(resumeContext.resumedQuery());
+                        basicTrace.setFinalAnswer(response);
+                        basicTrace.setTotalLatencyMs(System.currentTimeMillis() - startTime);
+                        traceRepository.save(basicTrace);
+                    } catch (Exception ex) {
+                        log.warn("Failed to save basic trace: {}", ex.getMessage());
+                    }
+                }
+
+                safeComplete(emitter);
+            } catch (Exception e) {
+                log.error("Agent resume failed: {}", e.getMessage(), e);
+                try {
+                    chatService.addMessage(resumeContext.sessionId(), resumeContext.userId(), "ai", "恢复任务时发生错误: " + e.getMessage());
+                } catch (Exception ignored) {}
+                try {
+                    sendSseEvent(emitter, "error", Map.of(
+                            "content", "恢复任务时发生错误: " + e.getMessage(),
+                            "session_id", resumeContext.sessionId(),
+                            "task_id", resumeContext.taskId()
+                    ));
+                    safeComplete(emitter);
+                } catch (IOException ex) {
+                    try {
+                        emitter.completeWithError(ex);
+                    } catch (IllegalStateException ignored) {}
+                }
+            } finally {
+                agentTools.clearSearchFilters();
+                SecurityContextHolder.clearContext();
+            }
+        }, taskExecutor);
+
+        return emitter;
+    }
+
+    public SseEmitter streamAgentResponse(String query, String sessionId, String userId) {
+        return streamAgentResponse(query, sessionId, userId, false, true, true, null, null, null);
+    }
+
+    public SseEmitter streamAgentResponse(String query, String sessionId, String userId,
+                                          boolean regenerate,
+                                          boolean enableKnowledge, boolean enableNotes,
+                                          List<String> fileIds) {
+        return streamAgentResponse(query, sessionId, userId, regenerate,
+                enableKnowledge, enableNotes, null, null, fileIds);
+    }
+
+    public SseEmitter streamAgentResponse(String query, String sessionId, String userId,
+                                          boolean regenerate,
+                                          boolean enableKnowledge, boolean enableNotes,
+                                          List<String> selectedKnowledgeDocs, List<String> selectedNotes,
+                                          List<String> fileIds) {
+        SseEmitter emitter = new SseEmitter(300000L);
+
+        SecurityContext securityContext = SecurityContextHolder.getContext();
+        String traceId = UUID.randomUUID().toString().replace("-", "");
+
+        CompletableFuture.runAsync(() -> {
+            SecurityContextHolder.setContext(securityContext);
+            long startTime = System.currentTimeMillis();
+
+            agentTools.setSearchFilters(enableKnowledge, enableNotes,
+                    selectedKnowledgeDocs, selectedNotes);
+            try {
+                SkillContextResolver.Context skillContext = skillContextResolver.resolve(userId);
+                List<ToolSpecification> activeTools = filterTools(enableKnowledge, enableNotes, skillContext);
+                if (!regenerate) {
+                    chatService.addMessage(sessionId, userId, "human", query);
+                }
+
+                log.info("工具过滤: enableKnowledge={}, enableNotes={}, skills={}, selectedKnowledgeDocs={}, selectedNotes={}, 可用工具数={}, tools={}",
+                        enableKnowledge, enableNotes, skillContext.version(), selectedKnowledgeDocs, selectedNotes,
+                        activeTools.size(), activeTools.stream().map(ToolSpecification::name).toList());
+
+                String attachmentContext = chatService.buildAttachmentContext(fileIds, userId);
+                String queryWithContext = attachmentContext != null
+                        ? attachmentContext + "用户问题：" + query
+                        : query;
+                String resolvedQuery = convCtxManager.resolveReferences(queryWithContext, sessionId);
+                String systemPrompt = loadSystemPrompt() + skillContext.prompt();
+
+                boolean useSupervisor = shouldUseSupervisor(query);
+                boolean artifactWriteBack = isArtifactWriteBackTask(query.trim().toLowerCase(Locale.ROOT));
+
+                ChatLanguageModel chatModel = modelFactory.createBalancedModel();
+                String normalizedGoal = buildSingleGoal(query);
+                var task = agentTaskService.createTask(userId, sessionId, query, normalizedGoal,
+                        useSupervisor ? "PLANNED" : "SINGLE");
+
+                AgentRuntime.RuntimeResult runtimeResult = agentRuntime.start(
+                        task.getTaskId(),
+                        query,
+                        resolvedQuery,
+                        sessionId,
+                        userId,
+                        systemPrompt,
+                        activeTools,
+                        emitter,
+                        useSupervisor,
+                        artifactWriteBack,
+                        chatModel
+                );
+
+                AgentLoopResult loopResult = runtimeResult.loopResult();
+                AgentState finalAgentState = loopResult.state();
+                String response;
+                if (loopResult.outcome() == AgentLoopResult.Outcome.NEED_CLARIFICATION) {
+                    response = loopResult.clarificationQuestion();
+                    agentTaskService.updateStatus(task.getTaskId(), AgentTaskStatus.WAITING_USER);
+                } else {
+                    response = composeAndReview(loopResult, query, emitter);
+                    agentTaskService.saveFinalResult(task.getTaskId(), AgentTaskStatus.COMPLETED, response, null);
+                }
+
+                chatService.addMessage(sessionId, userId, "ai", response);
+
+                sendSseEvent(emitter, "thinking", Map.of(
+                        "stage", "complete",
+                        "content", "已处理完成"
+                ));
+
+                int chunkSize = 50;
+                for (int i = 0; i < response.length(); i += chunkSize) {
+                    int end = Math.min(i + chunkSize, response.length());
+                    sendSseEvent(emitter, "response", Map.of(
+                            "content", response.substring(i, end),
+                            "session_id", sessionId
+                    ));
+                    Thread.sleep(50);
+                }
+
+                String ragTraceId = agentTools.getLatestTraceId();
+                String finalTraceId = ragTraceId != null ? ragTraceId : traceId;
+                log.info("Agent done - ragTraceId={}, finalTraceId={}, sessionId={}", ragTraceId, finalTraceId, sessionId);
+
+                List<ChatMessage> allHistory = chatService.getSessionMessages(sessionId);
+                int usedTokens = tokenCounter.estimateEntityTokens(allHistory);
+                int maxTokens = 32000;
+
+                Map<String, Object> doneData = new HashMap<>();
+                doneData.put("session_id", sessionId);
+                doneData.put("task_id", task.getTaskId());
+                doneData.put("trace_id", finalTraceId);
+                doneData.put("token_used", usedTokens);
+                doneData.put("token_max", maxTokens);
+
+                if (finalAgentState != null) {
+                    List<Artifact> artifacts = finalAgentState.getArtifacts();
+                    if (artifacts != null && !artifacts.isEmpty()) {
+                        List<Map<String, Object>> artifactList = new ArrayList<>();
+                        for (Artifact a : artifacts) {
+                            Map<String, Object> am = new HashMap<>();
+                            am.put("type", a.type());
+                            am.put("id", a.id());
+                            am.put("label", a.label());
+                            if (a.metadata() != null) {
+                                am.putAll(a.metadata());
+                            }
+                            artifactList.add(am);
+                        }
+                        doneData.put("artifacts", artifactList);
+                    }
+                }
+
+                sendSseEvent(emitter, "done", doneData);
+
                 if (ragTraceId == null) {
                     try {
                         RagTrace basicTrace = new RagTrace();
@@ -290,7 +398,6 @@ public class AgentService {
 
             } catch (Exception e) {
                 log.error("Agent stream failed: {}", e.getMessage(), e);
-                // 保存错误消息到会话（不让对话丢失）
                 try {
                     chatService.addMessage(sessionId, userId, "ai", "处理请求时发生错误: " + e.getMessage());
                 } catch (Exception ignored) {}

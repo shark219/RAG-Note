@@ -83,6 +83,16 @@ public class GoalEvaluator {
         // 4. 写操作成功 → 任务完成
         if (WRITE_TOOLS.contains(toolName)) {
             state.markWriteConfirmation(toolName + " 执行成功");
+            if ("createNote".equals(toolName)) {
+                state.setTaskStatus(TaskStatus.EXECUTING);
+                return GoalEvaluation.inProgress(state, "已创建笔记，继续后续步骤",
+                        "[目标未完成] 笔记已创建，但这只是中间步骤。请继续完成后续生成导图、追加内容或其它剩余步骤，不要停止。");
+            }
+            if ("appendNote".equals(toolName) && requiresWriteBackAfterArtifact(state)) {
+                state.setTaskStatus(TaskStatus.GOAL_ACHIEVED);
+                log.info("GoalEvaluator: 写回笔记成功且目标要求写回 → 目标达成");
+                return GoalEvaluation.achieved(state, toolName + " 执行成功");
+            }
             state.setTaskStatus(TaskStatus.GOAL_ACHIEVED);
             log.info("GoalEvaluator: 写操作 {} 成功 → 目标达成", toolName);
             return GoalEvaluation.achieved(state, toolName + " 执行成功");

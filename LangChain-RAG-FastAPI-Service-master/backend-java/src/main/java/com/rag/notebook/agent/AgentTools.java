@@ -24,6 +24,7 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Component
 public class AgentTools {
@@ -38,6 +39,7 @@ public class AgentTools {
 
     // 结构化结果缓存：AgentLoop 执行工具后从这里读取 ToolResult
     private final ThreadLocal<ToolResult> lastResult = new ThreadLocal<>();
+    private final ThreadLocal<AgentState> activeState = new ThreadLocal<>();
 
     // 当前请求的检索范围配置（由 AgentService 在启动 agent 前设置）
     private final ThreadLocal<Boolean> searchKnowledge = new ThreadLocal<>();
@@ -69,6 +71,14 @@ public class AgentTools {
         lastResult.set(result);
     }
 
+    public void bindState(AgentState state) {
+        activeState.set(state);
+    }
+
+    public void clearBoundState() {
+        activeState.remove();
+    }
+
     /** 设置当前请求的检索范围配置（供 AgentService 在启动 agent 前调用） */
     public void setSearchFilters(boolean sk, boolean sn,
                                   List<String> selectedKbDocs, List<String> selectedNts) {
@@ -95,6 +105,10 @@ public class AgentTools {
         String message = "笔记工具已被当前开关禁用: " + toolName;
         setResult(ToolResult.error(message, "TOOL_DISABLED", false));
         return message;
+    }
+
+    private AgentState state() {
+        return activeState.get();
     }
 
     @Tool("从知识库文档或笔记中检索相关内容并生成摘要。触发场景：用户提到'知识库'、'文档'、'资料'、'上传的文件'、'根据文档'、'根据我的笔记'、'根据笔记'、'笔记里怎么说'等关键词时必须调用此工具。注意：如果用户是想找特定笔记打开看，应该用 searchNotes 而不是 ragSummary")
@@ -322,12 +336,29 @@ public class AgentTools {
     public String createNote(@P("笔记标题，简洁明了") String title, @P("笔记内容，必须使用Markdown格式（#标题、-列表、```代码块等）") String content, @ToolMemoryId String userId) {
         if (!isNotesEnabled()) return notesDisabled("createNote");
         try {
+            AgentState state = state();
+            String key = "createNote:" + (state != null && state.getCurrentTaskType() != null ? state.getCurrentTaskType() : "");
+            if (state != null) {
+                if (state.hasCompletedActionKey(key) || state.getSharedNoteId() != null && !state.getSharedNoteId().isBlank()) {
+                    setResult(ToolResult.success("本任务已创建笔记，跳过重复创建，笔记ID: " + state.getSharedNoteId()));
+                    return "本任务已创建笔记，跳过重复创建，笔记ID: " + state.getSharedNoteId();
+                }
+            }
             NoteCreate noteCreate = new NoteCreate();
             noteCreate.setTitle(title);
             noteCreate.setContent(content);
             var result = noteService.createNote(userId, noteCreate);
+            if (state != null) {
+                state.setSharedNoteId(result.id());
+                state.setSharedNoteTitle(result.title());
+                state.addCompletedActionKey(key);
+                state.addKnownFact("已创建笔记ID：" + result.id());
+                state.addKnownFact("已创建笔记标题：" + result.title());
+            }
+            setResult(ToolResult.success("笔记创建成功，ID: " + result.id() + "，标题: " + result.title()));
             return "笔记创建成功，ID: " + result.id() + "，标题: " + result.title();
         } catch (Exception e) {
+            setResult(ToolResult.error("创建笔记失败: " + e.getMessage(), "CREATE_NOTE_ERROR", true));
             return "创建笔记失败: " + e.getMessage();
         }
     }
@@ -357,10 +388,30 @@ public class AgentTools {
             @ToolMemoryId String userId) {
         if (!isNotesEnabled()) return notesDisabled("appendNote");
         try {
+            String normalizedAppend = appendContent != null ? appendContent.trim() : "";
+            AgentState state = state();
+            if (normalizedAppend.isBlank()) {
+                setResult(ToolResult.empty("追加内容为空，已跳过。"));
+                return "追加内容为空，已跳过。";
+            }
+            if (state != null && state.getSharedNoteId() != null && !state.getSharedNoteId().isBlank()) {
+                noteId = state.getSharedNoteId();
+            }
+            String actionKey = noteId + ":" + normalizedAppend.hashCode();
+            if (state != null) {
+                if (state.hasCompletedActionKey(actionKey)) {
+                    setResult(ToolResult.success("本任务已完成相同追加操作，跳过重复追加，笔记ID: " + noteId));
+                    return "本任务已完成相同追加操作，跳过重复追加，笔记ID: " + noteId;
+                }
+                if (state.getSharedMindMap() != null && !state.getSharedMindMap().isBlank()
+                        && normalizedAppend.contains(state.getSharedMindMap())) {
+                    setResult(ToolResult.success("导图已存在，跳过重复追加，笔记ID: " + noteId));
+                    return "导图已存在，跳过重复追加，笔记ID: " + noteId;
+                }
+            }
             var note = noteService.getNote(userId, noteId);
             String oldContent = note.content() != null ? note.content() : "";
-            String normalizedAppend = appendContent != null ? appendContent.trim() : "";
-            if (!normalizedAppend.isBlank() && oldContent.contains(normalizedAppend)) {
+            if (oldContent.contains(normalizedAppend)) {
                 setResult(ToolResult.success("内容已存在，跳过重复追加，笔记ID: " + note.id()
                         + "，标题: " + note.title()));
                 return "内容已存在，跳过重复追加，笔记ID: " + note.id() + "，标题: " + note.title();
@@ -369,9 +420,20 @@ public class AgentTools {
             NoteUpdate update = new NoteUpdate();
             update.setContent(newContent);
             var result = noteService.updateNote(userId, noteId, update);
+            if (state != null) {
+                state.setSharedNoteId(result.id());
+                state.setSharedNoteTitle(result.title());
+                if (normalizedAppend.contains("mermaid") || normalizedAppend.contains("mindmap")) {
+                    state.setSharedMindMap(normalizedAppend);
+                }
+                state.addCompletedActionKey(actionKey);
+            }
+            setResult(ToolResult.success("内容追加成功，笔记ID: " + result.id() + "，标题: " + result.title()
+                    + "，当前总字数: " + newContent.length()));
             return "内容追加成功，笔记ID: " + result.id() + "，标题: " + result.title()
                     + "，当前总字数: " + newContent.length();
         } catch (Exception e) {
+            setResult(ToolResult.error("追加内容失败: " + e.getMessage(), "APPEND_NOTE_ERROR", true));
             return "追加内容失败: " + e.getMessage();
         }
     }
@@ -464,7 +526,6 @@ public class AgentTools {
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
             String body = response.body();
 
-            // 简单清理HTML标签
             String text = body.replaceAll("<script[^>]*>[\\s\\S]*?</script>", "")
                     .replaceAll("<style[^>]*>[\\s\\S]*?</style>", "")
                     .replaceAll("<[^>]+>", " ")
@@ -475,15 +536,28 @@ public class AgentTools {
                     .replaceAll("\\s+", " ")
                     .trim();
 
-            // 限制返回长度
             if (text.length() > 3000) {
                 text = text.substring(0, 3000) + "...(内容已截断)";
             }
 
-            return "网页内容抓取成功（HTTP " + response.statusCode() + "）：\n" + text;
+            AgentState state = state();
+            if (state != null && response.statusCode() == 200 && text.length() > 100) {
+                state.setSharedFetchedContent(text);
+                state.addKnownFact("已抓取网页正文，长度: " + text.length());
+            }
+
+            String display = "网页内容抓取成功（HTTP " + response.statusCode() + "）：\n" + text;
+            if (response.statusCode() >= 400 || text.isBlank() || text.length() < 80) {
+                setResult(ToolResult.error(display, "FETCH_URL_BAD_CONTENT", true));
+            } else {
+                setResult(ToolResult.success(display));
+            }
+            return display;
         } catch (IllegalArgumentException e) {
+            setResult(ToolResult.error("URL格式错误: " + e.getMessage(), "URL_INVALID", false));
             return "URL格式错误: " + e.getMessage();
         } catch (Exception e) {
+            setResult(ToolResult.error("抓取网页失败: " + e.getMessage(), "FETCH_URL_ERROR", true));
             return "抓取网页失败: " + e.getMessage();
         }
     }

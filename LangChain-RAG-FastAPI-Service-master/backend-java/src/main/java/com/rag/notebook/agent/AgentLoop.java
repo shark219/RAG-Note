@@ -1,6 +1,15 @@
 package com.rag.notebook.agent;
 
 import com.rag.notebook.agent.AgentState.ResultQuality;
+import com.rag.notebook.agent.runtime.AgentEventService;
+import com.rag.notebook.agent.runtime.AgentExecutionSnapshot;
+import com.rag.notebook.agent.runtime.AgentTaskEventType;
+import com.rag.notebook.agent.runtime.AgentTaskService;
+import com.rag.notebook.agent.runtime.ReflectionResult;
+import com.rag.notebook.agent.runtime.ReflectionService;
+import com.rag.notebook.agent.runtime.ReplanResult;
+import com.rag.notebook.agent.runtime.ReplanningService;
+import com.rag.notebook.agent.runtime.WorkerLoopContext;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
@@ -44,15 +53,27 @@ public class AgentLoop {
     private final ModelFactory modelFactory;
     private final GoalEvaluator goalEvaluator;
     private final ConversationContextManager contextManager;
+    private final ReflectionService reflectionService;
+    private final ReplanningService replanningService;
+    private final AgentTaskService agentTaskService;
+    private final AgentEventService agentEventService;
 
     public AgentLoop(AgentTools agentTools, ToolResultEvaluator evaluator,
                      ModelFactory modelFactory, GoalEvaluator goalEvaluator,
-                     ConversationContextManager contextManager) {
+                     ConversationContextManager contextManager,
+                     ReflectionService reflectionService,
+                     ReplanningService replanningService,
+                     AgentTaskService agentTaskService,
+                     AgentEventService agentEventService) {
         this.agentTools = agentTools;
         this.evaluator = evaluator;
         this.modelFactory = modelFactory;
         this.goalEvaluator = goalEvaluator;
         this.contextManager = contextManager;
+        this.reflectionService = reflectionService;
+        this.replanningService = replanningService;
+        this.agentTaskService = agentTaskService;
+        this.agentEventService = agentEventService;
     }
 
     /**
@@ -67,28 +88,70 @@ public class AgentLoop {
                       List<ToolSpecification> activeTools,
                       SseEmitter emitter,
                       String goal, List<String> successCriteria) throws IOException {
-
         AgentState state = new AgentState(userQuery);
+        WorkerLoopContext context = new WorkerLoopContext(
+                null,
+                null,
+                systemPrompt,
+                userQuery,
+                userId,
+                sessionId,
+                state,
+                historyMessages,
+                activeTools,
+                emitter,
+                MAX_ITERATIONS,
+                20,
+                32000,
+                goal,
+                successCriteria
+        );
+        return run(context);
+    }
 
-        // 设置目标
-        if (goal != null && !goal.isBlank()) {
-            state.setGoal(goal);
-            state.setSuccessCriteria(successCriteria);
-            log.info("目标: goal={}, successCriteria={}", goal, successCriteria);
+    public AgentLoopResult run(WorkerLoopContext context) throws IOException {
+
+        AgentState state = context.agentState() != null ? context.agentState() : new AgentState(context.userQuery());
+        agentTools.bindState(state);
+        state.setTaskId(context.taskId());
+        state.setStepId(context.stepId());
+
+        if (context.goal() != null && !context.goal().isBlank()) {
+            state.setGoal(context.goal());
+            state.setSuccessCriteria(context.successCriteria());
+            log.info("目标: goal={}, successCriteria={}", context.goal(), context.successCriteria());
         } else {
             state.setTaskStatus(TaskStatus.EXECUTING);
         }
 
         List<ChatMessage> messages = new ArrayList<>();
-        messages.add(SystemMessage.from(systemPrompt));
-        messages.addAll(historyMessages);
-        messages.add(UserMessage.from(userQuery));
+        messages.add(SystemMessage.from(context.systemPrompt()));
+        messages.addAll(context.messages());
+        messages.add(UserMessage.from(context.userQuery()));
 
-        for (int i = 0; i < MAX_ITERATIONS; i++) {
+        int maxIterations = context.maxIterations() != null ? context.maxIterations() : MAX_ITERATIONS;
+        int maxToolCalls = context.maxToolCalls() != null ? context.maxToolCalls() : 20;
+
+        for (int i = 0; i < maxIterations; i++) {
+            state.setIteration(i + 1);
+            persistSnapshot(context, state, null, null);
             log.info("Agent Loop 第 {} 轮", i + 1);
 
-            // 连续无进展 → 注入环境状态让 LLM 重新审视
             if (state.needsReflection()) {
+                ReflectionResult reflection = reflectionService.reflect(context, null, null);
+                if (reflection.summary() != null && !reflection.summary().isBlank()) {
+                    state.setLastReflectionSummary(reflection.summary());
+                    state.setLastFailureType(reflection.failureType());
+                    agentEventService.recordAndEmit(context.taskId(), AgentTaskEventType.REFLECTION_CREATED,
+                            Map.of("task_id", context.taskId(), "step_id", context.stepId(), "summary", reflection.summary()),
+                            context.emitter());
+                }
+                ReplanResult replanResult = replanningService.replan(context, reflection);
+                if (replanResult.summary() != null && !replanResult.summary().isBlank()) {
+                    agentEventService.recordAndEmit(context.taskId(), AgentTaskEventType.REPLAN_CREATED,
+                            Map.of("task_id", context.taskId(), "step_id", context.stepId(), "summary", replanResult.summary()),
+                            context.emitter());
+                }
                 String stateView = buildStateViewForReflection(state);
                 messages.add(UserMessage.from(stateView));
                 state.markProgress();
@@ -96,18 +159,16 @@ public class AgentLoop {
                         state.getConsecutiveNoProgress() + 1, stateView);
             }
 
-            // 每轮开始时发送思考状态，包含轮次和进度信息
-            sendRoundThinking(emitter, i + 1, state);
+            sendRoundThinking(context.emitter(), i + 1, state);
 
             ChatLanguageModel llm = modelFactory.createPreciseModel();
-            Response<AiMessage> response = llm.generate(messages, activeTools);
+            Response<AiMessage> response = llm.generate(messages, context.activeTools());
             AiMessage aiMessage = response.content();
 
             if (aiMessage.hasToolExecutionRequests()) {
                 messages.add(aiMessage);
                 boolean anyProgress = false;
 
-                // 打印 LLM 本轮决策
                 List<String> toolNames = aiMessage.toolExecutionRequests().stream()
                         .map(ToolExecutionRequest::name).toList();
                 log.info("LLM 决定调用工具: {} (第{}轮)", toolNames, i + 1);
@@ -115,11 +176,29 @@ public class AgentLoop {
                 int totalTools = aiMessage.toolExecutionRequests().size();
                 int toolIndex = 0;
                 for (ToolExecutionRequest req : aiMessage.toolExecutionRequests()) {
+                    if (state.getToolHistory().size() >= maxToolCalls) {
+                        state.setBlockedReason("达到最大工具调用次数限制");
+                        state.setLastFailureType("MAX_TOOL_CALLS");
+                        persistSnapshot(context, state, null, state.getBlockedReason());
+                        agentTools.clearBoundState();
+                        return AgentLoopResult.maxRounds(state);
+                    }
                     toolIndex++;
                     String toolName = req.name();
                     String toolArgs = req.arguments();
 
-                    sendSseEvent(emitter, "thinking", Map.of(
+                    if (!state.isToolAllowed(toolName)) {
+                        String blocked = "当前步骤禁止调用工具: " + toolName;
+                        messages.add(ToolExecutionResultMessage.from(req, blocked));
+                        state.addFailedAction(toolName + "(" + toolArgs + ")");
+                        continue;
+                    }
+
+                    agentEventService.recordAndEmit(context.taskId(), AgentTaskEventType.TOOL_CALLED,
+                            Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName, "args", toolArgs),
+                            context.emitter());
+
+                    sendSseEvent(context.emitter(), "thinking", Map.of(
                             "stage", "tool_call",
                             "round", i + 1,
                             "content", "正在调用工具: " + toolName,
@@ -127,7 +206,6 @@ public class AgentLoop {
                             "tool_total", totalTools
                     ));
 
-                    // 防重复规则 1：同工具同参数已失败过
                     if (state.hasCalledWithArgsAndFailed(toolName, toolArgs)) {
                         log.info("拦截重复调用: {}({})，之前已失败", toolName, toolArgs);
                         messages.add(ToolExecutionResultMessage.from(req,
@@ -135,7 +213,6 @@ public class AgentLoop {
                         continue;
                     }
 
-                    // 防重复规则 2：刚执行过完全相同的调用
                     if (state.hasSameAction(toolName, toolArgs)) {
                         log.info("拦截机械重复: {}({})，与上一轮完全相同", toolName, toolArgs);
                         messages.add(ToolExecutionResultMessage.from(req,
@@ -145,16 +222,13 @@ public class AgentLoop {
                         continue;
                     }
 
-                    // 执行工具
-                    String rawResult = executeTool(toolName, toolArgs, userId, activeTools);
+                    String rawResult = executeTool(toolName, toolArgs, context.userId(), context.activeTools());
                     ToolResult toolResult = getLastToolResult();
 
-                    // 评估并记录
                     ToolResultEvaluator.Evaluation eval = evaluator.evaluate(
                             toolName, toolArgs, rawResult, state.getOriginalQuery(), toolResult);
                     state.recordToolCall(toolName, toolArgs, rawResult, eval.quality());
 
-                    // 构建 Observation 注入给 LLM
                     String observationMsg = buildObservationMessage(
                             toolName, toolArgs, rawResult, eval, toolResult, state);
                     messages.add(ToolExecutionResultMessage.from(req, observationMsg));
@@ -166,27 +240,28 @@ public class AgentLoop {
                                     : rawResult != null ? rawResult.replace("\n", "\\n") : "(null)");
 
                     if (eval.quality() == ResultQuality.GOOD) {
-                        state.markProgress();
                         anyProgress = true;
+                        state.markProgress();
                         upgradeEvidenceFromTool(toolName, state);
                         extractFactsFromSuccess(toolName, toolArgs, rawResult, state);
-                        updateSessionContext(sessionId, toolName, toolArgs, rawResult);
+                        updateSessionContext(context.sessionId(), toolName, toolArgs, rawResult);
+                        agentEventService.record(context.taskId(), AgentTaskEventType.TOOL_SUCCEEDED,
+                                Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName));
 
-                        // ===== GoalEvaluator：目标是否已达成？ =====
                         GoalEvaluator.GoalEvaluation goalEval = goalEvaluator.evaluateAfterToolSuccess(
                                 state, toolName, rawResult);
+                        persistSnapshot(context, state, observationMsg, null);
                         if (goalEval.isAchieved()) {
                             log.info("GoalEvaluator: 目标已达成 → 工具 {} 成功后直接结束 (第{}轮)",
                                     toolName, i + 1);
-                            // 将目标达成信号注入最后一条消息
                             String finalMsg = rawResult + "\n\n---\n[目标已达成]\n"
                                     + goalEval.message() + "\n"
                                     + "请基于以上结果直接回答用户，不要再调用任何工具。";
                             messages.set(messages.size() - 1,
                                     ToolExecutionResultMessage.from(req, finalMsg));
+                            agentTools.clearBoundState();
                             return AgentLoopResult.ready(state);
                         }
-                        // 目标未达成 → 注入进度信息
                         if (goalEval.progressPrompt() != null) {
                             String enhancedMsg = observationMsg + "\n\n" + goalEval.progressPrompt();
                             messages.set(messages.size() - 1,
@@ -198,27 +273,37 @@ public class AgentLoop {
                         state.addKnownFact(toolName + "(\"" + truncateArgs(toolArgs)
                                 + "\") 执行成功但结果质量不足");
                         evaluator.buildStructuredReflection(toolName, toolArgs, eval, state);
+                        ReflectionResult reflection = reflectionService.reflect(context, toolName, rawResult);
+                        applyReflection(state, reflection);
+                        agentEventService.record(context.taskId(), AgentTaskEventType.TOOL_FAILED,
+                                Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName, "reason", eval.reason()));
+                        persistSnapshot(context, state, observationMsg, eval.reason());
                     } else {
                         state.markNoProgress();
                         evaluator.buildStructuredReflection(toolName, toolArgs, eval, state);
+                        ReflectionResult reflection = reflectionService.reflect(context, toolName, rawResult);
+                        applyReflection(state, reflection);
+                        agentEventService.record(context.taskId(), AgentTaskEventType.TOOL_FAILED,
+                                Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName, "reason", eval.reason()));
+                        persistSnapshot(context, state, observationMsg, eval.reason());
                     }
                 }
 
                 if (!anyProgress) state.markNoProgress();
 
             } else {
-                // LLM 返回文本，未调用工具
                 String answer = aiMessage.text();
                 log.info("LLM 返回文本（第{}轮，不调工具），内容预览: {}",
                         i + 1, answer.length() > 80 ? answer.substring(0, 80) + "..." : answer);
 
-                // 第1轮无工具调用且回复为反问 → 需要用户澄清意图
                 if (i == 0 && !state.hasSuccessfulToolCall() && isClarificationQuestion(answer)) {
                     log.info("Agent 识别为反问澄清: {}", answer.length() > 80 ? answer.substring(0, 80) + "..." : answer);
+                    persistSnapshot(context, state, answer, "需要用户澄清");
+                    agentTools.clearBoundState();
                     return AgentLoopResult.needClarification(state, answer);
                 }
 
-                if (!state.hasSuccessfulToolCall() && shouldForceRagBeforeDirectAnswer(activeTools, state.getOriginalQuery())) {
+                if (!state.hasSuccessfulToolCall() && shouldForceRagBeforeDirectAnswer(context.activeTools(), state.getOriginalQuery())) {
                     log.info("Agent Loop 强制先检索知识库/笔记: query={}", state.getOriginalQuery());
                     state.markNoProgress();
                     messages.add(UserMessage.from("""
@@ -227,26 +312,68 @@ public class AgentLoop {
                             不要直接用通用知识回答；如果 ragSummary 没有结果，再说明资料中未找到，并补充必要的通用解释。
                             检索 query：%s
                             """.formatted(state.getOriginalQuery())));
+                    persistSnapshot(context, state, null, null);
                     continue;
                 }
 
-                // GoalEvaluator 判断是否放行
                 GoalEvaluator.GoalEvaluation goalEval = goalEvaluator.evaluateOnTextResponse(state, answer);
                 if (goalEval.isBlocked()) {
                     log.info("GoalEvaluator 拦截 LLM 回答（第{}轮）: {}",
                             i + 1, goalEval.message());
                     state.markNoProgress();
                     messages.add(UserMessage.from(goalEval.progressPrompt()));
+                    persistSnapshot(context, state, answer, goalEval.message());
                     continue;
                 }
 
                 log.info("Agent Loop 完成，共 {} 轮", i + 1);
+                persistSnapshot(context, state, answer, null);
+                agentTools.clearBoundState();
                 return AgentLoopResult.ready(state);
             }
         }
 
-        log.info("Agent Loop 达到最大轮次 {}", MAX_ITERATIONS);
+        log.info("Agent Loop 达到最大轮次 {}", maxIterations);
+        persistSnapshot(context, state, null, "达到最大轮次");
+        agentTools.clearBoundState();
         return AgentLoopResult.maxRounds(state);
+    }
+
+    private void applyReflection(AgentState state, ReflectionResult reflection) {
+        if (reflection == null) {
+            return;
+        }
+        if (reflection.summary() != null && !reflection.summary().isBlank()) {
+            state.setLastReflectionSummary(reflection.summary());
+        }
+        if (reflection.failureType() != null && !reflection.failureType().isBlank()) {
+            state.setLastFailureType(reflection.failureType());
+        }
+        if (reflection.recommendedActions() != null) {
+            for (String action : reflection.recommendedActions()) {
+                state.addCandidateStrategy(action);
+            }
+        }
+        if (reflection.shouldAskUser()) {
+            state.setBlockedReason(reflection.rootCause());
+        }
+    }
+
+    private void persistSnapshot(WorkerLoopContext context, AgentState state, String latestObservation, String latestFailureReason) {
+        if (context.taskId() == null || context.taskId().isBlank()) {
+            return;
+        }
+        AgentExecutionSnapshot snapshot = new AgentExecutionSnapshot(
+                state.getIteration(),
+                state.getToolHistory().size(),
+                0,
+                state.buildStateSummary(),
+                latestObservation,
+                latestFailureReason,
+                state.getLastReflectionSummary(),
+                state
+        );
+        agentTaskService.updateExecutionSnapshot(context.taskId(), snapshot);
     }
 
     // ============================================================
