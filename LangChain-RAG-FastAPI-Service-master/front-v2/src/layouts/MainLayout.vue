@@ -58,6 +58,10 @@
             <template #icon><icon-trophy /></template>
             Skills 管理
           </a-menu-item>
+          <a-menu-item key="/system/agent-tasks">
+            <template #icon><icon-clock-circle /></template>
+            Agent 任务
+          </a-menu-item>
           <a-menu-item key="/system/debug">
             <template #icon><icon-bug /></template>
             开发者调试
@@ -114,6 +118,7 @@ import {
   IconCommand,
   IconTrophy,
   IconBug,
+  IconClockCircle,
 } from '@arco-design/web-vue/es/icon'
 
 const router = useRouter()
@@ -137,6 +142,7 @@ const menuTitleMap: Record<string, string> = {
   '/system/prompt': '提示词管理',
   '/system/mcp': 'MCP 工具',
   '/system/skills': 'Skills 管理',
+  '/system/agent-tasks': 'Agent 任务',
   '/system/debug': '开发者调试',
   '/settings': '个人设置',
 }

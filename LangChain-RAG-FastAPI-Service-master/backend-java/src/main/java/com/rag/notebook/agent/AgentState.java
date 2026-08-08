@@ -77,6 +77,12 @@ public class AgentState {
     private String sharedNoteTitle;
     private String sharedFetchedContent;
     private String sharedMindMap;
+    private boolean fetchStepFailed;
+    private String fetchFailureReason;
+    private String currentStepLabel;
+    private String currentStepDescription;
+    private String currentStepInstructions;
+    private int currentStepFailureCount;
 
     public AgentState(String originalQuery) {
         this.originalQuery = originalQuery;
@@ -264,6 +270,34 @@ public class AgentState {
 
     public void setSharedMindMap(String sharedMindMap) { this.sharedMindMap = sharedMindMap; }
 
+    public boolean isFetchStepFailed() { return fetchStepFailed; }
+
+    public void setFetchStepFailed(boolean fetchStepFailed) { this.fetchStepFailed = fetchStepFailed; }
+
+    public String getFetchFailureReason() { return fetchFailureReason; }
+
+    public void setFetchFailureReason(String fetchFailureReason) { this.fetchFailureReason = fetchFailureReason; }
+
+    public String getCurrentStepLabel() { return currentStepLabel; }
+
+    public void setCurrentStepLabel(String currentStepLabel) { this.currentStepLabel = currentStepLabel; }
+
+    public String getCurrentStepDescription() { return currentStepDescription; }
+
+    public void setCurrentStepDescription(String currentStepDescription) { this.currentStepDescription = currentStepDescription; }
+
+    public String getCurrentStepInstructions() { return currentStepInstructions; }
+
+    public void setCurrentStepInstructions(String currentStepInstructions) { this.currentStepInstructions = currentStepInstructions; }
+
+    public int getCurrentStepFailureCount() { return currentStepFailureCount; }
+
+    public void setCurrentStepFailureCount(int currentStepFailureCount) { this.currentStepFailureCount = Math.max(0, currentStepFailureCount); }
+
+    public void incrementCurrentStepFailureCount() { this.currentStepFailureCount++; }
+
+    public void resetCurrentStepFailureCount() { this.currentStepFailureCount = 0; }
+
     public String getBlockedReason() { return lastFailureType; }
 
     public void setBlockedReason(String blockedReason) { this.lastFailureType = blockedReason; }
@@ -430,6 +464,42 @@ public class AgentState {
                 if (a.label() != null) sb.append(": ").append(a.label());
                 sb.append("\n");
             }
+        }
+
+        if (!toolAllowedNames.isEmpty()) {
+            sb.append("\n当前步骤允许工具：\n");
+            for (String toolName : toolAllowedNames) {
+                sb.append("  - ").append(toolName).append("\n");
+            }
+        }
+
+        if (currentStepLabel != null && !currentStepLabel.isBlank()) {
+            sb.append("\n当前步骤：").append(currentStepLabel).append("\n");
+        }
+        if (currentStepDescription != null && !currentStepDescription.isBlank()) {
+            sb.append("步骤说明：").append(currentStepDescription).append("\n");
+        }
+        if (currentStepInstructions != null && !currentStepInstructions.isBlank()) {
+            sb.append("步骤约束：\n").append(currentStepInstructions).append("\n");
+        }
+
+        if (sharedNoteTitle != null && !sharedNoteTitle.isBlank()) {
+            sb.append("\n共享笔记标题：").append(sharedNoteTitle).append("\n");
+        }
+        if (sharedNoteId != null && !sharedNoteId.isBlank()) {
+            sb.append("共享笔记ID：").append(sharedNoteId).append("\n");
+        }
+        if (sharedFetchedContent != null && !sharedFetchedContent.isBlank()) {
+            String preview = sharedFetchedContent.length() > 400
+                    ? sharedFetchedContent.substring(0, 400) + "..."
+                    : sharedFetchedContent;
+            sb.append("已抓取正文预览：").append(preview).append("\n");
+        }
+        if (sharedMindMap != null && !sharedMindMap.isBlank()) {
+            String preview = sharedMindMap.length() > 400
+                    ? sharedMindMap.substring(0, 400) + "..."
+                    : sharedMindMap;
+            sb.append("已生成导图预览：").append(preview).append("\n");
         }
 
         // 最近观察

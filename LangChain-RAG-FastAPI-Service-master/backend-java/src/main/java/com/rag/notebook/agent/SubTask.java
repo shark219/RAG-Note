@@ -46,8 +46,4 @@ public class SubTask {
 
     /** 建议的工具（可选参考，Agent 可自主选择其他工具） */
     private String toolHint;
-
-    /** 已废弃——改用 successCriteria 判断 */
-    @Deprecated
-    private boolean mustUseTool;
 }

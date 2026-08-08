@@ -106,7 +106,6 @@ public class SupervisorService {
                 } else if (node.has("tool")) {
                     task.setToolHint(node.get("tool").asText());
                 }
-                task.setMustUseTool(node.has("mustUseTool") && node.get("mustUseTool").asBoolean());
 
                 // 解析目标追踪字段
                 task.setGoal(node.has("goal") ? node.get("goal").asText() : null);

@@ -136,8 +136,13 @@ public class GoalEvaluator {
             return GoalEvaluation.blocked(state, buildMustCallToolPrompt(state));
         }
 
-        // 调用过工具但全部 POOR/ERROR → 拦截（需要换策略）
+        // 调用过工具但全部 POOR/ERROR → 判断是否为如实说明场景
         if (!state.hasGoodQualityResult()) {
+            // 已连续失败多次 + LLM 明确说明无法完成 → 放行
+            if (state.getConsecutiveNoProgress() >= 2 && isExplicitFailureExplanation(llmAnswer)) {
+                log.info("GoalEvaluator: 放行 — 连续失败且 LLM 如实说明无法完成");
+                return GoalEvaluation.allowed(state);
+            }
             log.info("GoalEvaluator: 拦截 — 工具调用结果全为 POOR/ERROR");
             return GoalEvaluation.blocked(state, buildPoorQualityPrompt(state));
         }
@@ -168,6 +173,29 @@ public class GoalEvaluator {
         // 无明确目标 → 放行（自由对话场景）
         log.info("GoalEvaluator: 放行 — 无明确目标，自由对话");
         return GoalEvaluation.allowed(state);
+    }
+
+    /**
+     * 判断 LLM 回复是否为"如实说明失败"场景。
+     * 特征：明确说明无法完成 + 解释原因 + 不是简单抱怨
+     */
+    private boolean isExplicitFailureExplanation(String llmAnswer) {
+        if (llmAnswer == null || llmAnswer.length() < 20) return false;
+        String text = llmAnswer.toLowerCase();
+
+        // 必须包含明确的失败说明
+        boolean hasFailureStatement = containsAny(text,
+                "无法完成", "无法继续", "不能完成", "无法获取", "抓取失败", "失败了",
+                "拿不到", "获取不到", "访问失败", "连接失败", "超时", "无法抓取");
+
+        // 必须包含原因解释
+        boolean hasReason = containsAny(text,
+                "原因", "因为", "由于", "所以", "导致", "限制", "拦截", "反爬");
+
+        // 排除简单抱怨或无实质内容
+        boolean notTrivial = llmAnswer.length() > 50;
+
+        return hasFailureStatement && hasReason && notTrivial;
     }
 
     // ============================================================

@@ -4,6 +4,7 @@ public enum AgentTaskEventType {
     TASK_CREATED,
     PLAN_CREATED,
     STEP_STARTED,
+    STEP_SKIPPED,
     TOOL_CALLED,
     TOOL_SUCCEEDED,
     TOOL_FAILED,

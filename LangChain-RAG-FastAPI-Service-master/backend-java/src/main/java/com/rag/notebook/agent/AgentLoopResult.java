@@ -18,7 +18,9 @@ public record AgentLoopResult(
         /** 达到最大轮次，证据可能不足，Composer 需诚实说明 */
         MAX_ROUNDS,
         /** 用户意图模糊，需要反问澄清（替代独立的 ClarifierService） */
-        NEED_CLARIFICATION
+        NEED_CLARIFICATION,
+        /** 前置条件失败，当前任务无法继续 */
+        BLOCKED
     }
 
     public static AgentLoopResult ready(AgentState state) {
@@ -31,5 +33,9 @@ public record AgentLoopResult(
 
     public static AgentLoopResult needClarification(AgentState state, String question) {
         return new AgentLoopResult(Outcome.NEED_CLARIFICATION, state, question);
+    }
+
+    public static AgentLoopResult blocked(AgentState state, String reason) {
+        return new AgentLoopResult(Outcome.BLOCKED, state, reason);
     }
 }

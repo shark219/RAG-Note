@@ -10,6 +10,8 @@ import com.rag.notebook.chat.entity.ChatMessage;
 import com.rag.notebook.chat.service.ChatService;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.model.chat.ChatLanguageModel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -21,10 +23,12 @@ import java.util.Map;
 @Service
 public class AgentRuntime {
 
+    private static final Logger log = LoggerFactory.getLogger(AgentRuntime.class);
+
     private static final List<String> FETCH_ONLY_TOOLS = List.of("fetchUrl");
-    private static final List<String> CREATE_NOTE_TOOLS = List.of("createNote", "fetchUrl", "whatTimeIsNow");
-    private static final List<String> GENERATE_MINDMAP_TOOLS = List.of("generateMindMap", "fetchUrl", "getRecentNotes", "getNote", "whatTimeIsNow");
-    private static final List<String> APPEND_NOTE_TOOLS = List.of("appendNote", "getRecentNotes", "getNote", "whatTimeIsNow");
+    private static final List<String> CREATE_NOTE_TOOLS = List.of("createNote");
+    private static final List<String> GENERATE_MINDMAP_TOOLS = List.of("generateMindMap");
+    private static final List<String> APPEND_NOTE_TOOLS = List.of("appendNote");
 
     private final AgentTaskService agentTaskService;
     private final AgentEventService agentEventService;
@@ -32,19 +36,25 @@ public class AgentRuntime {
     private final ChatService chatService;
     private final ContextManager contextManager;
     private final AgentLoop agentLoop;
+    private final ReflectionService reflectionService;
+    private final ReplanningService replanningService;
 
     public AgentRuntime(AgentTaskService agentTaskService,
                         AgentEventService agentEventService,
                         SupervisorService supervisorService,
                         ChatService chatService,
                         ContextManager contextManager,
-                        AgentLoop agentLoop) {
+                        AgentLoop agentLoop,
+                        ReflectionService reflectionService,
+                        ReplanningService replanningService) {
         this.agentTaskService = agentTaskService;
         this.agentEventService = agentEventService;
         this.supervisorService = supervisorService;
         this.chatService = chatService;
         this.contextManager = contextManager;
         this.agentLoop = agentLoop;
+        this.reflectionService = reflectionService;
+        this.replanningService = replanningService;
     }
 
     public RuntimeResult start(String taskId,
@@ -178,6 +188,17 @@ public class AgentRuntime {
         AgentLoopResult finalResult = null;
         for (SubTask task : resumeContext.remainingSteps()) {
             String stepId = task.getId();
+            String taskType = classifyTask(task);
+
+            // 前置依赖检查：如果当前步骤需要前一步的产物，但前一步失败了，跳过后续步骤
+            if (shouldSkipDueToMissingDependency(taskType, sharedState)) {
+                log.info("步骤 {} 跳过：前置依赖不满足（类型: ）", stepId, taskType);
+                agentTaskService.markStepStatus(resumeContext.taskId(), stepId, AgentTaskStatus.BLOCKED, "前置步骤未完成，缺少必需的数据");
+                agentEventService.recordAndEmit(resumeContext.taskId(), AgentTaskEventType.STEP_SKIPPED,
+                        Map.of("task_id", resumeContext.taskId(), "step_id", stepId, "reason", "missing_dependency"), emitter);
+                continue;
+            }
+
             agentTaskService.markStepStatus(resumeContext.taskId(), stepId, AgentTaskStatus.RUNNING, null);
             agentEventService.recordAndEmit(resumeContext.taskId(), AgentTaskEventType.STEP_STARTED,
                     Map.of("task_id", resumeContext.taskId(), "step_id", stepId, "label", task.getLabel(), "resumed", true), emitter);
@@ -195,10 +216,47 @@ public class AgentRuntime {
                     task.getGoal(),
                     task.getSuccessCriteria(),
                     allowedToolsForTask(task),
-                    classifyTask(task),
+                    taskType,
                     false
             ), sharedState));
             mergeState(sharedState, stepResult.state());
+
+            // 关键步骤失败后触发重规划
+            if (shouldTriggerReplan(stepResult, taskType, sharedState)) {
+                log.info("步骤 {} 失败且为关键前置步骤，触发重规划", stepId);
+                agentEventService.recordAndEmit(resumeContext.taskId(), AgentTaskEventType.REFLECTION_CREATED,
+                        Map.of("task_id", resumeContext.taskId(), "step_id", stepId, "reason", "critical_step_failed"), emitter);
+
+                ReflectionResult reflection = reflectionService.reflect(
+                        buildStepContext(new StepExecutionContext(
+                                resumeContext.taskId(), stepId, systemPrompt, resumedQuery,
+                                resumeContext.userId(), resumeContext.sessionId(),
+                                historyMessages, activeTools, emitter,
+                                task.getGoal(), task.getSuccessCriteria(),
+                                allowedToolsForTask(task), taskType, false
+                        ), sharedState),
+                        null,
+                        stepResult.state().buildStateSummary()
+                );
+
+                if (reflection.shouldReplan()) {
+                    agentEventService.recordAndEmit(resumeContext.taskId(), AgentTaskEventType.REPLAN_CREATED,
+                            Map.of("task_id", resumeContext.taskId(), "reason", reflection.rootCause()), emitter);
+
+                    // 当前简化处理：关键步骤失败后直接终止任务，不再执行后续步骤
+                    // TODO: 后续可以调用 SupervisorService 重新规划，生成"请用户提供正文"的备用方案
+                    agentTaskService.markStepStatus(resumeContext.taskId(), stepId, AgentTaskStatus.FAILED, reflection.rootCause());
+                    agentTaskService.updateStatus(resumeContext.taskId(), AgentTaskStatus.BLOCKED);
+
+                    String clarification = "抓取网页内容失败，无法完成后续步骤。" +
+                            "如果你方便的话，可以直接提供文章正文，或者提供其他可访问的链接。";
+                    return new RuntimeResult(
+                            new AgentLoopResult(AgentLoopResult.Outcome.NEED_CLARIFICATION, sharedState, clarification),
+                            Collections.emptyList()
+                    );
+                }
+            }
+
             agentTaskService.markStepStatus(resumeContext.taskId(), stepId,
                     mapOutcome(stepResult.outcome()),
                     stepResult.clarificationQuestion() != null ? stepResult.clarificationQuestion() : stepResult.outcome().name());
@@ -223,6 +281,9 @@ public class AgentRuntime {
         state.setSuccessCriteria(List.of());
         state.setToolAllowedNames(stepContext.allowedToolNames());
         state.setCurrentTaskType(stepContext.taskType());
+        state.setCurrentStepLabel(resolveStepLabel(stepContext));
+        state.setCurrentStepDescription(resolveStepDescription(stepContext));
+        state.setCurrentStepInstructions(buildStepInstructions(stepContext, sharedState));
         return new WorkerLoopContext(
                 stepContext.taskId(),
                 stepContext.stepId(),
@@ -254,14 +315,90 @@ public class AgentRuntime {
     }
 
     private String classifyTask(SubTask task) {
-        String text = ((task.getLabel() != null ? task.getLabel() : "") + "\n"
-                + (task.getGoal() != null ? task.getGoal() : "") + "\n"
-                + (task.getDescription() != null ? task.getDescription() : "")).toLowerCase();
-        if (text.contains("抓取") || text.contains("网址") || text.contains("网页")) return "FETCH";
-        if (text.contains("新建笔记") || text.contains("创建笔记")) return "CREATE_NOTE";
-        if (text.contains("思维导图") || text.contains("脑图")) return "GENERATE_MINDMAP";
-        if (text.contains("追加") || text.contains("写入") || text.contains("写回")) return "APPEND_NOTE";
+        String toolHint = task.getToolHint() != null ? task.getToolHint() : "";
+
+        // 优先看 toolHint，这是 Supervisor 明确给的工具建议
+        if ("fetchUrl".equalsIgnoreCase(toolHint)) {
+            return "FETCH";
+        }
+        if ("createNote".equalsIgnoreCase(toolHint)) {
+            return "CREATE_NOTE";
+        }
+        if ("appendNote".equalsIgnoreCase(toolHint)) {
+            return "APPEND_NOTE";
+        }
+        if ("generateMindMap".equalsIgnoreCase(toolHint)) {
+            return "GENERATE_MINDMAP";
+        }
+
+        // toolHint 为空或无法识别时，才按语义匹配，并优先看"动作词"而非"上下文名词"
+        String label = task.getLabel() != null ? task.getLabel() : "";
+        String goal = task.getGoal() != null ? task.getGoal() : "";
+        String description = task.getDescription() != null ? task.getDescription() : "";
+
+        // 先看明确的写入动作，避免"网址内容"误判
+        if (label.contains("新建笔记") || label.contains("创建笔记")
+                || goal.contains("创建一篇") || goal.contains("新建一篇")) {
+            return "CREATE_NOTE";
+        }
+        if (label.contains("追加") || label.contains("写入笔记") || label.contains("写回")
+                || goal.contains("追加到") || goal.contains("写入新笔记")) {
+            return "APPEND_NOTE";
+        }
+        if (label.contains("思维导图") || label.contains("脑图") || label.contains("生成思维导图")
+                || goal.contains("生成思维导图") || goal.contains("生成Mermaid")) {
+            return "GENERATE_MINDMAP";
+        }
+
+        // 最后才是"抓取/获取网址"，只有明确带动作时才认定
+        String allText = (label + "\n" + goal + "\n" + description).toLowerCase();
+        if (allText.contains("抓取") || allText.contains("获取网址") || allText.contains("总结网页内容")) {
+            return "FETCH";
+        }
+
         return "GENERAL";
+    }
+
+    /**
+     * 前置依赖检查：判断当前步骤是否应该因前置产物缺失而跳过
+     */
+    private boolean shouldSkipDueToMissingDependency(String taskType, AgentState sharedState) {
+        return switch (taskType) {
+            case "CREATE_NOTE" -> {
+                // 创建笔记需要正文，如果共享状态里标记了"抓取失败且无内容"，跳过
+                boolean fetchFailed = sharedState.isFetchStepFailed();
+                String sharedContent = sharedState.getSharedFetchedContent();
+                yield fetchFailed && (sharedContent == null || sharedContent.isBlank() || sharedContent.length() < 100);
+            }
+            case "GENERATE_MINDMAP" -> {
+                // 生成导图需要笔记ID或正文
+                String noteId = sharedState.getSharedNoteId();
+                String content = sharedState.getSharedFetchedContent();
+                yield (noteId == null || noteId.isBlank()) && (content == null || content.isBlank() || content.length() < 100);
+            }
+            case "APPEND_NOTE" -> {
+                // 追加内容需要笔记ID
+                String noteId = sharedState.getSharedNoteId();
+                yield noteId == null || noteId.isBlank();
+            }
+            default -> false;
+        };
+    }
+
+    /**
+     * 判断是否应该触发重规划：关键前置步骤失败时需要重新评估整个任务
+     */
+    private boolean shouldTriggerReplan(AgentLoopResult stepResult, String taskType, AgentState sharedState) {
+        // 只有在达到最大轮次且是关键前置步骤时才触发
+        if (stepResult.outcome() != AgentLoopResult.Outcome.MAX_ROUNDS) {
+            return false;
+        }
+        // FETCH 是关键前置步骤，失败后应该重规划或终止
+        if ("FETCH".equals(taskType) && sharedState.isFetchStepFailed()) {
+            return true;
+        }
+        // TODO: 后续可以扩展其他关键步骤的判断
+        return false;
     }
 
     private AgentTaskStatus mapOutcome(AgentLoopResult.Outcome outcome) {
@@ -269,7 +406,51 @@ public class AgentRuntime {
             case READY -> AgentTaskStatus.COMPLETED;
             case MAX_ROUNDS -> AgentTaskStatus.BLOCKED;
             case NEED_CLARIFICATION -> AgentTaskStatus.WAITING_USER;
+            case BLOCKED -> AgentTaskStatus.BLOCKED;
         };
+    }
+
+    private String resolveStepLabel(StepExecutionContext stepContext) {
+        return stepContext.stepId() != null ? stepContext.stepId() : stepContext.taskType();
+    }
+
+    private String resolveStepDescription(StepExecutionContext stepContext) {
+        return stepContext.goal();
+    }
+
+    private String buildStepInstructions(StepExecutionContext stepContext, AgentState state) {
+        String taskType = stepContext.taskType();
+        List<String> allowedTools = stepContext.allowedToolNames();
+        StringBuilder sb = new StringBuilder();
+        sb.append("你当前在执行一个严格受限的子步骤。\n");
+        sb.append("本步骤只允许调用这些工具：").append(String.join(", ", allowedTools)).append("。\n");
+        sb.append("任何不在白名单里的工具都禁止调用，禁止自行重建流程、禁止补做其它步骤。\n");
+        sb.append("前一步的产物已经保存在共享状态里，优先使用共享状态，不要重新搜索、重新抓取、重新生成。\n");
+
+        switch (taskType) {
+            case "FETCH" -> sb.append("当前目标只是在 fetchUrl 中拿到高质量正文。完成后停止，不要创建笔记、不要搜索笔记、不要生成导图。\n");
+            case "CREATE_NOTE" -> sb.append("当前目标只是在已有正文基础上创建笔记。正文已经在共享状态中时，直接使用；不要再抓网页，不要查询笔记列表，不要生成导图。\n");
+            case "GENERATE_MINDMAP" -> sb.append("当前目标只是在已有笔记上下文中生成导图。优先使用共享 noteId；不要再读取最近笔记，不要抓网页，不要创建或追加笔记。\n");
+            case "APPEND_NOTE" -> sb.append("当前目标只是在已有笔记中追加导图或内容。优先使用共享 noteId 和共享导图；不要重新生成导图，不要搜索笔记，不要抓网页。\n");
+            default -> sb.append("如果共享状态已经提供了本步骤所需输入，直接完成当前步骤。\n");
+        }
+
+        if (state.getSharedNoteId() != null && !state.getSharedNoteId().isBlank()) {
+            sb.append("共享 noteId：").append(state.getSharedNoteId()).append("\n");
+        }
+        if (state.getSharedFetchedContent() != null && !state.getSharedFetchedContent().isBlank()) {
+            String preview = state.getSharedFetchedContent().length() > 300
+                    ? state.getSharedFetchedContent().substring(0, 300) + "..."
+                    : state.getSharedFetchedContent();
+            sb.append("共享正文预览：").append(preview).append("\n");
+        }
+        if (state.getSharedMindMap() != null && !state.getSharedMindMap().isBlank()) {
+            String preview = state.getSharedMindMap().length() > 300
+                    ? state.getSharedMindMap().substring(0, 300) + "..."
+                    : state.getSharedMindMap();
+            sb.append("共享导图预览：").append(preview).append("\n");
+        }
+        return sb.toString();
     }
 
     private void mergeState(AgentState target, AgentState source) {

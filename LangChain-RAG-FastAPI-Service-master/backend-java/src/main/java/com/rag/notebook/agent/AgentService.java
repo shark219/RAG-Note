@@ -427,129 +427,6 @@ public class AgentService {
     private record PipeResult(String response, AgentState state) {}
 
     /**
-     * 顺序执行管道：按子任务逐个运行 AgentLoop，并把上一步结果注入下一步。
-     */
-    private PipeResult runSequentialPipeline(String systemPrompt, String query,
-                                          List<dev.langchain4j.data.message.ChatMessage> historyMessages,
-                                          String userId, String sessionId,
-                                          List<ToolSpecification> activeTools,
-                                          SseEmitter emitter,
-                                          List<SubTask> subTasks) throws IOException {
-        String resolvedQuery = convCtxManager.resolveReferences(query, sessionId);
-
-        sendSseEvent(emitter, "thinking", Map.of(
-                "stage", "planning",
-                "content", "顺序执行 " + subTasks.size() + " 个目标"
-        ));
-
-        record SubResult(String taskId, String label, String content, AgentState state) {}
-        List<SubResult> results = new ArrayList<>();
-        AgentState mergedState = new AgentState(query);
-        StringBuilder completedContext = new StringBuilder();
-
-        for (int i = 0; i < subTasks.size(); i++) {
-            SubTask task = subTasks.get(i);
-            sendSseEvent(emitter, "thinking", Map.of(
-                    "stage", "planning",
-                    "content", "顺序执行第 " + (i + 1) + "/" + subTasks.size() + " 个目标: " + task.getLabel()
-            ));
-
-            String taskPrompt = buildSequentialTaskPrompt(systemPrompt, task, i, subTasks.size());
-            String taskQuery = buildSequentialTaskQuery(completedContext, task);
-
-            AgentLoopResult loopResult = agentLoop.run(taskPrompt, taskQuery,
-                    historyMessages, userId, sessionId, activeTools, emitter,
-                    task.getGoal(), task.getSuccessCriteria());
-
-            mergeState(mergedState, loopResult.state());
-
-            if (loopResult.outcome() == AgentLoopResult.Outcome.NEED_CLARIFICATION) {
-                return new PipeResult(loopResult.clarificationQuestion(), mergedState);
-            }
-
-            String content = responseComposer.compose(EvidencePack.from(loopResult.state()), loopResult.outcome());
-            results.add(new SubResult(task.getId(), task.getLabel(), content, loopResult.state()));
-
-            completedContext.append(buildSubTaskContextEntry(task, content, loopResult.state()));
-        }
-
-        sendSseEvent(emitter, "thinking", Map.of(
-                "stage", "composing",
-                "content", "正在整合 " + results.size() + " 个顺序目标结果"
-        ));
-
-        String answer = synthesizeResults(query, subTasks, results);
-        return new PipeResult(answer, mergedState);
-    }
-
-    /**
-     * 并行执行管道：多 Agent 并行处理独立子任务
-     */
-    private PipeResult runParallelPipeline(String systemPrompt, String query,
-                                        List<dev.langchain4j.data.message.ChatMessage> historyMessages,
-                                        String userId, String sessionId,
-                                        List<ToolSpecification> activeTools,
-                                        SseEmitter emitter,
-                                        List<SubTask> subTasks) throws IOException {
-
-        sendSseEvent(emitter, "thinking", Map.of(
-                "stage", "planning",
-                "content", "并行执行 " + subTasks.size() + " 个子任务"
-        ));
-
-        // 并行启动各子 Agent
-        record SubResult(String taskId, String label, String content, AgentState state) {}
-        List<SubResult> results = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-        for (SubTask task : subTasks) {
-            futures.add(CompletableFuture.runAsync(() -> {
-                try {
-                    String taskPrompt = systemPrompt
-                            + "\n\n[当前任务目标] " + task.getGoal()
-                            + "\n请专注于完成此目标，完成后直接输出结果。";
-
-                    AgentLoopResult r = agentLoop.run(taskPrompt, query,
-                            historyMessages, userId, sessionId, activeTools, emitter,
-                            task.getGoal(), null);
-
-                    // Composer 生成子任务的回答片段
-                    String content = responseComposer.compose(EvidencePack.from(r.state()), r.outcome());
-
-                    results.add(new SubResult(task.getId(), task.getLabel(), content, r.state()));
-                    log.info("并行子任务 [{}] {} 完成, {} 字", task.getId(), task.getLabel(),
-                            content.length());
-                } catch (Exception e) {
-                    log.warn("并行子任务 [{}] 失败: {}", task.getId(), e.getMessage());
-                    results.add(new SubResult(task.getId(), task.getLabel(),
-                            "执行失败: " + e.getMessage(), null));
-                }
-            }, taskExecutor));
-        }
-
-        // 等待全部完成
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-
-        // 合并 AgentState（产物、证据等）
-        AgentState mergedState = new AgentState(query);
-        for (SubResult sr : results) {
-            if (sr.state() != null) {
-                mergeState(mergedState, sr.state());
-            }
-        }
-
-        sendSseEvent(emitter, "thinking", Map.of(
-                "stage", "composing",
-                "content", "正在整合 " + results.size() + " 个子任务结果"
-        ));
-
-        // Writer 合成最终回答
-        String answer = synthesizeResults(query, subTasks, results);
-        log.info("并行管道完成: {} 个子任务, 最终回答 {} 字", subTasks.size(), answer.length());
-        return new PipeResult(answer, mergedState);
-    }
-
-    /**
      * Composer + 质量审查
      */
     private String composeAndReview(AgentLoopResult loopResult, String query,
@@ -630,6 +507,12 @@ public class AgentService {
         if (source.hasWriteConfirmation()) {
             target.markWriteConfirmation(source.getWriteConfirmation());
         }
+
+        // 传播关键失败状态
+        if (source.isFetchStepFailed()) {
+            log.info("mergeState: 传播 fetchStepFailed=true 到目标状态");
+            target.setFetchStepFailed(true);
+        }
     }
 
     /**
@@ -693,97 +576,10 @@ public class AgentService {
         return "完成用户请求：" + query.trim();
     }
 
-    private String buildSequentialTaskPrompt(String systemPrompt, SubTask task, int index, int total) {
-        StringBuilder sb = new StringBuilder(systemPrompt);
-        sb.append("\n\n[顺序任务执行]\n");
-        sb.append("当前是第 ").append(index + 1).append("/").append(total).append(" 个子任务。\n");
-        sb.append("当前目标：").append(task.getGoal()).append("\n");
-        if (task.getToolHint() != null && !task.getToolHint().isBlank()) {
-            sb.append("建议工具：").append(task.getToolHint()).append("（仅作参考，必要时可换工具）\n");
-        }
-        sb.append("只完成当前目标，不要提前执行后续目标，也不要重复执行已完成的上一步。\n");
-        sb.append("如果当前目标是读取笔记，成功读取完整笔记后就停止；不要生成导图或写回笔记。\n");
-        sb.append("如果当前目标是生成导图，成功生成导图后就停止；不要写回笔记。\n");
-        sb.append("如果当前目标是写回笔记，只把上一步产物追加/写入原笔记一次。当前目标完成后直接输出当前结果。");
-        return sb.toString();
-    }
-
-    private String buildSequentialTaskQuery(StringBuilder completedContext, SubTask task) {
-        StringBuilder sb = new StringBuilder();
-        if (completedContext.length() > 0) {
-            sb.append("[已完成的上一步结果]\n").append(completedContext).append("\n");
-        }
-        if (task.getDescription() != null && !task.getDescription().isBlank()) {
-            sb.append("当前子任务上下文：").append(task.getDescription()).append("\n");
-        }
-        sb.append("当前子任务目标：").append(task.getGoal());
-        return sb.toString();
-    }
-
-    private String buildSubTaskContextEntry(SubTask task, String content, AgentState state) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("- ").append(task.getLabel() != null ? task.getLabel() : task.getId()).append(": ");
-        sb.append(content != null ? content : "").append("\n");
-
-        if (!state.getWorkingMemory().isEmpty()) {
-            sb.append("  [关键事实]\n");
-            for (String fact : state.getWorkingMemory()) {
-                sb.append("  - ").append(fact).append("\n");
-            }
-        }
-
-        for (Artifact artifact : state.getArtifacts()) {
-            if (artifact.metadata() == null) continue;
-            Object artifactContent = artifact.metadata().get("content");
-            if (artifactContent != null && !artifactContent.toString().isBlank()) {
-                sb.append("  [产物内容: ").append(artifact.type()).append("]\n");
-                sb.append(truncateForContext(artifactContent.toString(), 8000)).append("\n");
-            }
-        }
-        return sb.toString();
-    }
-
-    private String truncateForContext(String text, int maxLen) {
-        if (text == null || text.length() <= maxLen) return text;
-        return text.substring(0, maxLen) + "\n...(truncated)";
-    }
-
-    /**
-     * 用 WriterService 合成多个并行子任务的结果
-     */
-    private String synthesizeResults(String query, List<SubTask> subTasks,
-                                      List<?> results) {
-        Map<String, String> resultMap = new LinkedHashMap<>();
-        for (Object obj : results) {
-            try {
-                var method = obj.getClass().getMethod("taskId");
-                var contentMethod = obj.getClass().getMethod("content");
-                resultMap.put((String) method.invoke(obj), (String) contentMethod.invoke(obj));
-            } catch (Exception ignored) {}
-        }
-
-        String answer = writerService.synthesize(query, subTasks, resultMap);
-
-        // 质量审查
-        List<Map<String, Object>> reviewDocs = resultMap.values().stream()
-                .map(r -> Map.<String, Object>of("content", r.length() > 500 ? r.substring(0, 500) : r))
-                .toList();
-
-        if (!reviewDocs.isEmpty()) {
-            var review = qualityReviewer.reviewAnswer(query, reviewDocs, answer);
-            if (!review.approved()) {
-                log.info("并行管道审查未通过: {}, 重新合成", review.reason());
-                answer = writerService.synthesize(
-                        query + "\n\n注意：" + review.feedback(), subTasks, resultMap);
-            }
-        }
-        return answer;
-    }
-
     /**
      * 解析工具调用的 JSON 参数（使用 Jackson，正确处理 \n \t 等转义）
      */
-    static Map<String, String> parseToolArguments(String json) {
+    public static Map<String, String> parseToolArguments(String json) {
         Map<String, String> result = new HashMap<>();
         if (json == null || json.isBlank()) return result;
         try {

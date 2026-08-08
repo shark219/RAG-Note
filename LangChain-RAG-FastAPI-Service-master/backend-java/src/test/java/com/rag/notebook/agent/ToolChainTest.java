@@ -1,5 +1,7 @@
 package com.rag.notebook.agent;
 
+import com.rag.notebook.agent.runtime.AgentRuntime;
+import com.rag.notebook.agent.runtime.AgentTaskService;
 import com.rag.notebook.cache.QueryCacheService;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.config.ApplicationProperties;
@@ -71,11 +73,13 @@ class ToolChainTest extends TestBase {
         ConversationContextManager convCtxMgr = mock(ConversationContextManager.class);
         SkillContextResolver skillCtx = mock(SkillContextResolver.class);
         when(skillCtx.resolve(any())).thenReturn(new SkillContextResolver.Context("", java.util.Set.of(), false, "v1"));
+        AgentRuntime agentRuntime = mock(AgentRuntime.class);
+        AgentTaskService agentTaskService = mock(AgentTaskService.class);
 
         return new AgentService(modelFactory, agentTools, chatService, props,
                 executor, contextManager, traceRepository, qualityReviewer,
                 supervisorService, writerService, tokenCounter, agentLoop,
-                responseComposer, convCtxMgr, skillCtx);
+                responseComposer, convCtxMgr, agentRuntime, agentTaskService, skillCtx);
     }
 
     @Nested

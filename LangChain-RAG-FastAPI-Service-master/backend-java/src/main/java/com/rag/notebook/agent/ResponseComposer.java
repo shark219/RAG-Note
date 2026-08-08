@@ -97,7 +97,10 @@ public class ResponseComposer {
         } else if (pack.writeConfirmation() != null) {
             sb.append("请告知用户操作已完成。");
         } else {
-            sb.append("未获取到任何相关数据。请诚实地告诉用户没有找到相关内容。");
+            sb.append("未获取到任何相关数据。请诚实地告诉用户没有找到相关内容。\n");
+            if (pack.goal() != null && !pack.goal().isBlank()) {
+                sb.append("如果目标未完成，请明确说明任务未完成，而不是表述为已经完成。\n");
+            }
         }
 
         if (outcome == AgentLoopResult.Outcome.MAX_ROUNDS) {

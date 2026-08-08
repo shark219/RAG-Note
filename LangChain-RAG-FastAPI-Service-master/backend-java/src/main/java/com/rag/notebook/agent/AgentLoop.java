@@ -1,6 +1,8 @@
 package com.rag.notebook.agent;
 
 import com.rag.notebook.agent.AgentState.ResultQuality;
+import com.rag.notebook.agent.policy.AgentPolicyService;
+import com.rag.notebook.agent.policy.BudgetConfig;
 import com.rag.notebook.agent.runtime.AgentEventService;
 import com.rag.notebook.agent.runtime.AgentExecutionSnapshot;
 import com.rag.notebook.agent.runtime.AgentTaskEventType;
@@ -9,6 +11,8 @@ import com.rag.notebook.agent.runtime.ReflectionResult;
 import com.rag.notebook.agent.runtime.ReflectionService;
 import com.rag.notebook.agent.runtime.ReplanResult;
 import com.rag.notebook.agent.runtime.ReplanningService;
+import com.rag.notebook.agent.runtime.ToolExecutionResult;
+import com.rag.notebook.agent.runtime.ToolExecutionService;
 import com.rag.notebook.agent.runtime.WorkerLoopContext;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
@@ -57,6 +61,8 @@ public class AgentLoop {
     private final ReplanningService replanningService;
     private final AgentTaskService agentTaskService;
     private final AgentEventService agentEventService;
+    private final ToolExecutionService toolExecutionService;
+    private final AgentPolicyService agentPolicyService;
 
     public AgentLoop(AgentTools agentTools, ToolResultEvaluator evaluator,
                      ModelFactory modelFactory, GoalEvaluator goalEvaluator,
@@ -64,7 +70,9 @@ public class AgentLoop {
                      ReflectionService reflectionService,
                      ReplanningService replanningService,
                      AgentTaskService agentTaskService,
-                     AgentEventService agentEventService) {
+                     AgentEventService agentEventService,
+                     ToolExecutionService toolExecutionService,
+                     AgentPolicyService agentPolicyService) {
         this.agentTools = agentTools;
         this.evaluator = evaluator;
         this.modelFactory = modelFactory;
@@ -74,6 +82,8 @@ public class AgentLoop {
         this.replanningService = replanningService;
         this.agentTaskService = agentTaskService;
         this.agentEventService = agentEventService;
+        this.toolExecutionService = toolExecutionService;
+        this.agentPolicyService = agentPolicyService;
     }
 
     /**
@@ -116,6 +126,26 @@ public class AgentLoop {
         state.setTaskId(context.taskId());
         state.setStepId(context.stepId());
 
+        // 构建预算配置
+        int maxIterations = context.maxIterations() != null ? context.maxIterations() : MAX_ITERATIONS;
+        int maxToolCalls = context.maxToolCalls() != null ? context.maxToolCalls() : 20;
+        BudgetConfig budget = BudgetConfig.builder()
+                .maxIterations(maxIterations)
+                .maxToolCalls(maxToolCalls)
+                .maxTokens(context.maxTokens() != null ? context.maxTokens() : 32000)
+                .maxRuntimeSeconds(600)
+                .maxConsecutiveFailures(5)
+                .maxSameToolCalls(3)
+                .build();
+
+        // 前置条件检查：失败步骤依赖检测
+        if (state.isFetchStepFailed()) {
+            log.info("前置检查：fetchStepFailed=true，当前步骤无法继续");
+            state.setBlockedReason("前置网页抓取失败，当前步骤依赖缺失");
+            agentTools.clearBoundState();
+            return AgentLoopResult.blocked(state, "前置网页抓取失败，当前步骤依赖缺失");
+        }
+
         if (context.goal() != null && !context.goal().isBlank()) {
             state.setGoal(context.goal());
             state.setSuccessCriteria(context.successCriteria());
@@ -129,13 +159,20 @@ public class AgentLoop {
         messages.addAll(context.messages());
         messages.add(UserMessage.from(context.userQuery()));
 
-        int maxIterations = context.maxIterations() != null ? context.maxIterations() : MAX_ITERATIONS;
-        int maxToolCalls = context.maxToolCalls() != null ? context.maxToolCalls() : 20;
-
         for (int i = 0; i < maxIterations; i++) {
             state.setIteration(i + 1);
             persistSnapshot(context, state, null, null);
             log.info("Agent Loop 第 {} 轮", i + 1);
+
+            // 预算检查
+            if (!agentPolicyService.checkBudget(budget, state, i + 1)) {
+                String reason = agentPolicyService.getBudgetViolationReason(budget, state, i + 1);
+                state.setBlockedReason(reason);
+                state.setLastFailureType("BUDGET_EXCEEDED");
+                persistSnapshot(context, state, null, reason);
+                agentTools.clearBoundState();
+                return AgentLoopResult.maxRounds(state);
+            }
 
             if (state.needsReflection()) {
                 ReflectionResult reflection = reflectionService.reflect(context, null, null);
@@ -159,6 +196,10 @@ public class AgentLoop {
                         state.getConsecutiveNoProgress() + 1, stateView);
             }
 
+            if (state.getCurrentStepInstructions() != null && !state.getCurrentStepInstructions().isBlank() && i == 0) {
+                messages.add(UserMessage.from("[步骤执行约束]\n" + state.getCurrentStepInstructions()));
+            }
+
             sendRoundThinking(context.emitter(), i + 1, state);
 
             ChatLanguageModel llm = modelFactory.createPreciseModel();
@@ -176,13 +217,16 @@ public class AgentLoop {
                 int totalTools = aiMessage.toolExecutionRequests().size();
                 int toolIndex = 0;
                 for (ToolExecutionRequest req : aiMessage.toolExecutionRequests()) {
-                    if (state.getToolHistory().size() >= maxToolCalls) {
-                        state.setBlockedReason("达到最大工具调用次数限制");
-                        state.setLastFailureType("MAX_TOOL_CALLS");
-                        persistSnapshot(context, state, null, state.getBlockedReason());
+                    // 预算检查（工具调用次数）
+                    if (!agentPolicyService.checkBudget(budget, state, i + 1)) {
+                        String reason = agentPolicyService.getBudgetViolationReason(budget, state, i + 1);
+                        state.setBlockedReason(reason);
+                        state.setLastFailureType("BUDGET_EXCEEDED");
+                        persistSnapshot(context, state, null, reason);
                         agentTools.clearBoundState();
                         return AgentLoopResult.maxRounds(state);
                     }
+
                     toolIndex++;
                     String toolName = req.name();
                     String toolArgs = req.arguments();
@@ -191,7 +235,41 @@ public class AgentLoop {
                         String blocked = "当前步骤禁止调用工具: " + toolName;
                         messages.add(ToolExecutionResultMessage.from(req, blocked));
                         state.addFailedAction(toolName + "(" + toolArgs + ")");
+                        state.addKnownFact("禁止调用非白名单工具：" + toolName);
                         continue;
+                    }
+
+                    // 审批检查
+                    if (agentPolicyService.requiresApproval(toolName, toolArgs, state)) {
+                        log.warn("工具 {} 需要用户审批", toolName);
+                        String approvalMsg = String.format("工具 %s 需要用户审批。参数: %s", toolName, toolArgs);
+                        state.setBlockedReason(approvalMsg);
+                        persistSnapshot(context, state, null, state.getBlockedReason());
+                        agentTools.clearBoundState();
+                        return AgentLoopResult.needClarification(state, approvalMsg);
+                    }
+
+                    // 频率限制检查
+                    if (!agentPolicyService.checkRateLimit(toolName, context.userId(), state)) {
+                        log.warn("工具 {} 超过频率限制", toolName);
+                        messages.add(ToolExecutionResultMessage.from(req,
+                                "工具调用超过频率限制: " + toolName));
+                        state.addFailedAction(toolName + "(" + toolArgs + ")");
+                        continue;
+                    }
+
+                    // fetchUrl 白名单检查
+                    if ("fetchUrl".equals(toolName)) {
+                        Map<String, String> args = AgentService.parseToolArguments(toolArgs);
+                        String url = args.getOrDefault("url", "");
+                        if (!agentPolicyService.isUrlAllowed(url)) {
+                            log.warn("URL 不在白名单中: {}", url);
+                            messages.add(ToolExecutionResultMessage.from(req,
+                                    "URL 不在允许的白名单中，无法访问: " + url));
+                            state.addFailedAction(toolName + "(" + toolArgs + ")");
+                            state.addKnownFact("URL 访问受限：" + url);
+                            continue;
+                        }
                     }
 
                     agentEventService.recordAndEmit(context.taskId(), AgentTaskEventType.TOOL_CALLED,
@@ -222,8 +300,21 @@ public class AgentLoop {
                         continue;
                     }
 
-                    String rawResult = executeTool(toolName, toolArgs, context.userId(), context.activeTools());
-                    ToolResult toolResult = getLastToolResult();
+                    // 使用 ToolExecutionService 执行工具
+                    ToolExecutionResult execResult = toolExecutionService.execute(
+                            toolName, toolArgs, context.userId(), state);
+
+                    String rawResult;
+                    ToolResult toolResult;
+                    if (execResult.isSuccess()) {
+                        rawResult = execResult.getResult();
+                        toolResult = execResult.getToolResult();
+                    } else {
+                        rawResult = "工具执行失败: " + execResult.getErrorMessage();
+                        toolResult = ToolResult.error(execResult.getErrorMessage(),
+                                execResult.getErrorCode(), false);
+                        agentTools.setResult(toolResult);
+                    }
 
                     ToolResultEvaluator.Evaluation eval = evaluator.evaluate(
                             toolName, toolArgs, rawResult, state.getOriginalQuery(), toolResult);
@@ -242,6 +333,7 @@ public class AgentLoop {
                     if (eval.quality() == ResultQuality.GOOD) {
                         anyProgress = true;
                         state.markProgress();
+                        state.resetCurrentStepFailureCount();
                         upgradeEvidenceFromTool(toolName, state);
                         extractFactsFromSuccess(toolName, toolArgs, rawResult, state);
                         updateSessionContext(context.sessionId(), toolName, toolArgs, rawResult);
@@ -270,6 +362,7 @@ public class AgentLoop {
                     } else if (eval.quality() == ResultQuality.POOR) {
                         anyProgress = true;
                         state.markNoProgress();
+                        state.incrementCurrentStepFailureCount();
                         state.addKnownFact(toolName + "(\"" + truncateArgs(toolArgs)
                                 + "\") 执行成功但结果质量不足");
                         evaluator.buildStructuredReflection(toolName, toolArgs, eval, state);
@@ -278,14 +371,23 @@ public class AgentLoop {
                         agentEventService.record(context.taskId(), AgentTaskEventType.TOOL_FAILED,
                                 Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName, "reason", eval.reason()));
                         persistSnapshot(context, state, observationMsg, eval.reason());
+                        if (shouldStopCurrentStep(state, toolName, eval, rawResult)) {
+                            agentTools.clearBoundState();
+                            return AgentLoopResult.maxRounds(state);
+                        }
                     } else {
                         state.markNoProgress();
+                        state.incrementCurrentStepFailureCount();
                         evaluator.buildStructuredReflection(toolName, toolArgs, eval, state);
                         ReflectionResult reflection = reflectionService.reflect(context, toolName, rawResult);
                         applyReflection(state, reflection);
                         agentEventService.record(context.taskId(), AgentTaskEventType.TOOL_FAILED,
                                 Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName, "reason", eval.reason()));
                         persistSnapshot(context, state, observationMsg, eval.reason());
+                        if (shouldStopCurrentStep(state, toolName, eval, rawResult)) {
+                            agentTools.clearBoundState();
+                            return AgentLoopResult.maxRounds(state);
+                        }
                     }
                 }
 
@@ -334,6 +436,15 @@ public class AgentLoop {
         }
 
         log.info("Agent Loop 达到最大轮次 {}", maxIterations);
+
+        // 循环退出后检查是否是关键步骤失败
+        if ("FETCH".equals(state.getCurrentTaskType()) && state.getCurrentStepFailureCount() >= 3) {
+            state.setFetchStepFailed(true);
+            state.setBlockedReason("FETCH_MAX_RETRIES_EXCEEDED");
+            state.addKnownFact("抓取步骤达到最大重试次数，所有尝试均失败。");
+            log.info("抓取步骤失败，设置 fetchStepFailed = true");
+        }
+
         persistSnapshot(context, state, null, "达到最大轮次");
         agentTools.clearBoundState();
         return AgentLoopResult.maxRounds(state);
@@ -357,6 +468,42 @@ public class AgentLoop {
         if (reflection.shouldAskUser()) {
             state.setBlockedReason(reflection.rootCause());
         }
+    }
+
+    private boolean shouldStopCurrentStep(AgentState state,
+                                          String toolName,
+                                          ToolResultEvaluator.Evaluation eval,
+                                          String rawResult) {
+        if (!"FETCH".equals(state.getCurrentTaskType())) {
+            return false;
+        }
+        if (!"fetchUrl".equals(toolName)) {
+            return false;
+        }
+        if (state.getCurrentStepFailureCount() < 3) {
+            return false;
+        }
+
+        // 搜索结果页检测
+        String lowered = rawResult == null ? "" : rawResult.toLowerCase(Locale.ROOT);
+        if (lowered.contains("bing.com/search") || lowered.contains("baidu.com/s")
+                || lowered.contains("sogou.com") || lowered.contains("so.com/s") || lowered.contains("search?q=")) {
+            state.setBlockedReason("FETCH_SEARCH_RESULT_PAGE");
+            state.addKnownFact("抓取结果已偏离原网页，命中了搜索结果页，终止当前抓取步骤。");
+            return true;
+        }
+
+        // fetchUrl 连续失败 3 次，无论原因，都应该终止
+        // 不再依赖 eval.reason() 的具体措辞，避免漏判
+        if (eval.quality() == ResultQuality.ERROR || eval.quality() == ResultQuality.POOR) {
+            state.setBlockedReason("FETCH_SOURCE_UNAVAILABLE");
+            state.setFetchStepFailed(true);
+            state.addKnownFact("源网页连续抓取失败（" + eval.reason() + "），已达到失败预算，终止当前抓取步骤。");
+            log.info("抓取步骤失败，设置 fetchStepFailed = true，原因: {}", eval.reason());
+            return true;
+        }
+
+        return false;
     }
 
     private void persistSnapshot(WorkerLoopContext context, AgentState state, String latestObservation, String latestFailureReason) {

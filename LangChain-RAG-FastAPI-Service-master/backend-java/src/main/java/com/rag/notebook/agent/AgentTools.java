@@ -19,12 +19,18 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 public class AgentTools {
@@ -337,6 +343,21 @@ public class AgentTools {
         if (!isNotesEnabled()) return notesDisabled("createNote");
         try {
             AgentState state = state();
+
+            // 前置检查：网页抓取失败时禁止创建笔记
+            if (state != null && state.isFetchStepFailed()) {
+                String msg = "前置网页抓取失败，禁止创建空笔记";
+                setResult(ToolResult.error(msg, "FETCH_FAILED_BLOCK", false));
+                return msg;
+            }
+
+            // 前置检查：内容过短或包含占位文本时禁止创建
+            if (content == null || content.trim().length() < 50) {
+                String msg = "笔记内容过短（少于50字符），禁止创建空笔记";
+                setResult(ToolResult.error(msg, "CONTENT_TOO_SHORT", false));
+                return msg;
+            }
+
             String key = "createNote:" + (state != null && state.getCurrentTaskType() != null ? state.getCurrentTaskType() : "");
             if (state != null) {
                 if (state.hasCompletedActionKey(key) || state.getSharedNoteId() != null && !state.getSharedNoteId().isBlank()) {
@@ -511,48 +532,40 @@ public class AgentTools {
     @Tool("抓取指定URL的网页内容并返回文本。触发场景：用户说'打开这个链接'、'抓取网页'、'这个URL的内容'、'帮我看看这个网页'时调用此工具")
     public String fetchUrl(@P("要抓取的网页URL") String url) {
         try {
+            URI uri = URI.create(url);
             HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(10))
+                    .connectTimeout(Duration.ofSeconds(6))
                     .followRedirects(HttpClient.Redirect.NORMAL)
                     .build();
 
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(15))
-                    .header("User-Agent", "Mozilla/5.0 (compatible; RAGNoteBot/1.0)")
+                    .uri(uri)
+                    .timeout(Duration.ofSeconds(8))
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                    .header("Referer", siteReferer(uri))
                     .GET()
                     .build();
 
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            String body = response.body();
-
-            String text = body.replaceAll("<script[^>]*>[\\s\\S]*?</script>", "")
-                    .replaceAll("<style[^>]*>[\\s\\S]*?</style>", "")
-                    .replaceAll("<[^>]+>", " ")
-                    .replaceAll("&nbsp;", " ")
-                    .replaceAll("&amp;", "&")
-                    .replaceAll("&lt;", "<")
-                    .replaceAll("&gt;", ">")
-                    .replaceAll("\\s+", " ")
-                    .trim();
-
-            if (text.length() > 3000) {
-                text = text.substring(0, 3000) + "...(内容已截断)";
-            }
+            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            String body = decodeBody(response);
+            PageExtraction extraction = extractPageContent(uri, body);
+            String summary = buildFetchSummary(uri, response.statusCode(), extraction);
 
             AgentState state = state();
-            if (state != null && response.statusCode() == 200 && text.length() > 100) {
-                state.setSharedFetchedContent(text);
-                state.addKnownFact("已抓取网页正文，长度: " + text.length());
+            if (state != null && response.statusCode() < 400 && extraction.qualityPass()) {
+                state.setSharedFetchedContent(extraction.content());
+                state.addKnownFact("已抓取网页正文，长度: " + extraction.content().length());
+                state.addKnownFact("抓取站点: " + uri.getHost());
             }
 
-            String display = "网页内容抓取成功（HTTP " + response.statusCode() + "）：\n" + text;
-            if (response.statusCode() >= 400 || text.isBlank() || text.length() < 80) {
-                setResult(ToolResult.error(display, "FETCH_URL_BAD_CONTENT", true));
+            if (response.statusCode() >= 400 || !extraction.qualityPass()) {
+                setResult(ToolResult.error(summary, "FETCH_URL_BAD_CONTENT", true));
             } else {
-                setResult(ToolResult.success(display));
+                setResult(ToolResult.success(summary));
             }
-            return display;
+            return summary;
         } catch (IllegalArgumentException e) {
             setResult(ToolResult.error("URL格式错误: " + e.getMessage(), "URL_INVALID", false));
             return "URL格式错误: " + e.getMessage();
@@ -561,6 +574,264 @@ public class AgentTools {
             return "抓取网页失败: " + e.getMessage();
         }
     }
+
+    String decodeBody(HttpResponse<byte[]> response) {
+        String contentType = response.headers().firstValue("content-type").orElse("");
+        String lower = contentType.toLowerCase(Locale.ROOT);
+        if (lower.contains("charset=gbk") || lower.contains("charset=gb2312")) {
+            return new String(response.body(), java.nio.charset.Charset.forName("GB18030"));
+        }
+        return new String(response.body(), StandardCharsets.UTF_8);
+    }
+
+    String siteReferer(URI uri) {
+        String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+        if (host.contains("zhihu.com")) return "https://www.zhihu.com/";
+        if (host.contains("csdn.net")) return "https://www.csdn.net/";
+        return uri.getScheme() + "://" + uri.getHost();
+    }
+
+    PageExtraction extractPageContent(URI uri, String html) {
+        String normalizedHtml = html == null ? "" : html;
+        String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+        String cleanHtml = normalizedHtml.replace(" ", "");
+
+        if (host.contains("zhihu.com")) {
+            return extractZhihuContent(cleanHtml);
+        }
+        if (host.contains("csdn.net")) {
+            return extractCsdnContent(cleanHtml);
+        }
+        return extractGenericContent(cleanHtml);
+    }
+
+    PageExtraction extractZhihuContent(String html) {
+        List<String> segments = new ArrayList<>();
+        collectSegmentsByClass(html, segments, "RichContent-inner");
+        collectSegmentsByClass(html, segments, "Post-RichText");
+        collectSegmentsByTag(html, segments, "article");
+        return finalizeExtraction(html, segments, "知乎");
+    }
+
+    PageExtraction extractCsdnContent(String html) {
+        List<String> segments = new ArrayList<>();
+        collectSegmentsById(html, segments, "article_content");
+        collectSegmentsByClass(html, segments, "blog-content-box");
+        collectSegmentsByClass(html, segments, "article_content");
+        collectSegmentsByTag(html, segments, "article");
+        return finalizeExtraction(html, segments, "CSDN");
+    }
+
+    PageExtraction extractGenericContent(String html) {
+        List<String> segments = new ArrayList<>();
+        collectSegmentsByTag(html, segments, "article");
+        collectSegmentsByTag(html, segments, "main");
+        collectSegmentsByClass(html, segments, "content");
+        collectSegmentsByClass(html, segments, "article");
+        collectSegmentsByClass(html, segments, "post-content");
+        return finalizeExtraction(html, segments, "通用");
+    }
+
+    void collectSegmentsByTag(String html, List<String> segments, String tagName) {
+        Matcher matcher = Pattern.compile("<" + tagName + "\\b[^>]*>([\\s\\S]*?)</" + tagName + ">", Pattern.CASE_INSENSITIVE)
+                .matcher(html);
+        while (matcher.find()) {
+            addSegment(segments, matcher.group(1));
+        }
+    }
+
+    void collectSegmentsByClass(String html, List<String> segments, String className) {
+        Matcher matcher = Pattern.compile("<(div|section|article)[^>]*class=\\\"[^\\\"]*" + Pattern.quote(className) + "[^\\\"]*\\\"[^>]*>([\\s\\S]*?)</\\1>", Pattern.CASE_INSENSITIVE)
+                .matcher(html);
+        while (matcher.find()) {
+            addSegment(segments, matcher.group(2));
+        }
+    }
+
+    void collectSegmentsById(String html, List<String> segments, String idName) {
+        Matcher matcher = Pattern.compile("<(div|section|article)[^>]*id=\\\"" + Pattern.quote(idName) + "\\\"[^>]*>([\\s\\S]*?)</\\1>", Pattern.CASE_INSENSITIVE)
+                .matcher(html);
+        while (matcher.find()) {
+            addSegment(segments, matcher.group(2));
+        }
+    }
+
+    void addSegment(List<String> segments, String rawSegment) {
+        String text = htmlToText(rawSegment);
+        if (!text.isBlank()) {
+            segments.add(text);
+        }
+    }
+
+    PageExtraction finalizeExtraction(String html, List<String> segments, String strategy) {
+        String fallback = htmlToText(html);
+        String best = selectBestSegment(segments, fallback);
+        ExtractionMetrics metrics = analyzeContent(best, fallback, html);
+        String normalized = best.length() > 6000 ? best.substring(0, 6000) + "\n...(内容已截断)" : best;
+        return new PageExtraction(normalized, metrics.qualityPass(), metrics.reason(), strategy,
+                metrics.contentLength(), metrics.coverageRatio(), metrics.paragraphCount(), metrics.hasStructure());
+    }
+
+    String selectBestSegment(List<String> segments, String fallback) {
+        String best = "";
+        int bestScore = -1;
+        LinkedHashSet<String> uniqueSegments = new LinkedHashSet<>(segments);
+        for (String segment : uniqueSegments) {
+            int score = scoreSegment(segment);
+            if (score > bestScore) {
+                bestScore = score;
+                best = segment;
+            }
+        }
+        if (best.isBlank() || best.length() < 200) {
+            return fallback;
+        }
+        return best;
+    }
+
+    int scoreSegment(String segment) {
+        int lengthScore = Math.min(segment.length(), 5000);
+        int paragraphBonus = countParagraphs(segment) * 120;
+        int punctuationBonus = countMatches(segment, "[。！？；：\\n]") * 8;
+        int penalty = countNavigationTokens(segment) * 180;
+        return lengthScore + paragraphBonus + punctuationBonus - penalty;
+    }
+
+    ExtractionMetrics analyzeContent(String content, String fallback, String html) {
+        int contentLength = content.length();
+        int fallbackLength = Math.max(fallback.length(), 1);
+        double coverageRatio = Math.min(1.0d, (double) contentLength / fallbackLength);
+        int paragraphCount = countParagraphs(content);
+        boolean hasStructure = paragraphCount >= 3 || countMatches(content, "[。！？；]") >= 4;
+        int navTokenCount = countNavigationTokens(content);
+        double navDensity = contentLength > 0 ? (double) navTokenCount / contentLength * 1000 : 0;
+        boolean navigationHeavy = navTokenCount >= 3 && (navDensity > 0.8d || contentLength < 1000);
+        boolean blocked = looksBlocked(html, content);
+        boolean qualityPass = contentLength >= 200 && hasStructure && coverageRatio >= 0.08d && !navigationHeavy && !blocked;
+
+        String reason;
+        if (content.isBlank()) {
+            reason = "正文为空";
+        } else if (blocked) {
+            reason = "页面存在站点拦截或登录提示";
+        } else if (navigationHeavy) {
+            reason = "命中导航/推荐内容，未进入正文";
+        } else if (contentLength < 200) {
+            reason = "正文过短，疑似摘要页或截断页";
+        } else if (!hasStructure) {
+            reason = "缺少明显正文结构";
+        } else if (coverageRatio < 0.08d) {
+            reason = "正文覆盖率不足，疑似只截到前半段";
+        } else {
+            reason = "正文完整";
+        }
+        return new ExtractionMetrics(qualityPass, reason, contentLength, coverageRatio, paragraphCount, hasStructure);
+    }
+
+    boolean looksBlocked(String html, String content) {
+        String text = (html + "\n" + content).toLowerCase(Locale.ROOT);
+
+        // 强拦截词：命中即判定为拦截
+        boolean hasHardBlock = text.contains("请先登录") || text.contains("扫码登录")
+                || text.contains("安全验证") || text.contains("访问受限")
+                || text.contains("继续访问");
+
+        // 弱拦截词：只有在内容很短时才判定为拦截
+        boolean hasSoftBlock = text.contains("展开阅读全文") || text.contains("复制链接") || text.contains("验证码");
+
+        // 强拦截词直接判定
+        if (hasHardBlock) {
+            return true;
+        }
+
+        // 弱拦截词 + 内容过短才判定为拦截
+        if (hasSoftBlock && content.length() < 500) {
+            return true;
+        }
+
+        return false;
+    }
+
+    int countNavigationTokens(String text) {
+        String[] tokens = {"上一篇", "下一篇", "相关推荐", "推荐阅读", "热门推荐", "更多内容", "登录后", "点赞", "评论", "收藏", "关注",
+                "搜索", "高级搜索", "搜索结果", "时间不限", "在新选项卡中打开链接", "网页", "图片", "视频", "微信", "百科", "意见反馈", "帮助"};
+        int count = 0;
+        for (String token : tokens) {
+            if (text.contains(token)) count++;
+        }
+        return count;
+    }
+
+    int countParagraphs(String text) {
+        String[] blocks = text.split("\\n+");
+        int paragraphs = 0;
+        for (String block : blocks) {
+            if (block.trim().length() >= 40) {
+                paragraphs++;
+            }
+        }
+        return paragraphs;
+    }
+
+    int countMatches(String text, String regex) {
+        Matcher matcher = Pattern.compile(regex).matcher(text);
+        int count = 0;
+        while (matcher.find()) count++;
+        return count;
+    }
+
+    String htmlToText(String html) {
+        if (html == null || html.isBlank()) return "";
+        return html.replaceAll("(?is)<script[^>]*>.*?</script>", " ")
+                .replaceAll("(?is)<style[^>]*>.*?</style>", " ")
+                .replaceAll("(?i)<br\\s*/?>", "\n")
+                .replaceAll("(?i)</p>", "\n")
+                .replaceAll("(?i)</div>", "\n")
+                .replaceAll("(?i)</li>", "\n")
+                .replaceAll("(?i)</h[1-6]>", "\n")
+                .replaceAll("<[^>]+>", " ")
+                .replace("&nbsp;", " ")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&#34;", "\"")
+                .replace("&#39;", "'")
+                .replaceAll("[ \\t\\x0B\\f\\r]+", " ")
+                .replaceAll("\n{3,}", "\n\n")
+                .trim();
+    }
+
+    String buildFetchSummary(URI uri, int statusCode, PageExtraction extraction) {
+        return "网页正文抓取结果（HTTP " + statusCode + "，站点策略: " + extraction.strategy() + "）\n"
+                + "质量判定: " + (extraction.qualityPass() ? "通过" : "未通过") + "\n"
+                + "判定原因: " + extraction.reason() + "\n"
+                + "正文长度: " + extraction.contentLength() + "\n"
+                + "覆盖率: " + String.format(Locale.ROOT, "%.2f", extraction.coverageRatio()) + "\n"
+                + "段落数: " + extraction.paragraphCount() + "\n"
+                + "正文结构: " + (extraction.hasStructure() ? "明显" : "不足") + "\n"
+                + "URL: " + uri + "\n\n"
+                + extraction.content();
+    }
+
+    record PageExtraction(
+            String content,
+            boolean qualityPass,
+            String reason,
+            String strategy,
+            int contentLength,
+            double coverageRatio,
+            int paragraphCount,
+            boolean hasStructure
+    ) {}
+
+    record ExtractionMetrics(
+            boolean qualityPass,
+            String reason,
+            int contentLength,
+            double coverageRatio,
+            int paragraphCount,
+            boolean hasStructure
+    ) {}
 
     @Tool("生成Mermaid图表代码。触发场景：用户说'画个流程图'、'生成图表'、'画个时序图'、'画个类图'时调用此工具")
     public String generateDiagram(
