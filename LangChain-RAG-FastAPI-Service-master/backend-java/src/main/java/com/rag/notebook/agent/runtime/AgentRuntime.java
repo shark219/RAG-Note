@@ -6,6 +6,7 @@ import com.rag.notebook.agent.AgentState;
 import com.rag.notebook.agent.ContextManager;
 import com.rag.notebook.agent.SubTask;
 import com.rag.notebook.agent.SupervisorService;
+import com.rag.notebook.agent.trace.AgentTraceService;
 import com.rag.notebook.chat.entity.ChatMessage;
 import com.rag.notebook.chat.service.ChatService;
 import dev.langchain4j.agent.tool.ToolSpecification;
@@ -38,6 +39,7 @@ public class AgentRuntime {
     private final AgentLoop agentLoop;
     private final ReflectionService reflectionService;
     private final ReplanningService replanningService;
+    private final AgentTraceService agentTraceService;
 
     public AgentRuntime(AgentTaskService agentTaskService,
                         AgentEventService agentEventService,
@@ -46,7 +48,8 @@ public class AgentRuntime {
                         ContextManager contextManager,
                         AgentLoop agentLoop,
                         ReflectionService reflectionService,
-                        ReplanningService replanningService) {
+                        ReplanningService replanningService,
+                        AgentTraceService agentTraceService) {
         this.agentTaskService = agentTaskService;
         this.agentEventService = agentEventService;
         this.supervisorService = supervisorService;
@@ -55,6 +58,7 @@ public class AgentRuntime {
         this.agentLoop = agentLoop;
         this.reflectionService = reflectionService;
         this.replanningService = replanningService;
+        this.agentTraceService = agentTraceService;
     }
 
     public RuntimeResult start(String taskId,
@@ -68,6 +72,10 @@ public class AgentRuntime {
                                boolean enablePlanning,
                                boolean artifactWriteBack,
                                ChatLanguageModel chatModel) throws IOException {
+
+        // 开始 Agent Trace 记录（已在 AgentService 中初始化，这里不重复调用）
+        log.info("Agent trace running: taskId={}", taskId);
+
         AgentTaskStatus runningStatus = AgentTaskStatus.RUNNING;
         agentTaskService.updateStatus(taskId, runningStatus);
         agentEventService.recordAndEmit(taskId, AgentTaskEventType.TASK_CREATED,
@@ -76,11 +84,30 @@ public class AgentRuntime {
         List<ChatMessage> history = chatService.getSessionMessages(sessionId);
         List<dev.langchain4j.data.message.ChatMessage> historyMessages = contextManager.buildMessages(history, chatModel);
 
-        List<SubTask> subTasks = enablePlanning ? supervisorService.plan(query) : Collections.emptyList();
-        if (subTasks.size() == 1 && !artifactWriteBack) {
-            subTasks = Collections.emptyList();
+        List<SubTask> subTasks = Collections.emptyList();
+        String executionMode = "SINGLE";
+        if (enablePlanning) {
+            long planningStart = System.currentTimeMillis();
+            try {
+                emitThinking(emitter, "planning", "正在分析任务并制定计划");
+                agentTaskService.updateStatus(taskId, AgentTaskStatus.PLANNING);
+                subTasks = supervisorService.plan(query);
+                if (subTasks.size() == 1 && !artifactWriteBack) {
+                    subTasks = Collections.emptyList();
+                }
+                executionMode = subTasks.isEmpty() ? "SINGLE" : subTasks.get(0).getExecutionMode();
+
+                // 记录规划决策到 trace
+                if (!subTasks.isEmpty()) {
+                    long planningLatency = System.currentTimeMillis() - planningStart;
+                    String planJson = formatPlanAsJson(subTasks);
+                    agentTraceService.recordPlanning(planJson, planningLatency);
+                }
+            } catch (Exception e) {
+                log.error("规划失败，降级为单步执行", e);
+                agentTraceService.recordError("PLANNING_ERROR", e.getMessage(), "supervisorService.plan", null);
+            }
         }
-        String executionMode = subTasks.isEmpty() ? "SINGLE" : subTasks.get(0).getExecutionMode();
         agentTaskService.savePlan(taskId, subTasks, executionMode);
         agentEventService.recordAndEmit(taskId, AgentTaskEventType.PLAN_CREATED,
                 Map.of("task_id", taskId, "execution_mode", executionMode, "step_count", subTasks.size()), emitter);
@@ -115,6 +142,7 @@ public class AgentRuntime {
             agentTaskService.markStepStatus(taskId, stepId, AgentTaskStatus.RUNNING, null);
             agentEventService.recordAndEmit(taskId, AgentTaskEventType.STEP_STARTED,
                     Map.of("task_id", taskId, "step_id", stepId, "label", task.getLabel()), emitter);
+            emitThinking(emitter, "step_start", String.format("开始执行步骤 %d/%d: %s", i + 1, subTasks.size(), task.getLabel()));
 
             AgentLoopResult stepResult = agentLoop.run(buildStepContext(new StepExecutionContext(
                     taskId,
@@ -239,9 +267,26 @@ public class AgentRuntime {
                         stepResult.state().buildStateSummary()
                 );
 
+                // 记录反思结果到 trace
+                if (reflection != null) {
+                    agentTraceService.recordReflection(
+                            reflection.summary(),
+                            reflection.recommendedActions() != null ? reflection.recommendedActions() : List.of(),
+                            Map.of("rootCause", reflection.rootCause() != null ? reflection.rootCause() : "",
+                                   "shouldReplan", reflection.shouldReplan(),
+                                   "confidence", reflection.confidence() != null ? reflection.confidence() : 0.0)
+                    );
+                }
+
                 if (reflection.shouldReplan()) {
                     agentEventService.recordAndEmit(resumeContext.taskId(), AgentTaskEventType.REPLAN_CREATED,
                             Map.of("task_id", resumeContext.taskId(), "reason", reflection.rootCause()), emitter);
+
+                    // 记录重规划到 trace
+                    agentTraceService.recordReplanning(
+                            reflection.rootCause(),
+                            "关键步骤失败，需要用户提供备用方案"
+                    );
 
                     // 当前简化处理：关键步骤失败后直接终止任务，不再执行后续步骤
                     // TODO: 后续可以调用 SupervisorService 重新规划，生成"请用户提供正文"的备用方案
@@ -471,11 +516,52 @@ public class AgentRuntime {
         target.setSharedMindMap(source.getSharedMindMap() != null ? source.getSharedMindMap() : target.getSharedMindMap());
     }
 
+    private void emitThinking(SseEmitter emitter, String stage, String content) {
+        if (emitter == null) return;
+        try {
+            emitter.send(SseEmitter.event()
+                    .name("thinking")
+                    .data(Map.of("type", "thinking", "stage", stage, "content", content)));
+        } catch (IOException e) {
+            log.warn("发送思考过程事件失败: stage={}, error={}", stage, e.getMessage());
+        }
+    }
+
     private String buildSingleGoal(String query) {
         if (query == null || query.isBlank()) {
             return "回答用户当前问题";
         }
         return "完成用户请求：" + query.trim();
+    }
+
+    /**
+     * 格式化规划为 JSON 字符串用于 trace 记录
+     */
+    private String formatPlanAsJson(List<SubTask> subTasks) {
+        if (subTasks == null || subTasks.isEmpty()) {
+            return "[]";
+        }
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < subTasks.size(); i++) {
+            SubTask task = subTasks.get(i);
+            if (i > 0) sb.append(",");
+            sb.append("{");
+            sb.append("\"id\":\"").append(task.getId() != null ? task.getId() : "").append("\",");
+            sb.append("\"label\":\"").append(escapeJson(task.getLabel())).append("\",");
+            sb.append("\"goal\":\"").append(escapeJson(task.getGoal())).append("\",");
+            sb.append("\"toolHint\":\"").append(task.getToolHint() != null ? task.getToolHint() : "").append("\"");
+            sb.append("}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private String escapeJson(String str) {
+        if (str == null) return "";
+        return str.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r");
     }
 
     public record RuntimeResult(AgentLoopResult loopResult, List<SubTask> subTasks) {}

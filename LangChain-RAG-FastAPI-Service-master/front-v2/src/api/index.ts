@@ -205,6 +205,24 @@ export const agentTaskApi = {
   detail: (taskId: string) => api.get(`/agent/tasks/${taskId}`),
   resume: (taskId: string, data?: { userMessage?: string }) =>
     api.post(`/agent/tasks/${taskId}/resume`, data || {}),
+  resumeStream: (taskId: string, data?: { userMessage?: string }) =>
+    fetch(`/api/agent/tasks/${taskId}/resume/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${localStorage.getItem('token')}`,
+      },
+      body: JSON.stringify(data || {}),
+    }),
+  getPendingTask: (sessionId: string) => api.get(`/agent/tasks/session/${sessionId}/pending`),
+}
+
+export const agentMetricsApi = {
+  getMetrics: (startDate: string, endDate: string) =>
+    api.get('/agent/metrics', { params: { startDate, endDate } }),
+  getRecent: (days: number = 7) =>
+    api.get('/agent/metrics/recent', { params: { days } }),
+  getToday: () => api.get('/agent/metrics/today'),
 }
 
 export const evaluationApi = {

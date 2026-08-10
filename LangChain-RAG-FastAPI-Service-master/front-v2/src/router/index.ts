@@ -102,6 +102,12 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/system/DebugEvaluation.vue'),
         meta: { title: '开发者调试' }
       },
+      {
+        path: 'system/agent-metrics',
+        name: 'AgentMetrics',
+        component: () => import('@/views/system/AgentMetrics.vue'),
+        meta: { title: 'Agent 质量评估' }
+      },
     ]
   },
   {

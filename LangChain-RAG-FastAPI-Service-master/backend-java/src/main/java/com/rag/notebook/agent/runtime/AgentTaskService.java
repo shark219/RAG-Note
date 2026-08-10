@@ -37,19 +37,22 @@ public class AgentTaskService {
     private final ChatSessionRepository sessionRepository;
     private final ObjectMapper objectMapper;
     private final com.rag.notebook.agent.AgentService agentService;
+    private final AgentTaskResumeService agentTaskResumeService;
 
     public AgentTaskService(AgentTaskRepository taskRepository,
                             AgentTaskStepRepository stepRepository,
                             AgentTaskEventRepository eventRepository,
                             ChatSessionRepository sessionRepository,
                             ObjectMapper objectMapper,
-                            @org.springframework.context.annotation.Lazy com.rag.notebook.agent.AgentService agentService) {
+                            @org.springframework.context.annotation.Lazy com.rag.notebook.agent.AgentService agentService,
+                            @org.springframework.context.annotation.Lazy AgentTaskResumeService agentTaskResumeService) {
         this.taskRepository = taskRepository;
         this.stepRepository = stepRepository;
         this.eventRepository = eventRepository;
         this.sessionRepository = sessionRepository;
         this.objectMapper = objectMapper;
         this.agentService = agentService;
+        this.agentTaskResumeService = agentTaskResumeService;
     }
 
     @Transactional
@@ -210,6 +213,12 @@ public class AgentTaskService {
         return agentService.resumeAgentTask(resumeContext, userMessage);
     }
 
+    public SseEmitter resumeTaskStream(String taskId, String userId, String userMessage) {
+        var resumeContext = agentTaskResumeService.prepareResume(taskId, userId, userMessage);
+        agentTaskResumeService.markResumeReady(resumeContext);
+        return agentService.resumeAgentTask(resumeContext, userMessage);
+    }
+
     @Transactional
     public AgentTask saveTask(AgentTask task, AgentTaskStatus status) {
         task.setStatus(status.name());
@@ -277,5 +286,15 @@ public class AgentTaskService {
             log.warn("Failed to serialize agent task payload: {}", e.getMessage());
             return null;
         }
+    }
+
+    public String findPendingTaskBySession(String sessionId, String userId) {
+        List<AgentTask> tasks = taskRepository.findBySessionIdAndUserIdOrderByStartedAtDesc(sessionId, userId);
+        for (AgentTask task : tasks) {
+            if (AgentTaskStatus.WAITING_USER.name().equals(task.getStatus())) {
+                return task.getTaskId();
+            }
+        }
+        return null;
     }
 }

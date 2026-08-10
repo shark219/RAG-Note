@@ -3,24 +3,11 @@ package com.rag.notebook.agent;
 import com.rag.notebook.agent.AgentState.ResultQuality;
 import com.rag.notebook.agent.policy.AgentPolicyService;
 import com.rag.notebook.agent.policy.BudgetConfig;
-import com.rag.notebook.agent.runtime.AgentEventService;
-import com.rag.notebook.agent.runtime.AgentExecutionSnapshot;
-import com.rag.notebook.agent.runtime.AgentTaskEventType;
-import com.rag.notebook.agent.runtime.AgentTaskService;
-import com.rag.notebook.agent.runtime.ReflectionResult;
-import com.rag.notebook.agent.runtime.ReflectionService;
-import com.rag.notebook.agent.runtime.ReplanResult;
-import com.rag.notebook.agent.runtime.ReplanningService;
-import com.rag.notebook.agent.runtime.ToolExecutionResult;
-import com.rag.notebook.agent.runtime.ToolExecutionService;
-import com.rag.notebook.agent.runtime.WorkerLoopContext;
+import com.rag.notebook.agent.runtime.*;
+import com.rag.notebook.agent.trace.AgentTraceService;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
-import dev.langchain4j.data.message.AiMessage;
-import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
-import dev.langchain4j.data.message.ToolExecutionResultMessage;
-import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.data.message.*;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
@@ -63,6 +50,7 @@ public class AgentLoop {
     private final AgentEventService agentEventService;
     private final ToolExecutionService toolExecutionService;
     private final AgentPolicyService agentPolicyService;
+    private final AgentTraceService agentTraceService;
 
     public AgentLoop(AgentTools agentTools, ToolResultEvaluator evaluator,
                      ModelFactory modelFactory, GoalEvaluator goalEvaluator,
@@ -72,7 +60,8 @@ public class AgentLoop {
                      AgentTaskService agentTaskService,
                      AgentEventService agentEventService,
                      ToolExecutionService toolExecutionService,
-                     AgentPolicyService agentPolicyService) {
+                     AgentPolicyService agentPolicyService,
+                     AgentTraceService agentTraceService) {
         this.agentTools = agentTools;
         this.evaluator = evaluator;
         this.modelFactory = modelFactory;
@@ -84,6 +73,7 @@ public class AgentLoop {
         this.agentEventService = agentEventService;
         this.toolExecutionService = toolExecutionService;
         this.agentPolicyService = agentPolicyService;
+        this.agentTraceService = agentTraceService;
     }
 
     /**
@@ -126,6 +116,9 @@ public class AgentLoop {
         state.setTaskId(context.taskId());
         state.setStepId(context.stepId());
 
+        // 记录 trace 开始时间（用于计算总耗时）
+        long traceStartTime = System.currentTimeMillis();
+
         // 构建预算配置
         int maxIterations = context.maxIterations() != null ? context.maxIterations() : MAX_ITERATIONS;
         int maxToolCalls = context.maxToolCalls() != null ? context.maxToolCalls() : 20;
@@ -139,11 +132,21 @@ public class AgentLoop {
                 .build();
 
         // 前置条件检查：失败步骤依赖检测
-        if (state.isFetchStepFailed()) {
-            log.info("前置检查：fetchStepFailed=true，当前步骤无法继续");
-            state.setBlockedReason("前置网页抓取失败，当前步骤依赖缺失");
+        if (state.isFetchStepFailed() && requiresFetchedContent(context)) {
+            log.warn("前置检查：fetchStepFailed=true 且当前步骤需要网页内容，无法继续");
+            state.setBlockedReason("前置网页抓取失败，当前步骤依赖网页内容，无法继续执行");
+            state.setTaskStatus(TaskStatus.GOAL_FAILED);
+            saveTokenStats(state);
+            saveTokenStats(state);
             agentTools.clearBoundState();
-            return AgentLoopResult.blocked(state, "前置网页抓取失败，当前步骤依赖缺失");
+            return AgentLoopResult.blocked(state, "前置网页抓取失败，当前步骤需要网页内容作为输入");
+        }
+
+        // 前置条件检查：createNote 步骤需要网页内容
+        if (isCreateNoteStep(context) && (state.getSharedFetchedContent() == null || state.getSharedFetchedContent().isBlank())) {
+            log.warn("前置检查：createNote 步骤但 sharedFetchedContent 为空，可能产生幻觉内容");
+            // 不阻止执行，但记录警告，让 GoalEvaluator 在 LLM 回答时拦截
+            state.addKnownFact("警告：没有抓取到网页内容，创建笔记可能包含编造的信息");
         }
 
         if (context.goal() != null && !context.goal().isBlank()) {
@@ -154,6 +157,22 @@ public class AgentLoop {
             state.setTaskStatus(TaskStatus.EXECUTING);
         }
 
+        // 检测用户是否回复了澄清请求
+        String userQuery = context.userQuery();
+        if (userQuery != null && userQuery.contains("选择选项")) {
+            int choice = extractUserChoice(userQuery);
+            if (choice > 0) {
+                log.info("检测到用户选择: choice={}, query={}", choice, userQuery);
+                AgentLoopResult result = handleUserClarificationChoice(context, state, choice);
+                if (result != null) {
+                    // 返回 blocked 或其他终止状态
+                    return result;
+                }
+                // result == null 表示选择了"搜索本地笔记"，继续执行当前 loop
+                log.info("用户选择继续执行，将搜索本地笔记");
+            }
+        }
+
         List<ChatMessage> messages = new ArrayList<>();
         messages.add(SystemMessage.from(context.systemPrompt()));
         messages.addAll(context.messages());
@@ -161,6 +180,7 @@ public class AgentLoop {
 
         for (int i = 0; i < maxIterations; i++) {
             state.setIteration(i + 1);
+            agentTraceService.incrementLoopCount();
             persistSnapshot(context, state, null, null);
             log.info("Agent Loop 第 {} 轮", i + 1);
 
@@ -170,24 +190,39 @@ public class AgentLoop {
                 state.setBlockedReason(reason);
                 state.setLastFailureType("BUDGET_EXCEEDED");
                 persistSnapshot(context, state, null, reason);
-                agentTools.clearBoundState();
+                saveTokenStats(state);
+            agentTools.clearBoundState();
                 return AgentLoopResult.maxRounds(state);
             }
 
             if (state.needsReflection()) {
+                emitThinking(context.emitter(), "reflecting", "检测到连续失败，正在分析原因");
                 ReflectionResult reflection = reflectionService.reflect(context, null, null);
                 if (reflection.summary() != null && !reflection.summary().isBlank()) {
                     state.setLastReflectionSummary(reflection.summary());
                     state.setLastFailureType(reflection.failureType());
                     agentEventService.recordAndEmit(context.taskId(), AgentTaskEventType.REFLECTION_CREATED,
-                            Map.of("task_id", context.taskId(), "step_id", context.stepId(), "summary", reflection.summary()),
+                            Map.of("task_id", context.taskId(),
+                                   "step_id", context.stepId() != null ? context.stepId() : "",
+                                   "summary", reflection.summary() != null ? reflection.summary() : ""),
                             context.emitter());
+                    emitThinking(context.emitter(), "reflected", "已完成反思分析: " + reflection.summary());
                 }
+                emitThinking(context.emitter(), "replanning", "正在调整执行策略");
                 ReplanResult replanResult = replanningService.replan(context, reflection);
                 if (replanResult.summary() != null && !replanResult.summary().isBlank()) {
                     agentEventService.recordAndEmit(context.taskId(), AgentTaskEventType.REPLAN_CREATED,
-                            Map.of("task_id", context.taskId(), "step_id", context.stepId(), "summary", replanResult.summary()),
+                            Map.of("task_id", context.taskId(),
+                                   "step_id", context.stepId() != null ? context.stepId() : "",
+                                   "summary", replanResult.summary() != null ? replanResult.summary() : ""),
                             context.emitter());
+                    emitThinking(context.emitter(), "replanned", "已调整策略: " + replanResult.summary());
+
+                    // 记录重规划
+                    agentTraceService.recordReplanning(
+                            reflection.summary() != null ? reflection.summary() : "连续失败触发重规划",
+                            replanResult.summary() != null ? replanResult.summary() : ""
+                    );
                 }
                 String stateView = buildStateViewForReflection(state);
                 messages.add(UserMessage.from(stateView));
@@ -203,8 +238,26 @@ public class AgentLoop {
             sendRoundThinking(context.emitter(), i + 1, state);
 
             ChatLanguageModel llm = modelFactory.createPreciseModel();
+            long llmStart = System.currentTimeMillis();
             Response<AiMessage> response = llm.generate(messages, context.activeTools());
+            long llmLatency = System.currentTimeMillis() - llmStart;
             AiMessage aiMessage = response.content();
+
+            // 统计 Token 消耗
+            if (response.tokenUsage() != null) {
+                int tokensUsed = response.tokenUsage().totalTokenCount();
+                state.addTokensConsumed(tokensUsed);
+                log.debug("本轮 Token 消耗: {}, 累计: {}", tokensUsed, state.getTotalTokensConsumed());
+            }
+
+            // 记录 LLM 交互
+            agentTraceService.recordLLMInteraction(
+                    "assistant",
+                    aiMessage.text() != null ? aiMessage.text() : "[Tool calls]",
+                    response.tokenUsage() != null ? response.tokenUsage().inputTokenCount() : 0,
+                    response.tokenUsage() != null ? response.tokenUsage().outputTokenCount() : 0,
+                    System.currentTimeMillis() - llmStart
+            );
 
             if (aiMessage.hasToolExecutionRequests()) {
                 messages.add(aiMessage);
@@ -223,7 +276,8 @@ public class AgentLoop {
                         state.setBlockedReason(reason);
                         state.setLastFailureType("BUDGET_EXCEEDED");
                         persistSnapshot(context, state, null, reason);
-                        agentTools.clearBoundState();
+                        saveTokenStats(state);
+            agentTools.clearBoundState();
                         return AgentLoopResult.maxRounds(state);
                     }
 
@@ -231,11 +285,18 @@ public class AgentLoop {
                     String toolName = req.name();
                     String toolArgs = req.arguments();
 
+                    long toolStart = System.currentTimeMillis();
+
                     if (!state.isToolAllowed(toolName)) {
                         String blocked = "当前步骤禁止调用工具: " + toolName;
                         messages.add(ToolExecutionResultMessage.from(req, blocked));
                         state.addFailedAction(toolName + "(" + toolArgs + ")");
                         state.addKnownFact("禁止调用非白名单工具：" + toolName);
+
+                        // 记录工具调用失败
+                        long toolLatency = System.currentTimeMillis() - toolStart;
+                        agentTraceService.recordToolCall(toolName, toolArgs,
+                                blocked, toolLatency, false, "工具不在白名单中");
                         continue;
                     }
 
@@ -245,7 +306,8 @@ public class AgentLoop {
                         String approvalMsg = String.format("工具 %s 需要用户审批。参数: %s", toolName, toolArgs);
                         state.setBlockedReason(approvalMsg);
                         persistSnapshot(context, state, null, state.getBlockedReason());
-                        agentTools.clearBoundState();
+                        saveTokenStats(state);
+            agentTools.clearBoundState();
                         return AgentLoopResult.needClarification(state, approvalMsg);
                     }
 
@@ -266,14 +328,38 @@ public class AgentLoop {
                             log.warn("URL 不在白名单中: {}", url);
                             messages.add(ToolExecutionResultMessage.from(req,
                                     "URL 不在允许的白名单中，无法访问: " + url));
-                            state.addFailedAction(toolName + "(" + toolArgs + ")");
+                            // 记录失败动作时包含"白名单"关键词，便于后续检测
+                            state.addFailedAction(toolName + "(" + toolArgs + ") [白名单拦截]");
                             state.addKnownFact("URL 访问受限：" + url);
+
+                            // 检查是否应该询问用户
+                            if (shouldAskUserAboutUrlWhitelist(state)) {
+                                String blockedUrl = extractBlockedUrl(state);
+                                String clarificationMsg = String.format(
+                                    "无法访问该网页：%s\n\n" +
+                                    "原因：该 URL 不在允许的白名单中。\n\n" +
+                                    "您希望如何继续？\n" +
+                                    "1. 添加该域名到白名单（需要管理员权限）\n" +
+                                    "2. 改为搜索本地笔记库中的相关内容\n" +
+                                    "3. 取消此次操作",
+                                    blockedUrl
+                                );
+                                log.info("URL 白名单限制，询问用户: {}", blockedUrl);
+                                persistSnapshot(context, state, clarificationMsg, "URL 白名单限制");
+                                saveTokenStats(state);
+            agentTools.clearBoundState();
+                                return AgentLoopResult.needClarification(state, clarificationMsg);
+                            }
+
                             continue;
                         }
                     }
 
                     agentEventService.recordAndEmit(context.taskId(), AgentTaskEventType.TOOL_CALLED,
-                            Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName, "args", toolArgs),
+                            Map.of("task_id", context.taskId(),
+                                   "step_id", context.stepId() != null ? context.stepId() : "",
+                                   "tool", toolName != null ? toolName : "",
+                                   "args", toolArgs != null ? toolArgs : ""),
                             context.emitter());
 
                     sendSseEvent(context.emitter(), "thinking", Map.of(
@@ -301,21 +387,42 @@ public class AgentLoop {
                     }
 
                     // 使用 ToolExecutionService 执行工具
+                    emitThinking(context.emitter(), "tool_executing", "正在执行工具: " + toolName);
                     ToolExecutionResult execResult = toolExecutionService.execute(
-                            toolName, toolArgs, context.userId(), state);
+                            toolName, toolArgs, context.userId(), context.taskId(), context.sessionId(), state);
 
                     String rawResult;
                     ToolResult toolResult;
+                    long toolLatency = System.currentTimeMillis() - toolStart;
+
                     if (execResult.isSuccess()) {
                         rawResult = execResult.getResult();
                         toolResult = execResult.getToolResult();
+                        emitThinking(context.emitter(), "tool_executed", "工具执行成功: " + toolName);
+
+                        // 记录成功的工具调用到 trace
+                        agentTraceService.recordToolCall(toolName, toolArgs, rawResult, toolLatency, true, null);
+
+                        // 如果是 ragSummary，关联 RAG trace ID
+                        if ("ragSummary".equals(toolName)) {
+                            String ragTraceId = agentTools.getLatestTraceId();
+                            if (ragTraceId != null) {
+                                agentTraceService.recordRagTraceId(ragTraceId);
+                            }
+                        }
                     } else {
                         rawResult = "工具执行失败: " + execResult.getErrorMessage();
                         toolResult = ToolResult.error(execResult.getErrorMessage(),
                                 execResult.getErrorCode(), false);
                         agentTools.setResult(toolResult);
+                        emitThinking(context.emitter(), "tool_failed", "工具执行失败: " + toolName);
+
+                        // 记录失败的工具调用到 trace
+                        agentTraceService.recordToolCall(toolName, toolArgs, rawResult, toolLatency, false, execResult.getErrorMessage());
+                        agentTraceService.recordError("TOOL_EXECUTION_ERROR", execResult.getErrorMessage(), toolName, null);
                     }
 
+                    emitThinking(context.emitter(), "evaluating", "正在评估工具执行结果");
                     ToolResultEvaluator.Evaluation eval = evaluator.evaluate(
                             toolName, toolArgs, rawResult, state.getOriginalQuery(), toolResult);
                     state.recordToolCall(toolName, toolArgs, rawResult, eval.quality());
@@ -338,20 +445,26 @@ public class AgentLoop {
                         extractFactsFromSuccess(toolName, toolArgs, rawResult, state);
                         updateSessionContext(context.sessionId(), toolName, toolArgs, rawResult);
                         agentEventService.record(context.taskId(), AgentTaskEventType.TOOL_SUCCEEDED,
-                                Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName));
+                                Map.of("task_id", context.taskId(),
+                                       "step_id", context.stepId() != null ? context.stepId() : "",
+                                       "tool", toolName != null ? toolName : ""));
 
+                        emitThinking(context.emitter(), "goal_evaluating", "正在评估目标达成情况");
                         GoalEvaluator.GoalEvaluation goalEval = goalEvaluator.evaluateAfterToolSuccess(
                                 state, toolName, rawResult);
                         persistSnapshot(context, state, observationMsg, null);
                         if (goalEval.isAchieved()) {
                             log.info("GoalEvaluator: 目标已达成 → 工具 {} 成功后直接结束 (第{}轮)",
                                     toolName, i + 1);
+                            emitThinking(context.emitter(), "goal_achieved", "目标已达成: " + goalEval.message());
+                            emitThinking(context.emitter(), "goal_achieved", "目标已达成，准备生成最终回答");
                             String finalMsg = rawResult + "\n\n---\n[目标已达成]\n"
                                     + goalEval.message() + "\n"
                                     + "请基于以上结果直接回答用户，不要再调用任何工具。";
                             messages.set(messages.size() - 1,
                                     ToolExecutionResultMessage.from(req, finalMsg));
-                            agentTools.clearBoundState();
+                            saveTokenStats(state);
+            agentTools.clearBoundState();
                             return AgentLoopResult.ready(state);
                         }
                         if (goalEval.progressPrompt() != null) {
@@ -369,10 +482,14 @@ public class AgentLoop {
                         ReflectionResult reflection = reflectionService.reflect(context, toolName, rawResult);
                         applyReflection(state, reflection);
                         agentEventService.record(context.taskId(), AgentTaskEventType.TOOL_FAILED,
-                                Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName, "reason", eval.reason()));
+                                Map.of("task_id", context.taskId(),
+                                       "step_id", context.stepId() != null ? context.stepId() : "",
+                                       "tool", toolName != null ? toolName : "",
+                                       "reason", eval.reason() != null ? eval.reason() : ""));
                         persistSnapshot(context, state, observationMsg, eval.reason());
                         if (shouldStopCurrentStep(state, toolName, eval, rawResult)) {
-                            agentTools.clearBoundState();
+                            saveTokenStats(state);
+            agentTools.clearBoundState();
                             return AgentLoopResult.maxRounds(state);
                         }
                     } else {
@@ -382,10 +499,14 @@ public class AgentLoop {
                         ReflectionResult reflection = reflectionService.reflect(context, toolName, rawResult);
                         applyReflection(state, reflection);
                         agentEventService.record(context.taskId(), AgentTaskEventType.TOOL_FAILED,
-                                Map.of("task_id", context.taskId(), "step_id", context.stepId(), "tool", toolName, "reason", eval.reason()));
+                                Map.of("task_id", context.taskId(),
+                                       "step_id", context.stepId() != null ? context.stepId() : "",
+                                       "tool", toolName != null ? toolName : "",
+                                       "reason", eval.reason() != null ? eval.reason() : ""));
                         persistSnapshot(context, state, observationMsg, eval.reason());
                         if (shouldStopCurrentStep(state, toolName, eval, rawResult)) {
-                            agentTools.clearBoundState();
+                            saveTokenStats(state);
+            agentTools.clearBoundState();
                             return AgentLoopResult.maxRounds(state);
                         }
                     }
@@ -393,7 +514,7 @@ public class AgentLoop {
 
                 if (!anyProgress) state.markNoProgress();
 
-            } else {
+        } else {
                 String answer = aiMessage.text();
                 log.info("LLM 返回文本（第{}轮，不调工具），内容预览: {}",
                         i + 1, answer.length() > 80 ? answer.substring(0, 80) + "..." : answer);
@@ -401,7 +522,8 @@ public class AgentLoop {
                 if (i == 0 && !state.hasSuccessfulToolCall() && isClarificationQuestion(answer)) {
                     log.info("Agent 识别为反问澄清: {}", answer.length() > 80 ? answer.substring(0, 80) + "..." : answer);
                     persistSnapshot(context, state, answer, "需要用户澄清");
-                    agentTools.clearBoundState();
+                    saveTokenStats(state);
+            agentTools.clearBoundState();
                     return AgentLoopResult.needClarification(state, answer);
                 }
 
@@ -430,7 +552,8 @@ public class AgentLoop {
 
                 log.info("Agent Loop 完成，共 {} 轮", i + 1);
                 persistSnapshot(context, state, answer, null);
-                agentTools.clearBoundState();
+                saveTokenStats(state);
+            agentTools.clearBoundState();
                 return AgentLoopResult.ready(state);
             }
         }
@@ -446,6 +569,7 @@ public class AgentLoop {
         }
 
         persistSnapshot(context, state, null, "达到最大轮次");
+        saveTokenStats(state);
         agentTools.clearBoundState();
         return AgentLoopResult.maxRounds(state);
     }
@@ -468,6 +592,18 @@ public class AgentLoop {
         if (reflection.shouldAskUser()) {
             state.setBlockedReason(reflection.rootCause());
         }
+    }
+
+    /**
+     * 保存 Token 统计到 trace（退出前调用）
+     */
+    private void saveTokenStats(AgentState state) {
+        agentTraceService.recordTokenStats(
+                state.getTotalTokensConsumed(),
+                0, // systemPromptTokens - TODO: 单独统计
+                0, // historyTokens - TODO: 单独统计
+                0  // toolResultTokens - TODO: 单独统计
+        );
     }
 
     private boolean shouldStopCurrentStep(AgentState state,
@@ -513,7 +649,7 @@ public class AgentLoop {
         AgentExecutionSnapshot snapshot = new AgentExecutionSnapshot(
                 state.getIteration(),
                 state.getToolHistory().size(),
-                0,
+                state.getTotalTokensConsumed(),
                 state.buildStateSummary(),
                 latestObservation,
                 latestFailureReason,
@@ -686,6 +822,141 @@ public class AgentLoop {
             case "searchNotes" -> state.upgradeEvidence(AgentState.EvidenceLevel.SEARCH_EVIDENCE);
             case "ragSummary" -> state.upgradeEvidence(AgentState.EvidenceLevel.SEARCH_EVIDENCE);
             case "listNotes" -> state.upgradeEvidence(AgentState.EvidenceLevel.LIST_EVIDENCE);
+        }
+    }
+
+    /**
+     * 判断当前步骤是否需要网页内容
+     */
+    private boolean requiresFetchedContent(WorkerLoopContext context) {
+        if (context.goal() == null) return false;
+        String goal = context.goal().toLowerCase(Locale.ROOT);
+        // createNote 步骤通常需要网页内容
+        return goal.contains("创建") && goal.contains("笔记") && goal.contains("总结");
+    }
+
+    /**
+     * 判断当前步骤是否为 createNote 步骤
+     */
+    private boolean isCreateNoteStep(WorkerLoopContext context) {
+        if (context.goal() == null) return false;
+        String goal = context.goal().toLowerCase(Locale.ROOT);
+        return goal.contains("创建") && goal.contains("笔记");
+    }
+
+    /**
+     * 判断是否应该询问用户关于 URL 白名单
+     */
+    private boolean shouldAskUserAboutUrlWhitelist(AgentState state) {
+        if (state.getFailedActions().size() < 3) return false;
+
+        // 检查最近 3 次失败是否都是 fetchUrl + 白名单拦截
+        long urlBlockedCount = state.getFailedActions().stream()
+                .filter(a -> a.contains("fetchUrl") &&
+                           (a.contains("白名单") || a.contains("不在允许") ||
+                            a.contains("访问受限") || a.contains("被拦截")))
+                .count();
+
+        return urlBlockedCount >= 3;
+    }
+
+    /**
+     * 从失败操作中提取被拦截的 URL
+     */
+    private String extractBlockedUrl(AgentState state) {
+        for (String action : state.getFailedActions()) {
+            if (action.contains("fetchUrl") && action.contains("url")) {
+                // 尝试从 JSON 参数中提取 URL
+                int urlStart = action.indexOf("\"url\"");
+                if (urlStart != -1) {
+                    int colonPos = action.indexOf(":", urlStart);
+                    int quoteStart = action.indexOf("\"", colonPos + 1);
+                    int quoteEnd = action.indexOf("\"", quoteStart + 1);
+                    if (quoteStart != -1 && quoteEnd != -1) {
+                        return action.substring(quoteStart + 1, quoteEnd);
+                    }
+                }
+            }
+        }
+        return "未知 URL";
+    }
+
+    /**
+     * 从用户消息中提取选择的选项编号
+     */
+    private int extractUserChoice(String userQuery) {
+        if (userQuery == null) return -1;
+
+        // 匹配 "选择选项 1" "选择选项 2" 等格式
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("选择选项\\s*(\\d+)");
+        java.util.regex.Matcher matcher = pattern.matcher(userQuery);
+
+        if (matcher.find()) {
+            return Integer.parseInt(matcher.group(1));
+        }
+        return -1;
+    }
+
+    /**
+     * 处理用户的澄清选择
+     */
+    private AgentLoopResult handleUserClarificationChoice(WorkerLoopContext context, AgentState state, int choice) {
+        String blockedUrl = extractBlockedUrl(state);
+
+        switch (choice) {
+            case 1: // 添加到白名单
+                log.info("用户选择添加域名到白名单: {}", blockedUrl);
+                state.setTaskStatus(TaskStatus.GOAL_FAILED);
+                state.setBlockedReason("需要管理员权限添加域名到白名单");
+                saveTokenStats(state);
+            agentTools.clearBoundState();
+                return AgentLoopResult.blocked(state,
+                    String.format("已收到您的选择。\n\n" +
+                        "您选择了「添加该域名到白名单」。\n\n" +
+                        "这需要管理员权限进行系统配置。请联系系统管理员将域名 `%s` 添加到 URL 白名单中，" +
+                        "然后重新尝试该任务。", extractDomain(blockedUrl)));
+
+            case 2: // 搜索本地笔记 - 返回 null 表示继续执行当前 loop
+                log.info("用户选择搜索本地笔记替代网页抓取");
+                // 修改状态：标记 fetchStep 失败，但允许继续
+                state.setFetchStepFailed(true);
+                state.addKnownFact("用户选择放弃网页抓取，改为搜索本地笔记");
+
+                // 清空失败记录，开始新的执行
+                state.getFailedActions().clear();
+                state.setTaskStatus(TaskStatus.EXECUTING);
+
+                // 返回 null 表示不立即结束，让调用方继续执行 AgentLoop
+                return null;
+
+            case 3: // 取消操作
+                log.info("用户选择取消操作");
+                state.setTaskStatus(TaskStatus.GOAL_FAILED);
+                state.setBlockedReason("用户主动取消操作");
+                saveTokenStats(state);
+            agentTools.clearBoundState();
+                return AgentLoopResult.blocked(state,
+                    "好的，已取消此次操作。\n\n" +
+                    "由于目标网页不在允许访问的白名单中，且您选择了取消操作，任务已终止。\n\n" +
+                    "如果您想：\n" +
+                    "- 添加该域名到白名单，请联系系统管理员\n" +
+                    "- 搜索本地笔记中的相关内容，可以重新发起一个新的查询");
+
+            default:
+                log.warn("未知的用户选择: {}", choice);
+                return AgentLoopResult.blocked(state, "抱歉，无法识别您的选择。请重新选择 1、2 或 3。");
+        }
+    }
+
+    /**
+     * 从 URL 中提取域名
+     */
+    private String extractDomain(String url) {
+        try {
+            java.net.URI uri = new java.net.URI(url);
+            return uri.getHost();
+        } catch (Exception e) {
+            return url;
         }
     }
 
@@ -893,5 +1164,51 @@ public class AgentLoop {
             if (text.contains(keyword)) return true;
         }
         return false;
+    }
+
+    /**
+     * 发送思考过程 SSE 事件到前端
+     * @param emitter SSE 发射器
+     * @param stage 阶段标识：reflecting, reflected, replanning, replanned, evaluating, tool_executing 等
+     * @param detail 详细描述
+     */
+    public static void emitThinking(SseEmitter emitter, String stage, String detail) {
+        if (emitter == null) return;
+        try {
+            Map<String, Object> data = Map.of(
+                    "stage", stage,
+                    "detail", detail,
+                    "timestamp", System.currentTimeMillis()
+            );
+            emitter.send(SseEmitter.event()
+                    .name("thinking")
+                    .data(data));
+        } catch (Exception e) {
+            log.warn("发送思考过程事件失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 构建 Prompt 摘要（用于 trace 记录）
+     */
+    private String buildPromptSummary(List<ChatMessage> messages) {
+        if (messages == null || messages.isEmpty()) return "";
+
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (ChatMessage msg : messages) {
+            if (count >= 3) { // 只记录前3条
+                sb.append("... (").append(messages.size() - count).append(" more messages)");
+                break;
+            }
+            String type = msg.type().toString();
+            String content = msg.text();
+            if (content != null && content.length() > 100) {
+                content = content.substring(0, 100) + "...";
+            }
+            sb.append("[").append(type).append("] ").append(content).append("\n");
+            count++;
+        }
+        return sb.toString();
     }
 }

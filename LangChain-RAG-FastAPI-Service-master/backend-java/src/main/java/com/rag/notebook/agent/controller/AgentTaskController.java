@@ -15,8 +15,11 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Map;
 
 @RestController
@@ -67,5 +70,22 @@ public class AgentTaskController {
         response.setRemainingStepCount(resumeContext.remainingSteps() == null ? 0 : resumeContext.remainingSteps().size());
         response.setRemainingStepLabels(resumeContext.remainingSteps() == null ? List.of() : resumeContext.remainingSteps().stream().map(SubTask::getLabel).toList());
         return ApiResponse.success(response);
+    }
+
+    @PostMapping("/{taskId}/resume/stream")
+    public SseEmitter resumeTaskStream(@UserId String userId,
+                                       @PathVariable String taskId,
+                                       @RequestBody(required = false) AgentTaskResumeRequest request) {
+        String userMessage = request == null ? null : request.getUserMessage();
+        return agentTaskService.resumeTaskStream(taskId, userId, userMessage);
+    }
+
+    @GetMapping("/session/{sessionId}/pending")
+    public ApiResponse<Map<String, Object>> getPendingTask(@UserId String userId,
+                                                           @PathVariable String sessionId) {
+        String taskId = agentTaskService.findPendingTaskBySession(sessionId, userId);
+        Map<String, Object> result = new HashMap<>();
+        result.put("taskId", taskId);  // taskId 可以为 null
+        return ApiResponse.success(result);
     }
 }

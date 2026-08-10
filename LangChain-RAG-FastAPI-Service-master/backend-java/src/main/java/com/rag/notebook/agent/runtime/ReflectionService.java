@@ -2,13 +2,16 @@ package com.rag.notebook.agent.runtime;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rag.notebook.agent.AgentLoop;
 import com.rag.notebook.agent.AgentState;
 import com.rag.notebook.agent.ModelFactory;
 import com.rag.notebook.agent.entity.AgentReflection;
 import com.rag.notebook.agent.repo.AgentReflectionRepository;
+import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -51,6 +54,9 @@ public class ReflectionService {
         }
 
         try {
+            // 发送反思开始事件
+            AgentLoop.emitThinking(context.emitter(), "reflecting", "正在反思执行策略");
+
             // 使用 LLM 分析当前状态
             ReflectionResult result = reflectWithLLM(context, state, latestToolName, latestRawResult);
 
@@ -58,6 +64,9 @@ public class ReflectionService {
             if (context.taskId() != null) {
                 persistReflection(context, state, result);
             }
+
+            // 发送反思完成事件
+            AgentLoop.emitThinking(context.emitter(), "reflected", "反思完成: " + result.rootCause());
 
             return result;
         } catch (Exception e) {
@@ -76,12 +85,17 @@ public class ReflectionService {
         String systemPrompt = buildReflectionSystemPrompt();
         String userPrompt = buildReflectionUserPrompt(context, state, latestToolName, latestRawResult);
 
-        String response = model.generate(
+        Response<AiMessage> response = model.generate(
                 SystemMessage.from(systemPrompt),
                 UserMessage.from(userPrompt)
-        ).content().text();
+        );
 
-        return parseReflectionResponse(response, state);
+        // 统计 Token 消耗
+        if (response.tokenUsage() != null) {
+            state.addTokensConsumed(response.tokenUsage().totalTokenCount());
+        }
+
+        return parseReflectionResponse(response.content().text(), state);
     }
 
     /**
@@ -96,13 +110,20 @@ public class ReflectionService {
                   "goalAchieved": false,
                   "shouldReplan": true,
                   "shouldAskUser": false,
-                  "failureType": "NO_PROGRESS | REPEATED_TOOL_FAILURE | MISSING_EVIDENCE | WRONG_STRATEGY",
+                  "failureType": "NO_PROGRESS | REPEATED_TOOL_FAILURE | MISSING_EVIDENCE | WRONG_STRATEGY | URL_BLOCKED",
                   "rootCause": "根本原因描述",
                   "missingEvidence": ["缺失证据1", "缺失证据2"],
                   "recommendedActions": ["建议行动1", "建议行动2"],
                   "summary": "反思总结",
                   "confidence": 0.75
                 }
+
+                failureType 类型说明：
+                - NO_PROGRESS: 连续多次无进展
+                - REPEATED_TOOL_FAILURE: 同一工具反复失败
+                - MISSING_EVIDENCE: 缺少关键证据
+                - WRONG_STRATEGY: 策略选择错误
+                - URL_BLOCKED: URL 被白名单拦截（需切换策略）
                 """;
     }
 
@@ -218,18 +239,57 @@ public class ReflectionService {
         }
 
         List<String> recommendedActions = new ArrayList<>();
-        recommendedActions.add("切换检索词或改用其他工具路径");
-        if (context.successCriteria() != null && !context.successCriteria().isEmpty()) {
-            recommendedActions.add("对照 successCriteria 补齐缺失证据");
+        String failureType;
+        String rootCause;
+        boolean shouldReplan;
+
+        // 检测 URL 白名单拦截
+        boolean isUrlBlocked = isUrlBlockedScenario(state, latestToolName, latestRawResult);
+        if (isUrlBlocked) {
+            failureType = "URL_BLOCKED";
+            rootCause = "URL 被白名单拦截，无法访问外部网页";
+            recommendedActions.add("切换到搜索本地笔记库");
+            recommendedActions.add("或询问用户是否添加该 URL 到白名单");
+            shouldReplan = true;
+        } else if (state.getConsecutiveNoProgress() >= 2) {
+            failureType = "NO_PROGRESS";
+            rootCause = missingEvidence.isEmpty() ? "当前执行路径未形成有效推进" : String.join("；", missingEvidence);
+            recommendedActions.add("切换检索词或改用其他工具路径");
+            if (context.successCriteria() != null && !context.successCriteria().isEmpty()) {
+                recommendedActions.add("对照 successCriteria 补齐缺失证据");
+            }
+            shouldReplan = true;
+        } else {
+            failureType = "REPEATED_TOOL_FAILURE";
+            rootCause = missingEvidence.isEmpty() ? "当前执行路径未形成有效推进" : String.join("；", missingEvidence);
+            recommendedActions.add("切换检索词或改用其他工具路径");
+            shouldReplan = state.getConsecutiveNoProgress() >= 2;
         }
 
-        String failureType = state.getConsecutiveNoProgress() >= 2 ? "NO_PROGRESS" : "REPEATED_TOOL_FAILURE";
-        String rootCause = missingEvidence.isEmpty() ? "当前执行路径未形成有效推进" : String.join("；", missingEvidence);
         String summary = "任务在当前路径上推进不足，需要切换策略";
-        boolean shouldReplan = state.getConsecutiveNoProgress() >= 2;
 
         return new ReflectionResult(false, shouldReplan, false, failureType, rootCause,
                 missingEvidence, recommendedActions, summary, 0.42);
+    }
+
+    /**
+     * 判断是否为 URL 白名单拦截场景
+     */
+    private boolean isUrlBlockedScenario(AgentState state, String latestToolName, String latestRawResult) {
+        // 检查最新工具调用结果
+        if ("fetchUrl".equals(latestToolName) && latestRawResult != null) {
+            String lower = latestRawResult.toLowerCase();
+            if (lower.contains("白名单") || lower.contains("不在允许") ||
+                lower.contains("访问受限") || lower.contains("url被拦截")) {
+                return true;
+            }
+        }
+
+        // 检查失败操作列表
+        return state.getFailedActions().stream()
+                .anyMatch(a -> a.contains("fetchUrl") &&
+                        (a.contains("白名单") || a.contains("不在允许") ||
+                         a.contains("访问受限") || a.contains("被拦截")));
     }
 
     /**

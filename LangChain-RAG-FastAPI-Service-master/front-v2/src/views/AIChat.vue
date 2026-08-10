@@ -175,6 +175,46 @@
               </div>
               <!-- 回复正文 -->
               <div v-if="msg.content" class="message-text" v-html="renderMarkdown(msg.content)" />
+              <!-- 用户澄清选项 -->
+              <div v-if="msg.role === 'ai' && isClarificationMessage(msg)" class="clarification-options">
+                <a-alert type="warning" style="margin-bottom: 12px">
+                  <template #icon><icon-exclamation-circle /></template>
+                  需要您的决策
+                </a-alert>
+                <a-space direction="vertical" :size="8" style="width: 100%">
+                  <a-button
+                    type="outline"
+                    long
+                    @click="handleClarificationChoice(msg, 1)"
+                    :disabled="msg.clarificationAnswered"
+                  >
+                    <template #icon>🔓</template>
+                    添加该域名到白名单
+                  </a-button>
+                  <a-button
+                    type="outline"
+                    long
+                    @click="handleClarificationChoice(msg, 2)"
+                    :disabled="msg.clarificationAnswered"
+                  >
+                    <template #icon>🔍</template>
+                    改为搜索本地笔记库
+                  </a-button>
+                  <a-button
+                    type="outline"
+                    status="danger"
+                    long
+                    @click="handleClarificationChoice(msg, 3)"
+                    :disabled="msg.clarificationAnswered"
+                  >
+                    <template #icon>❌</template>
+                    取消此次操作
+                  </a-button>
+                </a-space>
+                <div v-if="msg.clarificationAnswered" style="margin-top: 12px; color: var(--color-text-3); font-size: 12px;">
+                  已选择：{{ getClarificationChoiceLabel(msg.clarificationChoice) }}
+                </div>
+              </div>
               <!-- 产物渲染（思维导图、图表等） -->
               <div v-if="msg.artifacts && msg.artifacts.length > 0" class="artifact-section">
                 <div v-for="art in msg.artifacts" :key="art.id" class="artifact-card">
@@ -388,8 +428,9 @@ import {
   IconThunderbolt,
   IconCommand,
   IconAttachment,
+  IconExclamationCircle,
 } from '@arco-design/web-vue/es/icon'
-import { chatApi, evaluationApi, knowledgeApi, noteApi } from '@/api'
+import { chatApi, evaluationApi, knowledgeApi, noteApi, agentTaskApi } from '@/api'
 import { marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import hljs from 'highlight.js'
@@ -412,6 +453,7 @@ const sessions = ref<any[]>([])
 const messages = ref<any[]>([])
 const quoteMessage = ref<any>(null)
 const showToolApproval = ref(false)
+const pendingTaskId = ref<string | null>(null)
 let stopFlag = false
 const tokenUsed = ref(0)
 const tokenMax = ref(32000)
@@ -462,16 +504,27 @@ const quickQuestions = [
 
 // 思考过程阶段配置
 const stageConfig: Record<string, { label: string; color: string }> = {
-  retrieval:   { label: '检索',   color: '#B8926E' },
-  hyde:        { label: 'HyDE',   color: '#8B7E6F' },
-  reorder:     { label: '重排序', color: '#D4914A' },
-  summarize:   { label: '总结',   color: '#7D9B7A' },
-  planning:    { label: '规划',   color: '#6B8EAE' },
-  researching: { label: '研究',   color: '#8B7E6F' },
-  writing:     { label: '写作',   color: '#7D9B7A' },
-  tool_call:   { label: '工具',   color: '#D4914A' },
-  review:      { label: '审查',   color: '#C47D5A' },
-  complete:    { label: '完成',   color: '#5A8F6A' },
+  retrieval:        { label: '检索',     color: '#B8926E' },
+  hyde:             { label: 'HyDE',     color: '#8B7E6F' },
+  reorder:          { label: '重排序',   color: '#D4914A' },
+  summarize:        { label: '总结',     color: '#7D9B7A' },
+  planning:         { label: '规划任务', color: '#6B8EAE' },
+  step_start:       { label: '执行步骤', color: '#7D8EAE' },
+  researching:      { label: '研究',     color: '#8B7E6F' },
+  writing:          { label: '写作',     color: '#7D9B7A' },
+  tool_call:        { label: '工具',     color: '#D4914A' },
+  review:           { label: '审查',     color: '#C47D5A' },
+  complete:         { label: '完成',     color: '#5A8F6A' },
+  reflecting:       { label: '反思分析', color: '#9B6B8E' },
+  reflected:        { label: '反思完成', color: '#8E6B9B' },
+  replanning:       { label: '调整策略', color: '#6B8EAE' },
+  replanned:        { label: '策略已调整', color: '#5A7DAE' },
+  tool_executing:   { label: '执行工具', color: '#D4914A' },
+  tool_executed:    { label: '工具完成', color: '#C4A14A' },
+  tool_failed:      { label: '工具失败', color: '#C47D5A' },
+  evaluating:       { label: '评估结果', color: '#7D9B7A' },
+  goal_evaluating:  { label: '评估目标', color: '#6B9B7A' },
+  goal_achieved:    { label: '目标达成', color: '#5A8F6A' },
 }
 
 function getStageLabel(stage: string) {
@@ -721,8 +774,21 @@ async function fetchMessages() {
     })
     scrollToBottom()
     fetchTokenUsage()
+    // 查询待澄清任务
+    await fetchPendingTask()
   } catch (e) {
     console.error('获取消息失败', e)
+  }
+}
+
+async function fetchPendingTask() {
+  if (!currentSessionId.value) return
+  try {
+    const res: any = await agentTaskApi.getPendingTask(currentSessionId.value)
+    const data = res?.data || res
+    pendingTaskId.value = data?.taskId || null
+  } catch (e) {
+    console.error('查询待澄清任务失败', e)
   }
 }
 
@@ -883,10 +949,11 @@ async function sendMessage(text: string, options?: { skipUserMessage?: boolean; 
               // 更新 token 用量
               if (data.token_used !== undefined) tokenUsed.value = data.token_used
               if (data.token_max !== undefined) tokenMax.value = data.token_max
-              // 保存 traceId 和产物到消息
+              // 保存 traceId、taskId 和产物到消息
               const msg = lastMsg()
               if (msg?.role === 'ai') {
                 if (traceId) msg.traceId = traceId
+                if (data.task_id) msg.taskId = data.task_id  // 保存 taskId 用于恢复任务
                 // 产物数据（思维导图、图表等）
                 if (data.artifacts && Array.isArray(data.artifacts) && data.artifacts.length > 0) {
                   msg.artifacts = data.artifacts
@@ -1070,6 +1137,175 @@ function handleDeleteMessage(index: number) {
       Message.success('已删除')
     },
   })
+}
+
+// ========== 用户澄清处理 ==========
+
+function isClarificationMessage(msg: any): boolean {
+  if (!msg || !msg.content) return false
+  const content = msg.content.toLowerCase()
+  return content.includes('您希望如何继续') ||
+         content.includes('你希望如何继续') ||
+         (content.includes('url') && content.includes('不在') && content.includes('白名单'))
+}
+
+function getClarificationChoiceLabel(choice: number): string {
+  const labels: Record<number, string> = {
+    1: '添加该域名到白名单',
+    2: '改为搜索本地笔记库',
+    3: '取消此次操作'
+  }
+  return labels[choice] || '未知选项'
+}
+
+async function handleClarificationChoice(clarificationMsg: any, choice: number) {
+  if (!currentSessionId.value) {
+    Message.warning('当前无会话')
+    return
+  }
+
+  // 从后端查询待澄清任务
+  let taskId = clarificationMsg.taskId
+  if (!taskId) {
+    try {
+      const res: any = await agentTaskApi.getPendingTask(currentSessionId.value)
+      const data = res?.data || res
+      taskId = data?.taskId || null
+    } catch (error: any) {
+      Message.error('无法获取待澄清任务：' + (error.message || '未知错误'))
+      return
+    }
+  }
+
+  if (!taskId) {
+    Message.error('无法恢复任务：缺少任务 ID')
+    return
+  }
+
+  // 标记该消息已回答
+  clarificationMsg.clarificationAnswered = true
+  clarificationMsg.clarificationChoice = choice
+
+  // 构造用户的选择消息
+  const choiceText = `选择选项 ${choice}: ${getClarificationChoiceLabel(choice)}`
+
+  // 添加用户选择消息到界面
+  messages.value.push({ role: 'human', content: choiceText })
+
+  // 添加 AI 消息占位
+  messages.value.push({
+    role: 'ai',
+    content: '',
+    thinking: [] as any[],
+    thinkingCollapsed: false,
+    traceId: '',
+    feedback: null as number | null,
+  })
+
+  streaming.value = true
+  stopFlag = false
+  scrollToBottom()
+
+  try {
+    // 调用 resume API 恢复任务
+    const response = await agentTaskApi.resumeStream(taskId, { userMessage: choiceText })
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      streaming.value = false
+      return
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let aiResponse = ''
+    let traceId = ''
+
+    const lastMsg = () => messages.value[messages.value.length - 1]
+
+    while (!stopFlag) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue
+        try {
+          const jsonStr = line.startsWith('data: ') ? line.slice(6) : line.slice(5)
+          if (!jsonStr.trim()) continue
+          const data = JSON.parse(jsonStr)
+
+          switch (data.type) {
+            case 'thinking': {
+              const msg = lastMsg()
+              if (msg?.role === 'ai') {
+                msg.thinking = [...msg.thinking, {
+                  stage: data.stage || '',
+                  content: data.content || '',
+                }]
+                await nextTick()
+                scrollToBottom()
+              }
+              break
+            }
+            case 'response': {
+              const content = data.content || ''
+              aiResponse += content
+              const msg = lastMsg()
+              if (msg?.role === 'ai') {
+                msg.content = aiResponse
+                await nextTick()
+                scrollToBottom()
+              }
+              break
+            }
+            case 'done': {
+              traceId = data.trace_id || ''
+              if (data.token_used !== undefined) tokenUsed.value = data.token_used
+              if (data.token_max !== undefined) tokenMax.value = data.token_max
+              const msg = lastMsg()
+              if (msg?.role === 'ai') {
+                if (traceId) msg.traceId = traceId
+                if (data.task_id) msg.taskId = data.task_id
+                if (data.artifacts && Array.isArray(data.artifacts) && data.artifacts.length > 0) {
+                  msg.artifacts = data.artifacts
+                }
+              }
+              break
+            }
+            case 'error': {
+              const msg = lastMsg()
+              if (msg?.role === 'ai') {
+                msg.content = data.content || '处理请求时发生错误'
+              }
+              break
+            }
+          }
+        } catch (e) {
+          console.warn('SSE parse error:', line, e)
+        }
+      }
+    }
+
+    const msg = lastMsg()
+    if (msg?.role === 'ai' && !msg.content) {
+      msg.content = '恢复任务失败'
+    }
+
+    streaming.value = false
+    scrollToBottom()
+  } catch (error: any) {
+    console.error('恢复任务失败:', error)
+    Message.error('恢复任务失败: ' + (error.message || '未知错误'))
+    const msg = messages.value[messages.value.length - 1]
+    if (msg?.role === 'ai') {
+      msg.content = '恢复任务失败: ' + (error.message || '未知错误')
+    }
+    streaming.value = false
+  }
 }
 
 function formatTime(dateStr: string) {
@@ -1506,6 +1742,31 @@ function formatTime(dateStr: string) {
   background: var(--color-primary);
   color: #fff;
 }
+
+/* 用户澄清选项样式 */
+.clarification-options {
+  margin-top: 12px;
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--color-bg-2);
+  border: 1px solid var(--color-border-2);
+}
+
+.clarification-options .arco-btn {
+  font-size: 14px;
+  transition: all 0.3s ease;
+}
+
+.clarification-options .arco-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.clarification-options .arco-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 
 .message-toolbar {
   display: flex;

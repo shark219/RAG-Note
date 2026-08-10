@@ -57,6 +57,7 @@ public class AgentState {
     private final List<String> workingMemory = new ArrayList<>();
     private final List<String> failedActions = new ArrayList<>();
     private int consecutiveNoProgress = 0;
+    private int totalTokensConsumed = 0;
 
     // ========== 证据级别 ==========
     private EvidenceLevel highestEvidence = EvidenceLevel.NONE;
@@ -337,6 +338,14 @@ public class AgentState {
     public int getConsecutiveNoProgress() { return consecutiveNoProgress; }
 
     public boolean needsReflection() { return consecutiveNoProgress >= 2; }
+
+    public int getTotalTokensConsumed() { return totalTokensConsumed; }
+
+    public void addTokensConsumed(int tokens) {
+        if (tokens > 0) {
+            this.totalTokensConsumed += tokens;
+        }
+    }
 
     // ============================================================
     // 查询方法

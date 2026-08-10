@@ -84,27 +84,52 @@
             </div>
 
             <div class="detail-block">
-              <div class="block-title">步骤</div>
+              <div class="block-title">执行步骤</div>
               <a-timeline>
                 <a-timeline-item v-for="step in detail.steps || []" :key="step.stepId" :color="statusColor(step.status)">
-                  <div class="timeline-title">{{ step.label || step.stepId }}</div>
-                  <div class="timeline-sub">{{ step.status }} · {{ step.goal || '-' }}</div>
-                  <div v-if="step.resultSummary" class="timeline-text">{{ step.resultSummary }}</div>
+                  <template #dot>
+                    <icon-check-circle v-if="step.status === 'COMPLETED'" :style="{ fontSize: '16px', color: 'rgb(var(--green-6))' }" />
+                    <icon-loading v-else-if="step.status === 'RUNNING'" :style="{ fontSize: '16px', color: 'rgb(var(--arcoblue-6))' }" />
+                    <icon-close-circle v-else-if="step.status === 'FAILED' || step.status === 'BLOCKED'" :style="{ fontSize: '16px', color: 'rgb(var(--red-6))' }" />
+                    <icon-record v-else :style="{ fontSize: '16px', color: 'var(--color-text-4)' }" />
+                  </template>
+                  <div class="timeline-step">
+                    <div class="timeline-title">{{ step.label || step.stepId }}</div>
+                    <div class="timeline-sub">
+                      <a-tag :color="statusColor(step.status)" size="small">{{ step.status }}</a-tag>
+                      <span>{{ step.goal || '-' }}</span>
+                    </div>
+                    <div v-if="step.resultSummary" class="timeline-text">{{ step.resultSummary }}</div>
+                  </div>
                 </a-timeline-item>
               </a-timeline>
             </div>
 
             <div class="detail-block">
-              <div class="block-title">恢复后任务时间线</div>
+              <div class="block-title">执行事件时间线</div>
               <a-timeline>
                 <a-timeline-item
                   v-for="event in detail.events || []"
                   :key="`${event.createdAt}-${event.eventType}`"
                   :color="eventColor(event.eventType)"
                 >
-                  <div class="timeline-title">{{ event.eventType }}</div>
-                  <div class="timeline-sub">{{ event.createdAt || '-' }}</div>
-                  <div v-if="event.payloadJson" class="timeline-text">{{ event.payloadJson }}</div>
+                  <template #dot>
+                    <icon-check-circle v-if="event.eventType.includes('COMPLETED') || event.eventType.includes('SUCCEEDED')" :style="{ fontSize: '14px' }" />
+                    <icon-close-circle v-else-if="event.eventType.includes('FAILED') || event.eventType.includes('BLOCKED')" :style="{ fontSize: '14px' }" />
+                    <icon-info-circle v-else-if="event.eventType.includes('REFLECTION') || event.eventType.includes('REPLAN')" :style="{ fontSize: '14px' }" />
+                    <icon-record v-else :style="{ fontSize: '14px' }" />
+                  </template>
+                  <div class="timeline-event">
+                    <div class="timeline-title">{{ formatEventType(event.eventType) }}</div>
+                    <div class="timeline-sub">{{ event.createdAt || '-' }}</div>
+                    <div v-if="event.payloadJson" class="timeline-payload">
+                      <a-collapse :bordered="false" size="small">
+                        <a-collapse-item key="1" header="查看详情">
+                          <pre class="payload-content">{{ formatPayload(event.payloadJson) }}</pre>
+                        </a-collapse-item>
+                      </a-collapse>
+                    </div>
+                  </div>
                 </a-timeline-item>
               </a-timeline>
             </div>
@@ -127,7 +152,14 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { Message } from '@arco-design/web-vue'
-import { IconRefresh } from '@arco-design/web-vue/es/icon'
+import {
+  IconRefresh,
+  IconCheckCircle,
+  IconCloseCircle,
+  IconInfoCircle,
+  IconRecord,
+  IconLoading
+} from '@arco-design/web-vue/es/icon'
 import { agentTaskApi } from '@/api'
 
 const loading = ref(false)
@@ -214,6 +246,35 @@ function eventColor(eventType?: string) {
   if (eventType.includes('REFLECTION') || eventType.includes('REPLAN')) return 'orange'
   if (eventType.includes('COMPLETED') || eventType.includes('SUCCEEDED')) return 'green'
   return 'arcoblue'
+}
+
+function formatEventType(eventType: string) {
+  const typeMap: Record<string, string> = {
+    TASK_CREATED: '任务创建',
+    PLAN_CREATED: '计划生成',
+    STEP_STARTED: '步骤开始',
+    STEP_COMPLETED: '步骤完成',
+    STEP_FAILED: '步骤失败',
+    STEP_SKIPPED: '步骤跳过',
+    TOOL_CALLED: '工具调用',
+    TOOL_SUCCEEDED: '工具成功',
+    TOOL_FAILED: '工具失败',
+    REFLECTION_CREATED: '反思分析',
+    REPLAN_CREATED: '重新规划',
+    TASK_BLOCKED: '任务阻塞',
+    TASK_COMPLETED: '任务完成',
+    TASK_FAILED: '任务失败'
+  }
+  return typeMap[eventType] || eventType
+}
+
+function formatPayload(payloadJson: string) {
+  try {
+    const payload = JSON.parse(payloadJson)
+    return JSON.stringify(payload, null, 2)
+  } catch {
+    return payloadJson
+  }
 }
 </script>
 
@@ -326,5 +387,28 @@ function eventColor(eventType?: string) {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.timeline-step,
+.timeline-event {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.timeline-payload {
+  margin-top: 8px;
+}
+
+.payload-content {
+  margin: 0;
+  padding: 12px;
+  background: var(--color-fill-2);
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: 'Consolas', 'Monaco', monospace;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

@@ -3,13 +3,16 @@ package com.rag.notebook.agent.runtime;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rag.notebook.agent.AgentLoop;
 import com.rag.notebook.agent.AgentState;
 import com.rag.notebook.agent.ModelFactory;
 import com.rag.notebook.agent.SubTask;
 import com.rag.notebook.agent.SupervisorService;
+import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.output.Response;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -45,6 +48,9 @@ public class ReplanningService {
         }
 
         try {
+            // 发送重规划开始事件
+            AgentLoop.emitThinking(context.emitter(), "replanning", "正在重新规划任务");
+
             // 使用 LLM 生成新计划
             List<SubTask> newSteps = replanWithLLM(context, reflectionResult);
 
@@ -52,6 +58,9 @@ public class ReplanningService {
                 log.warn("LLM 重规划返回空计划，使用回退方案");
                 newSteps = fallbackReplan(context, reflectionResult);
             }
+
+            // 发送重规划完成事件
+            AgentLoop.emitThinking(context.emitter(), "replanned", "重规划完成，生成 " + newSteps.size() + " 个新步骤");
 
             return new ReplanResult(
                     reflectionResult.rootCause(),
@@ -80,12 +89,17 @@ public class ReplanningService {
         String systemPrompt = buildReplanSystemPrompt();
         String userPrompt = buildReplanUserPrompt(context, reflectionResult);
 
-        String response = model.generate(
+        Response<AiMessage> response = model.generate(
                 SystemMessage.from(systemPrompt),
                 UserMessage.from(userPrompt)
-        ).content().text();
+        );
 
-        return parseReplanResponse(response);
+        // 统计 Token 消耗
+        if (response.tokenUsage() != null) {
+            context.agentState().addTokensConsumed(response.tokenUsage().totalTokenCount());
+        }
+
+        return parseReplanResponse(response.content().text());
     }
 
     /**
@@ -202,6 +216,40 @@ public class ReplanningService {
 
         // 根据失败类型生成简化计划
         String failureType = reflectionResult.failureType();
+        AgentState state = context.agentState();
+
+        // URL 白名单限制 → 切换到搜索本地笔记
+        if ("URL_BLOCKED".equals(failureType) || isUrlBlockedByPolicy(reflectionResult, state)) {
+            SubTask step = new SubTask();
+            step.setId("RP-1");
+            step.setLabel("在本地笔记中搜索相关内容");
+            step.setGoal("从已有笔记中查找相关信息");
+            step.setDescription("由于网页访问受限，改为搜索本地笔记库中的相关内容");
+            step.setToolHint("searchNotes,ragSummary");
+            step.setSuccessCriteria(List.of("找到相关笔记", "总结核心内容"));
+            step.setExecutionMode("SEQUENTIAL");
+            newSteps.add(step);
+
+            log.info("重规划: URL 访问受限 → 切换到本地笔记搜索");
+            return newSteps;
+        }
+
+        // fetchUrl 连续失败 → 直接报告失败，不要继续
+        if (state != null && state.isFetchStepFailed() &&
+            state.getFailedActions().stream().anyMatch(a -> a.contains("fetchUrl"))) {
+            SubTask step = new SubTask();
+            step.setId("RP-1");
+            step.setLabel("报告网页抓取失败");
+            step.setGoal("向用户说明无法获取网页内容的原因");
+            step.setDescription("无法访问指定网页，向用户报告原因并询问是否切换策略");
+            step.setToolHint("NONE"); // 明确标记不需要调用工具
+            step.setSuccessCriteria(List.of("说明失败原因", "提供替代方案"));
+            step.setExecutionMode("SEQUENTIAL");
+            newSteps.add(step);
+
+            log.info("重规划: fetchUrl 失败 → 报告失败并询问用户");
+            return newSteps;
+        }
 
         if ("NO_PROGRESS".equals(failureType) || "REPEATED_TOOL_FAILURE".equals(failureType)) {
             // 切换策略
@@ -236,5 +284,23 @@ public class ReplanningService {
         }
 
         return newSteps;
+    }
+
+    /**
+     * 判断是否为 URL 白名单阻止导致的失败
+     */
+    private boolean isUrlBlockedByPolicy(ReflectionResult reflectionResult, AgentState state) {
+        if (reflectionResult == null || state == null) return false;
+
+        String rootCause = reflectionResult.rootCause();
+        boolean hasUrlBlockedMessage = rootCause != null &&
+            (rootCause.contains("白名单") || rootCause.contains("不在允许") ||
+             rootCause.contains("访问受限") || rootCause.contains("URL被拦截"));
+
+        boolean hasFailedFetchUrl = state.getFailedActions().stream()
+            .anyMatch(a -> a.contains("fetchUrl") &&
+                          (a.contains("白名单") || a.contains("不在允许")));
+
+        return hasUrlBlockedMessage || hasFailedFetchUrl;
     }
 }

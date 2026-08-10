@@ -4,6 +4,7 @@ import com.rag.notebook.agent.runtime.AgentResumeContext;
 import com.rag.notebook.agent.runtime.AgentRuntime;
 import com.rag.notebook.agent.runtime.AgentTaskService;
 import com.rag.notebook.agent.runtime.AgentTaskStatus;
+import com.rag.notebook.agent.trace.AgentTraceService;
 import com.rag.notebook.chat.entity.ChatMessage;
 import com.rag.notebook.chat.service.ChatService;
 import com.rag.notebook.config.ApplicationProperties;
@@ -58,6 +59,7 @@ public class AgentService {
     private final AgentTaskService agentTaskService;
     private final List<ToolSpecification> toolSpecifications;
     private final SkillContextResolver skillContextResolver;
+    private final AgentTraceService agentTraceService;
 
     public AgentService(ModelFactory modelFactory, AgentTools agentTools,
                         ChatService chatService, ApplicationProperties props,
@@ -73,7 +75,8 @@ public class AgentService {
                         ConversationContextManager ctxManager,
                         AgentRuntime agentRuntime,
                         AgentTaskService agentTaskService,
-                        SkillContextResolver skillContextResolver) {
+                        SkillContextResolver skillContextResolver,
+                        AgentTraceService agentTraceService) {
         this.modelFactory = modelFactory;
         this.agentTools = agentTools;
         this.chatService = chatService;
@@ -91,6 +94,7 @@ public class AgentService {
         this.agentRuntime = agentRuntime;
         this.agentTaskService = agentTaskService;
         this.skillContextResolver = skillContextResolver;
+        this.agentTraceService = agentTraceService;
         // 从 @Tool 注解自动提取工具定义
         this.toolSpecifications = ToolSpecifications.toolSpecificationsFrom(agentTools);
     }
@@ -131,6 +135,18 @@ public class AgentService {
         CompletableFuture.runAsync(() -> {
             SecurityContextHolder.setContext(securityContext);
             long startTime = System.currentTimeMillis();
+
+            // 初始化 trace
+            agentTraceService.startTrace(
+                    resumeContext.taskId(),
+                    resumeContext.sessionId(),
+                    resumeContext.userId(),
+                    resumeContext.resumedQuery(),
+                    "gpt-4o",
+                    0.7f,
+                    null
+            );
+
             try {
                 SkillContextResolver.Context skillContext = skillContextResolver.resolve(resumeContext.userId());
                 List<ToolSpecification> activeTools = filterTools(true, true, skillContext);
@@ -160,6 +176,15 @@ public class AgentService {
                     chatService.addMessage(resumeContext.sessionId(), resumeContext.userId(), "human", userMessage);
                 }
                 chatService.addMessage(resumeContext.sessionId(), resumeContext.userId(), "ai", response);
+
+                // 记录 Artifacts
+                if (finalAgentState != null && finalAgentState.getArtifacts() != null) {
+                    agentTraceService.recordArtifacts(finalAgentState.getArtifacts());
+                }
+
+                // 完成并保存 trace
+                long totalLatency = System.currentTimeMillis() - startTime;
+                agentTraceService.completeTrace(response, "COMPLETED", totalLatency);
 
                 sendSseEvent(emitter, "thinking", Map.of(
                         "stage", "complete",
@@ -225,6 +250,13 @@ public class AgentService {
                 safeComplete(emitter);
             } catch (Exception e) {
                 log.error("Agent resume failed: {}", e.getMessage(), e);
+
+                // 记录错误到 trace
+                agentTraceService.recordError("RESUME_ERROR", e.getMessage(), null,
+                        java.util.Arrays.toString(e.getStackTrace()));
+                long totalLatency = System.currentTimeMillis() - startTime;
+                agentTraceService.completeTrace(null, "FAILED", totalLatency);
+
                 try {
                     chatService.addMessage(resumeContext.sessionId(), resumeContext.userId(), "ai", "恢复任务时发生错误: " + e.getMessage());
                 } catch (Exception ignored) {}
@@ -303,6 +335,17 @@ public class AgentService {
                 var task = agentTaskService.createTask(userId, sessionId, query, normalizedGoal,
                         useSupervisor ? "PLANNED" : "SINGLE");
 
+                // 初始化 trace
+                agentTraceService.startTrace(
+                        task.getTaskId(),
+                        sessionId,
+                        userId,
+                        query,
+                        "gpt-4o",
+                        0.7f,
+                        systemPrompt
+                );
+
                 AgentRuntime.RuntimeResult runtimeResult = agentRuntime.start(
                         task.getTaskId(),
                         query,
@@ -329,6 +372,15 @@ public class AgentService {
                 }
 
                 chatService.addMessage(sessionId, userId, "ai", response);
+
+                // 记录 Artifacts
+                if (finalAgentState != null && finalAgentState.getArtifacts() != null) {
+                    agentTraceService.recordArtifacts(finalAgentState.getArtifacts());
+                }
+
+                // 完成并保存 trace
+                long totalLatency = System.currentTimeMillis() - startTime;
+                agentTraceService.completeTrace(response, "COMPLETED", totalLatency);
 
                 sendSseEvent(emitter, "thinking", Map.of(
                         "stage", "complete",
@@ -398,6 +450,13 @@ public class AgentService {
 
             } catch (Exception e) {
                 log.error("Agent stream failed: {}", e.getMessage(), e);
+
+                // 记录错误到 trace
+                agentTraceService.recordError("AGENT_ERROR", e.getMessage(), null,
+                        java.util.Arrays.toString(e.getStackTrace()));
+                long totalLatency = System.currentTimeMillis() - startTime;
+                agentTraceService.completeTrace(null, "FAILED", totalLatency);
+
                 try {
                     chatService.addMessage(sessionId, userId, "ai", "处理请求时发生错误: " + e.getMessage());
                 } catch (Exception ignored) {}

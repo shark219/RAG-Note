@@ -127,6 +127,12 @@ public class GoalEvaluator {
 
         // 一个工具都没调过 → 判断是否需要工具
         if (!state.hasSuccessfulToolCall()) {
+            // URL 白名单拦截场景：虽然没有成功工具调用，但已有失败记录
+            if (isUrlBlockedScenario(state) && state.getFailedActions().size() >= 3) {
+                log.info("GoalEvaluator: 放行 — URL 白名单拦截且已失败 3 次，允许报告失败");
+                state.setTaskStatus(TaskStatus.GOAL_FAILED);
+                return GoalEvaluation.allowed(state);
+            }
             // 通用知识问题不需要强求调工具（"G1是什么"、"JVM原理"等）
             if (isGeneralKnowledgeQuery(state.getOriginalQuery())) {
                 log.info("GoalEvaluator: 放行 — 通用知识问题，无需工具");
@@ -141,6 +147,19 @@ public class GoalEvaluator {
             // 已连续失败多次 + LLM 明确说明无法完成 → 放行
             if (state.getConsecutiveNoProgress() >= 2 && isExplicitFailureExplanation(llmAnswer)) {
                 log.info("GoalEvaluator: 放行 — 连续失败且 LLM 如实说明无法完成");
+                state.setTaskStatus(TaskStatus.GOAL_FAILED);
+                return GoalEvaluation.allowed(state);
+            }
+            // URL 白名单拦截场景 + 已失败 1 次 → 放行（不要继续死循环）
+            if (isUrlBlockedScenario(state) && state.getConsecutiveNoProgress() >= 1) {
+                log.info("GoalEvaluator: 放行 — URL 白名单拦截且已失败 1 次，允许报告失败");
+                state.setTaskStatus(TaskStatus.GOAL_FAILED);
+                return GoalEvaluation.allowed(state);
+            }
+            // 已连续失败 3 次 → 强制放行，避免死循环
+            if (state.getConsecutiveNoProgress() >= 3) {
+                log.warn("GoalEvaluator: 强制放行 — 已连续失败 {} 次，避免死循环", state.getConsecutiveNoProgress());
+                state.setTaskStatus(TaskStatus.GOAL_FAILED);
                 return GoalEvaluation.allowed(state);
             }
             log.info("GoalEvaluator: 拦截 — 工具调用结果全为 POOR/ERROR");
@@ -160,7 +179,7 @@ public class GoalEvaluator {
                 return GoalEvaluation.allowed(state);
             }
 
-            GoalCheckResult check = checkGoalWithLLM(state.getGoal(), state.getOriginalQuery(), llmAnswer);
+            GoalCheckResult check = checkGoalWithLLM(state.getGoal(), state.getOriginalQuery(), llmAnswer, state);
             if (check.achieved) {
                 log.info("GoalEvaluator: LLM 判定目标已达成 → 放行");
                 return GoalEvaluation.allowed(state);
@@ -186,11 +205,13 @@ public class GoalEvaluator {
         // 必须包含明确的失败说明
         boolean hasFailureStatement = containsAny(text,
                 "无法完成", "无法继续", "不能完成", "无法获取", "抓取失败", "失败了",
-                "拿不到", "获取不到", "访问失败", "连接失败", "超时", "无法抓取");
+                "拿不到", "获取不到", "访问失败", "连接失败", "超时", "无法抓取",
+                "不在白名单", "白名单限制", "被拦截", "访问受限", "不允许访问");
 
         // 必须包含原因解释
         boolean hasReason = containsAny(text,
-                "原因", "因为", "由于", "所以", "导致", "限制", "拦截", "反爬");
+                "原因", "因为", "由于", "所以", "导致", "限制", "拦截", "反爬",
+                "白名单", "策略", "安全", "配置");
 
         // 排除简单抱怨或无实质内容
         boolean notTrivial = llmAnswer.length() > 50;
@@ -293,10 +314,21 @@ public class GoalEvaluator {
     }
 
     /**
+     * 判断是否为 URL 白名单拦截场景
+     */
+    private boolean isUrlBlockedScenario(AgentState state) {
+        // 检查失败操作列表
+        return state.getFailedActions().stream()
+                .anyMatch(a -> a.contains("fetchUrl") &&
+                        (a.contains("白名单") || a.contains("不在允许") ||
+                         a.contains("访问受限") || a.contains("被拦截")));
+    }
+
+    /**
      * 用 LLM 判断目标是否达成。这是真正智能的判断——LLM 理解目标的语义，
      * 不会因为关键词对不上就误判。
      */
-    private GoalCheckResult checkGoalWithLLM(String goal, String originalQuery, String llmAnswer) {
+    private GoalCheckResult checkGoalWithLLM(String goal, String originalQuery, String llmAnswer, AgentState state) {
         try {
             ChatLanguageModel llm = modelFactory.createChatModel(0.0, Duration.ofSeconds(10));
             String answerPreview = llmAnswer.length() > 500 ? llmAnswer.substring(0, 500) : llmAnswer;
@@ -314,6 +346,12 @@ public class GoalEvaluator {
                     UserMessage.from(prompt)
             );
             Response<AiMessage> response = llm.generate(messages);
+
+            // 统计 Token 消耗
+            if (response.tokenUsage() != null) {
+                state.addTokensConsumed(response.tokenUsage().totalTokenCount());
+            }
+
             String result = response.content().text().trim();
             boolean achieved = result.toUpperCase().startsWith("YES");
             String reason = result.length() > 3 ? result.substring(3).trim() : result;

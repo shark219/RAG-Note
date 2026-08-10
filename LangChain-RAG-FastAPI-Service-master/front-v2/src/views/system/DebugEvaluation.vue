@@ -67,6 +67,24 @@
           </a-col>
         </a-row>
 
+        <a-row :gutter="16" style="margin-top: 16px;">
+          <a-col :span="24">
+            <a-card class="quick-link-card">
+              <div style="display: flex; align-items: center; gap: 12px;">
+                <icon-bar-chart style="font-size: 20px; color: #3491FA;" />
+                <div>
+                  <div style="color: #F8FAFC; font-weight: 500; margin-bottom: 4px;">Agent 质量评估</div>
+                  <div style="color: #94A3B8; font-size: 13px;">查看 Agent 任务执行效率、工具使用情况、反思分析等详细指标</div>
+                </div>
+                <a-button type="primary" style="margin-left: auto;" @click="goToAgentMetrics">
+                  进入查看
+                  <template #icon><icon-right /></template>
+                </a-button>
+              </div>
+            </a-card>
+          </a-col>
+        </a-row>
+
         <a-row :gutter="16" class="content-row">
           <a-col :xs="24" :md="12">
             <a-card title="本周 RAGAS 指标均值" class="section-card">
@@ -808,10 +826,13 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { Message, Modal } from '@arco-design/web-vue'
-import { IconPlayArrow, IconPlus, IconRefresh, IconCommon, IconDelete } from '@arco-design/web-vue/es/icon'
+import { IconPlayArrow, IconPlus, IconRefresh, IconCommon, IconDelete, IconBarChart, IconRight } from '@arco-design/web-vue/es/icon'
 import { evaluationApi, knowledgeApi, noteApi } from '@/api'
 import dayjs from 'dayjs'
+
+const router = useRouter()
 
 // ========== 标签切换 ==========
 const activeTab = ref('overview')
@@ -916,6 +937,11 @@ const mostImpactfulComponent = computed(() => {
 onMounted(() => {
   loadOverview()
 })
+
+// ========== 导航到 Agent 评估 ==========
+const goToAgentMetrics = () => {
+  router.push('/system/agent-metrics')
+}
 
 // ========== 质量概览数据加载（轻量） ==========
 async function refreshOverview() {
@@ -1550,6 +1576,21 @@ function getLevelColor(level: string) {
   gap: 8px;
   max-height: 250px;
   overflow-y: auto;
+}
+
+.quick-link-card {
+  background: #111827;
+  border: 1px solid #1E293B;
+  border-radius: 8px;
+  transition: border-color 0.3s;
+
+  &:hover {
+    border-color: #3491FA;
+  }
+
+  :deep(.arco-card-body) {
+    padding: 20px;
+  }
 }
 
 .testcase-item {
